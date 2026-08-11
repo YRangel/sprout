@@ -1,7 +1,8 @@
 #!/bin/sh
 # install.sh — install sprout locally (Termux-first).
 #
-# Copies the three runtime artifacts side-by-side into ${PREFIX:-$HOME/.local}/bin
+# Copies the runtime artifacts side-by-side into ${PREFIX:-$HOME/.local}/bin
+# (trio + optional libsprout-core-musl.so for Alpine guests)
 # so sprout's sibling-of-argv[0] discovery finds them:
 #   sprout            — Rust launcher (CLI)
 #   libsprout-core.so — C interposer (glibc-linked; must come from CI artifact
@@ -20,7 +21,7 @@ pick() {
         bin) if [ -f "$SRC/target/release/$1" ]; then echo "$SRC/target/release/$1"; return; fi
              if [ -f "$SRC/target/debug/$1" ]; then echo "$SRC/target/debug/$1"; return; fi ;;
     esac
-    for d in "$SRC"/target/release/build/*/out "$SRC"/target/debug/build/*/out "$SRC"/target; do
+    for d in "$SRC" "$SRC"/target/release/build/*/out "$SRC"/target/debug/build/*/out "$SRC"/target; do
         if [ -f "$d/$1" ]; then echo "$d/$1"; return; fi
     done
     echo ""
