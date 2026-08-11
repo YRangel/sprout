@@ -218,6 +218,39 @@ impl LaunchPlan {
             display: display_program.to_string(),
         })
     }
+
+    /// Wrap an existing plan (normally a preload plan) under the ptrace
+    /// supervisor. Used for Go-dynamic images: they are ET_DYN with
+    /// PT_INTERP — so they still need the sanitized loader chain as the
+    /// kernel launch vehicle — but their runtime issues syscalls DIRECTLY
+    /// (bypassing libc), so only the supervisor can translate their path
+    /// arguments at syscall-entry stops.
+    pub fn supervise(mut plan: LaunchPlan, supervisor: PathBuf) -> LaunchPlan {
+        let mut argv: Vec<OsString> = vec!["--".into()];
+        argv.push(plan.loader.clone().into_os_string());
+        argv.extend(plan.argv);
+        // The supervisor performs its exec rewrites using
+        // SPROUT_GUEST_PRELOAD (interposer:sanitized-libc pair); the
+        // preload plan holds exactly that pair in LD_PRELOAD.
+        let has_guest_preload = plan.env.iter().any(|(k, _)| k == "SPROUT_GUEST_PRELOAD");
+        if !has_guest_preload {
+            if let Some((_, ld)) = plan.env.iter().find(|(k, _)| k == "LD_PRELOAD") {
+                let v = ld.clone();
+                plan.env.push(("SPROUT_GUEST_PRELOAD".into(), v));
+            }
+        }
+        // The supervisor is a *host* binary (bionic on Android): it must
+        // never see LD_PRELOAD / LD_LIBRARY_PATH at exec time, because the
+        // host linker resolves them before main() and would try to link
+        // glibc objects. The supervisor re-injects LD_PRELOAD into the
+        // tracee child itself from SPROUT_GUEST_PRELOAD, and the guest lib
+        // path travels in the chain argv via --library-path.
+        plan.env.retain(|(k, _)| k != "LD_PRELOAD" && k != "LD_LIBRARY_PATH");
+        plan.loader = supervisor;
+        plan.argv = argv;
+        plan.strategy = Strategy::Ptrace;
+        plan
+    }
 }
 
 #[cfg(test)]

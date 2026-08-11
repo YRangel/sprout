@@ -9,7 +9,7 @@ Two interception layers cover the full binary spectrum:
 | layer | covers | mechanism |
 |-------|--------|-----------|
 | `LD_PRELOAD` fast path | dynamic glibc images (the 99%) | symbol interposition, loader-chain launch, sanitized runtime libs |
-| `sprout-ptrace` supervisor | static + script targets of static execers (the 1%) | ptrace argument rewriting at syscall-entry stops |
+| `sprout-ptrace` supervisor | static + Go binaries (the 1%) | ptrace argument rewriting at syscall-entry stops |
 
 The launcher picks the layer per exec: dynamic binaries never see ptrace.
 
@@ -135,9 +135,11 @@ Known exclusions, all tracked on the roadmap:
 - **musl guests** (Alpine) — v0.4. Different `ld-musl` path, different
   sanitize profile; the *model* carries over (the nolibc-static class
   already passes the supervisor).
-- **Go-specific calling conventions** — verified only via the
-  equivalent nolibc-static class (`-nostdlib -static` asm ELF). A real
-  Go toolchain build is a CI milestone, not a code path.
+- **Go binaries** — covered by the supervisor (static Go via
+  classification, dynamic Go detected by its PT_NOTE `.note.go.buildid`
+  and launched through the loader chain wrapped in the supervisor;
+  verified with real Go 1.24.4 builds: static CGO_ENABLED=0 and
+  dynamic -linkmode=external, goroutines + file I/O + exit codes).
 - **64-bit guests on other ABIs** (x86_64 via Box64) — separate
   sandboxing question entirely.
 

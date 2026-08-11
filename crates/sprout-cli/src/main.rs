@@ -141,16 +141,33 @@ fn run() -> Result<u8, Error> {
         let supervisor = sprout_ptrace::supervisor_path().ok_or(Error::PtraceUnimplemented)?;
         let preload_so = sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?;
         let cache_dir = cache_dir();
-        LaunchPlan::supervisor(
-            &rootfs,
-            supervisor,
-            program_host,
-            &program_name,
-            &cli.cmd,
-            cli.verbose,
-            preload_so,
-            &cache_dir,
-        )?
+        match class {
+            /* Dynamic Go: libc-linked for cgo, but io walks raw syscalls.
+             * Interposer never sees them → supervisor translates. It still
+             * launches via the sanitized loader chain (PT_INTERP present),
+             * so wrap the preload plan under the supervisor. */
+            GuestClass::GoDynamic { .. } => {
+                let pre = LaunchPlan::preload(
+                    &rootfs,
+                    program_host,
+                    &full_cmd,
+                    preload_so,
+                    cli.verbose,
+                    &cache_dir,
+                )?;
+                LaunchPlan::supervise(pre, supervisor)
+            }
+            _ => LaunchPlan::supervisor(
+                &rootfs,
+                supervisor,
+                program_host,
+                &program_name,
+                &cli.cmd,
+                cli.verbose,
+                preload_so,
+                &cache_dir,
+            )?,
+        }
     } else {
         let preload_so = sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?;
         let cache_dir = cache_dir();

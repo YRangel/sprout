@@ -17,7 +17,9 @@ impl Strategy {
     pub fn for_elf(class: &GuestClass) -> Option<Self> {
         match class {
             GuestClass::Dynamic { .. } => Some(Strategy::Preload),
-            GuestClass::Static => Some(Strategy::Ptrace),
+            // Direct-syscall images (static, Go-dynamic) need the
+            // supervisor: the interposer can't see their path arguments.
+            GuestClass::Static | GuestClass::GoDynamic { .. } => Some(Strategy::Ptrace),
             GuestClass::NotElf | GuestClass::Elf32 => None,
         }
     }
@@ -41,6 +43,11 @@ mod tests {
             Strategy::for_elf(&GuestClass::Static),
             Some(Strategy::Ptrace)
         );
+        // Go-dynamic is equally supervisor-routed (raw syscalls).
+        let g = GuestClass::GoDynamic {
+            interp: "/lib/ld.so".into(),
+        };
+        assert_eq!(Strategy::for_elf(&g), Some(Strategy::Ptrace));
     }
 
     #[test]

@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/user.h>
@@ -119,6 +120,15 @@ static int poke_str(pid_t pid, unsigned long long addr, const char *s, size_t le
 static const char *g_loader;      /* SPROUT_LOADER: sanitized guest loader (host) */
 static const char *g_libpath;     /* SPROUT_LIBRARY_PATH: guest lib dirs (host) */
 static const char *g_guestpreload;/* SPROUT_GUEST_PRELOAD: interposer:sanitized-libc */
+
+/* tracee.kind: -1 unclassified, 0 dynamic preload-governed, 1 static,
+ * 2 dynamic-Go (libc-linked yet raw-syscall — supervisor must translate).
+ */
+static const char *sp_kind_name(int k) {
+    return k == 2 ? "GO-DYNAMIC (supervisor translates)" :
+           k == 1 ? "STATIC (supervisor translates)" :
+           k == 0 ? "dynamic (preload governs)" : "unclassified";
+}
 static const char *g_rootfs;      /* SPROUT_ROOTFS (guest root, host absolute) */
 
 /* Host-file ELF inspection (open + phdrs). Returns 1 static, 0 dynamic,
@@ -414,11 +424,104 @@ static int poke_str(pid_t pid, unsigned long long addr, const char *s, size_t le
     return 0;
 }
 
+/* Detect a Go runtime binary by its PT_NOTE "Go" buildid note. Present in
+ * all Go binaries (CGO or not, stripped or not): namesz=4, name="Go". */
+#define SP_PT_NOTE 4
+static int is_go_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char eh[64];
+    if (fread(eh, 1, 64, f) != 64 || memcmp(eh, "\x7f" "ELF", 4) || eh[4] != 2) {
+        fclose(f);
+        return 0;
+    }
+    unsigned long long phoff = *(unsigned long long *)(eh + 32);
+    unsigned short phentsize = *(unsigned short *)(eh + 54);
+    unsigned short phnum = *(unsigned short *)(eh + 56);
+    int go = 0;
+    for (unsigned i = 0; i < phnum && i < 32 && !go; i++) {
+        unsigned char ph[56];
+        if (fseek(f, (long)(phoff + i * (unsigned long long)phentsize), SEEK_SET) != 0 ||
+            fread(ph, 1, 56, f) != 56) break;
+        if (*(unsigned *)ph != SP_PT_NOTE) continue;
+        unsigned long long noff = *(unsigned long long *)(ph + 8);
+        unsigned long long nsz  = *(unsigned long long *)(ph + 32);
+        if (!nsz || nsz > (1 << 20)) continue;
+        unsigned char *seg = malloc(nsz);
+        if (!seg) break;
+        if (fseek(f, (long)noff, SEEK_SET) != 0 || fread(seg, 1, nsz, f) != nsz) {
+            free(seg);
+            break;
+        }
+        size_t p = 0;
+        while (p + 12 <= nsz) {
+            unsigned namesz = *(unsigned *)(seg + p);
+            unsigned descsz = *(unsigned *)(seg + p + 4);
+            if (!namesz || namesz > 256 || p + 12 + namesz > nsz) break;
+            if (namesz == 4 && memcmp(seg + p + 12, "Go\0\0", 4) == 0) { go = 1; break; }
+            size_t na = ((size_t)namesz + 3) & ~(size_t)3;
+            size_t da = ((size_t)descsz + 3) & ~(size_t)3;
+            size_t np = p + 12 + na + da;
+            if (np <= p || np > nsz) break;
+            p = np;
+        }
+        free(seg);
+    }
+    fclose(f);
+    return go;
+}
+
+/* For loader-chain images, /proc/pid/exe forever reports the LOADER (the
+ * kernel exec'd ld.so; ld.so merely mapped the app). The real app lives in
+ * the chain argv: [loader, --argv0, ., --inhibit-cache, --library-path,
+ *   <lp>, <APP>, ...]. Extract the app path so classification sees the
+ * real image (Go note scan applies to it, not the loader). */
+static int chain_app_path(pid_t pid, char out[SP_PATH_MAX]) {
+    char cp[64];
+    snprintf(cp, sizeof(cp), "/proc/%d/cmdline", pid);
+    FILE *f = fopen(cp, "rb");
+    if (!f) return 0;
+    char buf[16384];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n < 2 || !g_loader) return 0;
+    buf[n] = '\0';
+    /* token 0 must be exactly the sanitized loader path (argv[0] of the
+     * exec the supervisor or the chain rewriter issued). */
+    size_t t0len = strlen(buf);
+    if (t0len == 0 || strcmp(buf, g_loader) != 0) return 0;
+    size_t pos = t0len + 1;
+    size_t lp_pos = (size_t)-1;
+    while (pos < n) {
+        const char *tok = buf + pos;
+        size_t tl = strlen(tok);
+        if (strcmp(tok, "--library-path") == 0 && pos + tl + 1 < n) {
+            lp_pos = pos + tl + 1;   /* libpath token */
+            size_t ll = strlen(buf + lp_pos);
+            if (lp_pos + ll + 1 >= n) return 0;
+            const char *app = buf + lp_pos + ll + 1;
+            if (*app) {
+                snprintf(out, SP_PATH_MAX, "%s", app);
+                return 1;
+            }
+            return 0;
+        }
+        pos += tl + 1;
+    }
+    return 0;
+}
+
 /* Classify the image a tracee just exec'd: static ELF or not.
  * Reads /proc/<pid>/exe's program headers; PT_INTERP presence means a
  * dynamic loader (preload path); ET_EXEC without PT_INTERP, or static-PIE
- * ET_DYN without PT_INTERP, are "static" for policy purposes. */
+ * ET_DYN without PT_INTERP, are "static" for policy purposes.
+ * Loader-chain images: classification targets the CHAIN APP (see above),
+ * so a dynamic Go binary surfaces as kind 2 (translate + exec-rewrite,
+ * same posture as static) because Go's runtime syscalls bypass libc. */
 static int classify_tracee_image(pid_t pid) {
+    char app[SP_PATH_MAX];
+    if (chain_app_path(pid, app))
+        return is_go_file(app) ? 2 : 0;
     char exe[64];
     snprintf(exe, sizeof(exe), "/proc/%d/exe", pid);
     FILE *f = fopen(exe, "rb");
@@ -449,6 +552,7 @@ static int classify_tracee_image(pid_t pid) {
             if (strcmp(link, g_loader) == 0) return 0;
         }
     }
+    if (is_go_file(exe)) return 2;   /* static Go: raw syscalls, translate */
     return 1;
 }
 
@@ -496,6 +600,26 @@ static int translate_reg_path(tracee_t *t, pid_t pid, struct user_pt_regs *r, in
     if (guest_absolutize(pid, guest) != 0) return 0;
     char host[SP_PATH_MAX];
     if (!sp_translate(&g_cfg, guest, host)) return 0;
+    /* Existence filter (phase-guard): force-prefixing loader-phase host
+     * opens (cache .so under $PREFIX/...) would corrupt them. Translate
+     * only when the candidate (or its parent, for O_CREAT-ish callers)
+     * actually exists; otherwise leave the call against the host tree.
+     * For pure static tracees this is equivalent (guest files all exist
+     * under the rootfs); pseudo-paths like /proc fall to host anyway. */
+    {
+        struct stat st;
+        if (lstat(host, &st) != 0) {
+            char par[SP_PATH_MAX];
+            snprintf(par, sizeof(par), "%s", host);
+            char *sl = strrchr(par, '/');
+            if (sl == par || !sl) {
+                if (lstat("/", &st) != 0) return 0;
+            } else {
+                *sl = '\0';
+                if (lstat(par, &st) != 0) return 0;
+            }
+        }
+    }
     size_t hl = strlen(host);
     if (hl >= SP_SCRATCH_CAP) return 0;
     unsigned long long scratch = (unsigned long long)r->sp - SP_SCRATCH_BELOW_SP;
@@ -609,14 +733,13 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
         if (kind >= 0) {
             t->static_kind = kind;
             if (g_debug)
-                SP_TRACE("[%d] lazily classified as %s\n", pid,
-                         kind ? "STATIC (supervisor translates)" : "dynamic (preload governs)");
+                SP_TRACE("[%d] lazily classified as %s\n", pid, sp_kind_name(kind));
         }
     }
 
-    /* Path translation for STATIC tracees only — dynamic processes have
-     * the LD_PRELOAD interposer (this supervisor is a last resort). */
-    if (t->static_kind != 1) return;
+    /* Path translation for supervisor-governed tracees (static=1, dynamic
+     * Go=2). Plain dynamic processes have the LD_PRELOAD interposer. */
+    if (t->static_kind <= 0) return;
 
     /* execve/execveat of a DYNAMIC (or script) target from a static
      * process: the kernel cannot satisfy PT_INTERP on the host (empty
@@ -935,7 +1058,7 @@ int main(int argc, char **argv) {
                     t->static_kind = kind;
                     if (g_debug)
                         SP_TRACE("[%d] exec event: image is %s\n", w,
-                                 kind ? "STATIC (supervisor translates)" : "dynamic (preload governs)");
+                                 sp_kind_name(kind));
                 }
             }
             goto cont;
