@@ -14,5 +14,6 @@ path = "src/main.rs"
 [dependencies]
 sprout-core = { path = "../sprout-core" }
 sprout-preload = { path = "../sprout-preload" }
+sprout-ptrace = { path = "../sprout-ptrace" }
 clap.workspace = true
 anyhow.workspace = true

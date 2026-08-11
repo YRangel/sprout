@@ -84,7 +84,15 @@ impl LaunchPlan {
         // resolution over libc (verified via dladdr probing: LD_PRELOAD is
         // resolved left-to-right).
         let ld_preload = format!("{}:{}", preload_so.display(), sanitized.display());
+
+        // Inheriting the host PATH leaks host dirs into the guest PATH
+        // search (python's shutil.which, env, shells). proot-distro sets a
+        // guest-sane PATH for the same reason. SPROUT_GUEST_PATH overrides.
+        let guest_path = std::env::var("SPROUT_GUEST_PATH").unwrap_or_else(|_| {
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+        });
         let mut env = vec![
+            ("PATH".into(), guest_path),
             ("SPROUT_ROOTFS".into(), rootfs.root.display().to_string()),
             ("LD_PRELOAD".into(), ld_preload),
             ("LD_LIBRARY_PATH".into(), library_path.clone()),
@@ -150,6 +158,39 @@ impl LaunchPlan {
         }
         let status = cmd.status()?;
         Ok(status)
+    }
+
+    /// Build the supervisor launch plan for a static / preload-incapable
+    /// guest binary (ADR-0002: ptrace is the last-resort fallback).
+    ///
+    /// Executes `sprout-ptrace -- <host-program> [args...]` with
+    /// `SPROUT_ROOTFS` set so the supervisor's syscall-entry hook can
+    /// translate absolute pathname arguments.
+    pub fn supervisor(
+        rootfs: &Rootfs,
+        supervisor: PathBuf,
+        guest_prog: PathBuf,
+        display_program: &str,
+        args: &[OsString],
+        debug: bool,
+    ) -> Self {
+        let mut argv: Vec<OsString> = vec!["--".into(), guest_prog.into_os_string()];
+        argv.extend(args.iter().cloned());
+        let mut env: Vec<(String, String)> = vec![(
+            "SPROUT_ROOTFS".into(),
+            rootfs.root.display().to_string(),
+        )];
+        if debug {
+            env.push(("SPROUT_DEBUG".into(), "1".into()));
+        }
+        Self {
+            strategy: Strategy::Ptrace,
+            loader: supervisor,
+            argv,
+            env,
+            cwd: None,
+            display: display_program.to_string(),
+        }
     }
 }
 

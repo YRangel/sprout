@@ -30,3 +30,8 @@ is a no-op. The table is sorted by how `proot-distro login` uses flags.
 
 `proot-distro login` can be pointed at sprout by symlinking
 `$PREFIX/bin/proot` → `sprout`; a `$PREFIX/bin/sprout` alias exists too.
+
+
+### Environment hygiene
+
+sprout, like proot-distro, substitutes a guest-sane `PATH` (`/usr/local/sbin:.../sbin:/bin`) unless `SPROUT_GUEST_PATH` overrides it; learning host PATH habits (`which`-less slim guests notwithstanding).

@@ -264,6 +264,7 @@ dependencies = [
  "clap",
  "sprout-core",
  "sprout-preload",
+ "sprout-ptrace",
 ]
 
 [[package]]

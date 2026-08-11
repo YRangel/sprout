@@ -101,6 +101,9 @@ typedef struct {
     unsigned long long arg0;
     unsigned long long argN;
     int   got_robust_list;
+    /* -1 = not yet classified at exec event, 0 = dynamic (preload governs),
+     * 1 = static: no LD_PRELOAD possible, supervisor must translate. */
+    int   static_kind;
 } tracee_t;
 
 static tracee_t g_tracees[SP_MAX_TRACEES];
@@ -111,7 +114,9 @@ static tracee_t *find_or_add(pid_t pid) {
         if (g_tracees[i].pid == pid) return &g_tracees[i];
     for (int i = 0; i < SP_MAX_TRACEES; i++)
         if (g_tracees[i].pid == 0) {
+            memset(&g_tracees[i], 0, sizeof(g_tracees[i]));
             g_tracees[i].pid = pid;
+            g_tracees[i].static_kind = -1;
             return &g_tracees[i];
         }
     return NULL;
@@ -159,6 +164,67 @@ static int poke_str(pid_t pid, unsigned long long addr, const char *s, size_t le
     return 0;
 }
 
+/* Classify the image a tracee just exec'd: static ELF or not.
+ * Reads /proc/<pid>/exe's program headers; PT_INTERP presence means a
+ * dynamic loader (preload path); ET_EXEC without PT_INTERP, or static-PIE
+ * ET_DYN without PT_INTERP, are "static" for policy purposes. */
+static int classify_tracee_image(pid_t pid) {
+    char exe[64];
+    snprintf(exe, sizeof(exe), "/proc/%d/exe", pid);
+    FILE *f = fopen(exe, "rb");
+    if (!f) return -1;
+    unsigned char eh[64];
+    if (fread(eh, 1, sizeof(eh), f) != sizeof(eh)) { fclose(f); return -1; }
+    if (memcmp(eh, "\x7f" "ELF", 4) != 0 || eh[4] != 2 /* ELFCLASS64 */) { fclose(f); return -1; }
+    unsigned long long e_phoff = *(unsigned long long *)(eh + 32);
+    unsigned short e_phentsize = *(unsigned short *)(eh + 54);
+    unsigned short e_phnum = *(unsigned short *)(eh + 56);
+    for (unsigned int i = 0; i < e_phnum && i < 32; i++) {
+        if (fseek(f, (long)(e_phoff + i * e_phentsize), SEEK_SET) != 0) break;
+        unsigned char ph[56];
+        if (fread(ph, 1, sizeof(ph), f) != sizeof(ph)) break;
+        unsigned int p_type = *(unsigned int *)ph;
+        if (p_type == PT_INTERP) { fclose(f); return 0; }
+    }
+    fclose(f);
+    return 1;
+}
+
+/* Where we scribble translated path strings inside the tracee: 16 KiB
+ * below the *current* stack pointer of the stopped thread. aarch64 has no
+ * red zone and the thread is stopped at a syscall entry (its own code
+ * cannot run until we continue it), so the region below SP is guaranteed
+ * free of live data. Other threads never write below this thread's SP.
+ * Max 4 KiB per stop; guest paths are usually << 1 KiB. */
+#define SP_SCRATCH_BELOW_SP 16384
+#define SP_SCRATCH_CAP      3072
+
+/* Translate the pathname argument regs[argi] of a stopped STATIC tracee.
+ * Current working directory of the tracee is not tracked, so only absolute
+ * guest paths are rewritten (documented gap; at-family syscalls with a
+ * real dirfd are skipped by callers). Returns 1 when regs were modified. */
+static int translate_reg_path(tracee_t *t, pid_t pid, struct user_pt_regs *r, int argi,
+                              const char *name) {
+    (void)t;
+    unsigned long long ptr = r->regs[argi];
+    if (ptr == 0 || ptr >= 0x800000000000ULL) return 0;
+    char guest[SP_PATH_MAX];
+    if (peek_str(pid, ptr, guest, sizeof(guest)) < 0) return 0;
+    if (guest[0] != '/') return 0;
+    char host[SP_PATH_MAX];
+    if (!sp_translate(&g_cfg, guest, host)) return 0;
+    size_t hl = strlen(host);
+    if (hl >= SP_SCRATCH_CAP) return 0;
+    unsigned long long scratch = (unsigned long long)r->sp - SP_SCRATCH_BELOW_SP;
+    /* probe mapped-ness of the scratch page first */
+    errno = 0;
+    if (ptrace(PTRACE_PEEKDATA, pid, (void *)scratch, NULL) == -1 && errno) return 0;
+    if (poke_str(pid, scratch, host, hl) != 0) return 0;
+    r->regs[argi] = scratch;
+    if (g_debug) SP_TRACE("[%d] %s arg%d %s -> %s (scratch@sp-16k)\n", pid, name, argi, guest, host);
+    return 1;
+}
+
 typedef struct {
     int ok;             /* 1 if GSI is available and op == ENTRY */
     long nr;            /* syscall number (kernel view, cached in regs->syscallno) */
@@ -201,10 +267,39 @@ static sp_syscall_view sp_view_syscall(pid_t pid, struct user_pt_regs *regs) {
 
 /* On aarch64, GET_SYSCALL_INFO arguments: for ENTRY the six args are at
  * indices 0..5 and syscall nr at 6. arg0 is in x0. */
+/* dirfd-at-family syscalls whose pathname argument we translate for
+ * STATIC tracees: {sysno, dirfd_argi, path_argi}. dirfd_argi == -1 means
+ * there is no dirfd (path arg is standalone, e.g. execve/chdir). A real
+ * dirfd (>= 0) skips translation: the fd was opened previously and the
+ * kernel resolves relative to it. */
+typedef struct { long sysno; int dirfd_argi; int path_argi; const char *name; } sp_path_rule;
+static const sp_path_rule SP_PATH_RULES[] = {
+    { SYS_openat,      0, 1, "openat"      },
+    { SYS_openat2,     0, 1, "openat2"     },
+    { SYS_newfstatat,  0, 1, "newfstatat"  },
+    { SYS_faccessat,   0, 1, "faccessat"   },
+    { SYS_faccessat2,  0, 1, "faccessat2"  },
+    { SYS_readlinkat,  0, 1, "readlinkat"  },
+    { SYS_statx,       0, 1, "statx"       },
+    { 34 /*mkdirat*/,  0, 1, "mkdirat"     },
+    { 35 /*unlinkat*/, 0, 1, "unlinkat"    },
+    { 33 /*mknodat*/,  0, 1, "mknodat"     },
+    { 53 /*fchmodat*/, 0, 1, "fchmodat"    },
+    { 54 /*fchownat*/, 0, 1, "fchownat"    },
+    { 88 /*utimensat*/,0, 1, "utimensat"   },
+    { 36 /*symlinkat*/,   -1, 1, "symlinkat.linkpath" }, /* arg1 only: target is written literally */
+    { 37 /*linkat*/,       0, 1, "linkat.oldpath"       },
+    { 38 /*renameat*/,     0, 1, "renameat.oldpath"     },
+    { 276/*renameat2*/,    0, 1, "renameat2.oldpath"    },
+    { 49 /*chdir*/,       -1, 0, "chdir"     },
+    { SYS_execve,     -1, 0, "execve"      },
+    { SYS_execveat,    0, 1, "execveat"    },
+};
+
 static void apply_policy_entry(tracee_t *t, pid_t pid,
                                 long sysno, unsigned long long x0, unsigned long long x1) {
-    switch (sysno) {
-    case SYS_set_robust_list: {
+    (void)x0; (void)x1;
+    if (sysno == SYS_set_robust_list) {
         /* Rewrite the cached syscall number via PTRACE_SET_SYSCALL so
          * seccomp evaluates getpid (always allowed) instead. errno
          * distinguishes "no support" (EINVAL/ENOTSUP) from "stopped
@@ -215,36 +310,55 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
             if (g_debug) fprintf(stderr,
                 "[ptrace] %d PTRACE_SET_SYSCALL failed rc=%ld errno=%d; relying on SIGSYS-swallow fallback\n",
                 pid, rc, errno);
-            break; /* signal-stop fallback below will handle it */
+            return; /* signal-stop fallback below will handle it */
         }
         t->got_robust_list = 1;
         if (g_debug) SP_TRACE("[%d] set_robust_list → getpid\n", pid);
-        break;
+        return;
     }
 
-    case SYS_openat: case SYS_openat2: case SYS_newfstatat:
-    case SYS_faccessat: case SYS_faccessat2: case SYS_readlinkat:
-    case SYS_statx:
-        if ((int)x0 != AT_FDCWD_VAL) break;
-        if (x1 == 0 || x1 >= 0x800000000000ULL) break;
-        goto translate_path;
-    case SYS_execve: case SYS_execveat:
-        if (sysno == SYS_execveat && (int)x0 != AT_FDCWD_VAL) break;
-        if (x0 == 0 || x0 >= 0x800000000000ULL) break;
-        x1 = x0; /* path is in x0 for execve */
-        goto translate_path;
-    translate_path:;
-        char guest[SP_PATH_MAX];
-        if (peek_str(pid, x1, guest, sizeof(guest)) < 0) break;
-        if (guest[0] != '/') break;
-        char host[SP_PATH_MAX];
-        if (!sp_translate(&g_cfg, guest, host)) break;
-        if (poke_str(pid, x1, host, strlen(host)) != 0) break;
-        if (g_debug) SP_TRACE("[%d] %ld %s → %s\n", pid, sysno, guest, host);
-        break;
+    /* Lazy classification: the initial exec stop (post-TRACEME) is consumed
+     * by the bare waitpid that precedes PTRACE_SETOPTIONS, so the main
+     * program never produces a PTRACE_EVENT_EXEC we can see. The first
+     * syscall-stop of any tracee, however, reliably runs after its exec. */
+    if (t->static_kind == -1) {
+        int kind = classify_tracee_image(pid);
+        if (kind >= 0) {
+            t->static_kind = kind;
+            if (g_debug)
+                SP_TRACE("[%d] lazily classified as %s\n", pid,
+                         kind ? "STATIC (supervisor translates)" : "dynamic (preload governs)");
+        }
+    }
 
-    default:
-        break;
+    /* Path translation for STATIC tracees only — dynamic processes have
+     * the LD_PRELOAD interposer (this supervisor is a last resort). */
+    if (t->static_kind != 1) return;
+
+    for (size_t i = 0; i < sizeof(SP_PATH_RULES)/sizeof(*SP_PATH_RULES); i++) {
+        const sp_path_rule *rule = &SP_PATH_RULES[i];
+        if (rule->sysno != sysno) continue;
+        if (rule->dirfd_argi >= 0) {
+            /* dirfd = regs[rule->dirfd_argi]; only AT_FDCWD translates
+             * (real dirfds resolve in kernel space against an fd whose
+             * path we don't mirror). GSI already filed regs; we re-fetch
+             * lazily only when a rule matched. */
+            struct user_pt_regs rchk;
+            struct iovec iovchk = { &rchk, sizeof(rchk) };
+            if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovchk) != 0) return;
+            if ((int)rchk.regs[rule->dirfd_argi] != AT_FDCWD_VAL) return;
+
+            int changed = translate_reg_path(t, pid, &rchk, rule->path_argi, rule->name);
+            if (changed)
+                ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovchk);
+        } else {
+            struct user_pt_regs rchk;
+            struct iovec iovchk = { &rchk, sizeof(rchk) };
+            if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovchk) != 0) return;
+            if (translate_reg_path(t, pid, &rchk, rule->path_argi, rule->name))
+                ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovchk);
+        }
+        return; /* one rule per sysno */
     }
 }
 
@@ -395,7 +509,23 @@ int main(int argc, char **argv) {
             }
             goto cont;
         }
-        if (sig == SIGTRAP) goto cont;   /* exec/clone/fork: keep walking */
+        /* PTRACE_EVENT stops arrive as plain SIGTRAP with an event code in
+         * the high 16 bits of status. PTRACE_EVENT_EXEC is where we learn
+         * what image the tracee now runs: classify static vs dynamic so the
+         * entry policy knows whether IT has to translate paths. */
+        if (sig == SIGTRAP) {
+            unsigned int ev = (unsigned int)status >> 16;
+            if (ev == (unsigned int)PTRACE_EVENT_EXEC) {
+                int kind = classify_tracee_image(w);
+                if (kind >= 0) {
+                    t->static_kind = kind;
+                    if (g_debug)
+                        SP_TRACE("[%d] exec event: image is %s\n", w,
+                                 kind ? "STATIC (supervisor translates)" : "dynamic (preload governs)");
+                }
+            }
+            goto cont;
+        }
         ptrace(PTRACE_SYSCALL, w, 0, (void *)(long)sig);
         continue;
     cont:

@@ -76,13 +76,42 @@ fn run() -> Result<u8, Error> {
         rootfs.bindings.push(Binding::parse(spec)?);
     }
 
-    let program_name = cli.cmd[0].to_string_lossy();
-    let program_host = rootfs.find_program(&program_name)?;
+    let mut program_name = cli.cmd[0].to_string_lossy().into_owned();
+    let mut program_host = rootfs.find_program(&program_name)?;
 
-    let class = classify(&program_host)?;
+    // Full argv passed to the plan (argv[0] included, matching kernel exec):
+    // for shebang scripts this becomes [interp, opt?, script, orig args...].
+    let mut full_cmd: Vec<OsString> = cli.cmd.clone();
+
+    let mut class = classify(&program_host)?;
+
+    // Shebang (#!): exec the script's interpreter instead (kernel semantics:
+    // argv = [interp, opt-arg?, script, orig args...]). The interpreter must
+    // itself be a guest binary on PATH (supports '#!/usr/bin/env X' too).
+    if matches!(class, GuestClass::NotElf) {
+        if let Some((interp, opt)) = parse_shebang(&program_host) {
+            let interp_host = rootfs.find_program(&interp).map_err(|_| Error::UnsupportedElf {
+                program: program_name.clone(),
+                class: class.clone(),
+            })?;
+            let interp_class = classify(&interp_host)?;
+            let script_guest = program_name.clone();
+            let orig_args: Vec<OsString> = cli.cmd[1..].to_vec();
+            let mut rebuilt: Vec<OsString> = vec![interp.clone().into()];
+            if let Some(o) = opt {
+                rebuilt.push(o.into());
+            }
+            rebuilt.push(script_guest.into());
+            rebuilt.extend(orig_args);
+            full_cmd = rebuilt;
+            program_host = interp_host;
+            program_name = interp;
+            class = interp_class;
+        }
+    }
     let strategy = match cli.fallback.as_str() {
         "auto" => Strategy::for_elf(&class).ok_or(Error::UnsupportedElf {
-            program: program_name.clone().into_owned(),
+            program: program_name.clone(),
             class: class.clone(),
         })?,
         "preload" => Strategy::Preload,
@@ -99,27 +128,36 @@ fn run() -> Result<u8, Error> {
         Strategy::Preload => {
             if let GuestClass::Static = class {
                 return Err(Error::StaticNeedsPtrace {
-                    program: program_name.clone().into_owned(),
+                    program: program_name.clone(),
                 });
             }
         }
     }
 
-    if strategy == Strategy::Ptrace {
-        return Err(Error::PtraceUnimplemented);
-    }
-
-    let preload_so = sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?;
-
-    let cache_dir = cache_dir();
-    let plan = LaunchPlan::preload(
-        &rootfs,
-        program_host,
-        &cli.cmd,
-        preload_so,
-        cli.verbose,
-        &cache_dir,
-    )?;
+    let plan = if strategy == Strategy::Ptrace {
+        /* Last-resort path (ADR-0002): supervisor translates syscall args
+         * for static / preload-incapable images. */
+        let supervisor = sprout_ptrace::supervisor_path().ok_or(Error::PtraceUnimplemented)?;
+        LaunchPlan::supervisor(
+            &rootfs,
+            supervisor,
+            program_host,
+            &program_name,
+            &cli.cmd,
+            cli.verbose,
+        )
+    } else {
+        let preload_so = sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?;
+        let cache_dir = cache_dir();
+        LaunchPlan::preload(
+            &rootfs,
+            program_host,
+            &full_cmd,
+            preload_so,
+            cli.verbose,
+            &cache_dir,
+        )?
+    };
 
     if cli.dry_run {
         eprintln!("{}", plan.explain());
@@ -141,6 +179,27 @@ fn cache_dir() -> PathBuf {
         return PathBuf::from(home).join(".cache").join("sprout");
     }
     std::env::temp_dir().join("sprout")
+}
+
+/// Parse a guest script's shebang line: `#!/path/to/interp [one-opt-arg]`.
+///
+/// Kernel rules (fs/binfmt_script.c): everything on the first line after
+/// `#!` up to whitespace separates interpreter and ONE optional argument.
+/// `/usr/bin/env FOO` needs no special-casing: env resolves FOO on the
+/// guest PATH via the interposer's `execvp` chain.
+fn parse_shebang(host_path: &std::path::Path) -> Option<(String, Option<String>)> {
+    use std::io::{BufRead, BufReader};
+    let f = std::fs::File::open(host_path).ok()?;
+    let mut first = String::new();
+    BufReader::new(f).read_line(&mut first).ok()?;
+    let line = first.strip_prefix("#!")?.trim();
+    let mut it = line.split_whitespace();
+    let interp = it.next()?.to_string();
+    if interp.is_empty() {
+        return None;
+    }
+    let opt = it.next().map(std::string::ToString::to_string);
+    Some((interp, opt))
 }
 
 fn main() -> ExitCode {
