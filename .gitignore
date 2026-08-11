@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.dSYM/
+.idea/
+.vscode/
+/docs/book/
+
+/target/fakeroot

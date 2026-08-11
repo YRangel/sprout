@@ -1,0 +1,18 @@
+[package]
+name = "sprout-core"
+version = "0.1.0"
+description = "Core library for sprout: rootfs model, ELF inspection, strategy selection, guest-link plumbing"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+nix = { workspace = true, features = ["process", "signal", "fs"] }
+
+[dependencies.sprout-preload]
+path = "../sprout-preload"
+
+[dev-dependencies]
+tempfile = "3"

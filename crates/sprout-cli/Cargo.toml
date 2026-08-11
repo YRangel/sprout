@@ -1,0 +1,18 @@
+[package]
+name = "sprout-cli"
+version = "0.1.0"
+description = "Rootless glibc Linux runtime for Android — proot-compatible launcher (LD_PRELOAD fast path, ptrace fallback)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "sprout"
+path = "src/main.rs"
+
+[dependencies]
+sprout-core = { path = "../sprout-core" }
+sprout-preload = { path = "../sprout-preload" }
+clap.workspace = true
+anyhow.workspace = true

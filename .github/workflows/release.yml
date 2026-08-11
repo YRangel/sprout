@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --workspace
+      - name: collect
+        run: |
+          mkdir -p dist
+          cp target/release/sprout dist/
+          so=$(find target/release/build/sprout-preload-*/out -name libsprout-core.so | head -1)
+          test -n "$so" && cp "$so" dist/
+          strip dist/sprout dist/libsprout-core.so || true
+          sha256sum dist/* > dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: latest
+      - run: mdbook build docs
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: docs/book

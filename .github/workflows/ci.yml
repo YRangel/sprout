@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel older runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --workspace -- -D warnings
+
+  test-glibc:
+    name: test (ubuntu-24.04 ARM)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+      - name: verify preload artifact is a real glibc-linked .so
+        run: |
+          so=$(find target/debug/build/sprout-preload-*/out -name libsprout-core.so | head -1)
+          test -n "$so" && file "$so" | grep -q 'ELF 64-bit LSB shared object, ARM aarch64'
+          # glibc-linked: must *not* reference Android-only symbols
+          ! readelf -d "$so" | grep -qi android
+
+  test-termux:
+    name: test (Termux aarch64 self-hosted)
+    runs-on: [self-hosted, linux, arm64, termux]
+    if: ${{ always() }}  # skip gracefully when no runner registered
+    steps:
+      - uses: actions/checkout@v4
+      - run: pkg show rust >/dev/null 2>&1 || pkg install -y rust clang
+      - run: cargo test --workspace --all-targets
+
+  build-cdylib:
+    name: build libsprout-core.so (glibc)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p sprout-preload --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libsprout-core.so-aarch64
+          path: target/release/build/sprout-preload-*/out/libsprout-core.so
+          if-no-files-found: error
+
+  docs:
+    name: mdBook build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: latest
+      - run: mdbook build docs
