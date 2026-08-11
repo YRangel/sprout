@@ -1,7 +1,7 @@
 //! Discovery for the ptrace supervisor binary built by this crate's build script.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Absolute path to the `sprout-ptrace` helper.
 ///
