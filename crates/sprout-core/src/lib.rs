@@ -16,7 +16,7 @@ pub mod sanitize;
 pub use elf::{classify, ElfError, GuestClass};
 pub use error::Error;
 pub use plan::LaunchPlan;
-pub use rootfs::{Binding, Rootfs};
+pub use rootfs::{Binding, LibcFlavor, Rootfs};
 pub use strategy::Strategy;
 
 pub type Result<T> = std::result::Result<T, Error>;

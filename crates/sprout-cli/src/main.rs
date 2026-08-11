@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use sprout_core::{classify, Binding, Error, GuestClass, LaunchPlan, Rootfs, Strategy};
+use sprout_core::{classify, Binding, Error, GuestClass, LaunchPlan, LibcFlavor, Rootfs, Strategy};
 
 /// Rootless glibc Linux userspace for Android (proot-compatible CLI).
 ///
@@ -134,14 +134,47 @@ fn run() -> Result<u8, Error> {
         }
     }
 
-    let plan = if strategy == Strategy::Ptrace {
+    let plan = if strategy == Strategy::Ptrace || rootfs.libc_flavor() == LibcFlavor::Musl {
         /* Last-resort path (ADR-0002): supervisor translates syscall args
          * for static / preload-incapable images, and rewrites static→dynamic
-         * exec into the sanitized loader chain. */
+         * exec into the sanitized loader chain. MUSL guests (v0.4) take this
+         * route for EVERY image (ADR-0009): musl's whole-libc-in-ldso plus
+         * busybox's suid-drop can't be covered by ldso sanitization alone. */
+        let preload_so = if rootfs.libc_flavor() == LibcFlavor::Musl {
+            sprout_preload::core_library_musl_path().ok_or(Error::PreloadNotFound)?
+        } else {
+            sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?
+        };
         let supervisor = sprout_ptrace::supervisor_path().ok_or(Error::PtraceUnimplemented)?;
-        let preload_so = sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?;
         let cache_dir = cache_dir();
-        match class {
+        if rootfs.libc_flavor() == LibcFlavor::Musl {
+            match class {
+                /* Static musl: direct exec under supervisor (translates) */
+                GuestClass::Static => LaunchPlan::supervisor(
+                    &rootfs,
+                    supervisor,
+                    program_host,
+                    &program_name,
+                    &cli.cmd,
+                    cli.verbose,
+                    preload_so,
+                    &cache_dir,
+                )?,
+                /* Dynamic musl: loader-chain launch wrapped in supervisor (kind 3) */
+                _ => {
+                    let pre = LaunchPlan::preload(
+                        &rootfs,
+                        program_host,
+                        &full_cmd,
+                        preload_so,
+                        cli.verbose,
+                        &cache_dir,
+                    )?;
+                    LaunchPlan::supervise(pre, supervisor)
+                }
+            }
+        } else {
+            match class {
             /* Dynamic Go: libc-linked for cgo, but io walks raw syscalls.
              * Interposer never sees them → supervisor translates. It still
              * launches via the sanitized loader chain (PT_INTERP present),
@@ -167,9 +200,14 @@ fn run() -> Result<u8, Error> {
                 preload_so,
                 &cache_dir,
             )?,
+            }
         }
     } else {
-        let preload_so = sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?;
+        let preload_so = if rootfs.libc_flavor() == LibcFlavor::Musl {
+            sprout_preload::core_library_musl_path().ok_or(Error::PreloadNotFound)?
+        } else {
+            sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?
+        };
         let cache_dir = cache_dir();
         LaunchPlan::preload(
             &rootfs,

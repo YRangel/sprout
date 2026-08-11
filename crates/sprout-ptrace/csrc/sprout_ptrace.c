@@ -81,7 +81,17 @@
  *
  * Unknown traps are still forwarded to the tracee with the original
  * signal so we don't silently mask real seccomp policy. */
-static const long SP_EMULATE_OK[] = { SYS_set_robust_list /*99*/, 293 /*rseq*/ };
+/* Base table (all guests): glibc tolerates ENOSYS for these two init calls. */
+static const long SP_EMULATE_BASE[] = { 99 /*set_robust_list*/, 293 /*rseq*/ };
+/* Musl extra: faccessat init-poll + Android-blocked set*id family — the
+ * "already at minimal privilege" truth of a rootless sandbox. Applied at
+ * signal-stop level for musl-flavored tracees (kind 3, dynamic -of-musl),
+ * NOT glibc (a guest that *legitimately* changes IDs must see EPERM, not
+ * a fabricated success — that's why the fast path forgives only musl). */
+static const long SP_EMULATE_MUSL_EXTRA[] = {
+    48 /*faccessat*/, 143,144,145,146,147,149,151,152 /*set*id*/,
+    159 /*setgroups*/
+};
 
 /* Linux 5.3+ exposes structured syscall info. */
 #ifndef PTRACE_GET_SYSCALL_INFO
@@ -120,12 +130,15 @@ static int poke_str(pid_t pid, unsigned long long addr, const char *s, size_t le
 static const char *g_loader;      /* SPROUT_LOADER: sanitized guest loader (host) */
 static const char *g_libpath;     /* SPROUT_LIBRARY_PATH: guest lib dirs (host) */
 static const char *g_guestpreload;/* SPROUT_GUEST_PRELOAD: interposer:sanitized-libc */
+static int g_libc_kind;           /* 0=glibc, 1=musl (SPROUT_LIBC) */
+#define SP_LIBC_MUSL 1
 
 /* tracee.kind: -1 unclassified, 0 dynamic preload-governed, 1 static,
  * 2 dynamic-Go (libc-linked yet raw-syscall — supervisor must translate).
  */
 static const char *sp_kind_name(int k) {
-    return k == 2 ? "GO-DYNAMIC (supervisor translates)" :
+    return k == 3 ? "MUSL-DYNAMIC (supervisor translates)" :
+           k == 2 ? "GO-DYNAMIC (supervisor translates)" :
            k == 1 ? "STATIC (supervisor translates)" :
            k == 0 ? "dynamic (preload governs)" : "unclassified";
 }
@@ -133,6 +146,30 @@ static const char *g_rootfs;      /* SPROUT_ROOTFS (guest root, host absolute) *
 
 /* Host-file ELF inspection (open + phdrs). Returns 1 static, 0 dynamic,
  * 2 shebang-script (interp copied into buf), -1 not recognized. */
+/* Busybox alpine layout: /bin/ls -> /bin/busybox absolute symlink would
+ * resolve on the HOST (missing). Chase absolute symlink targets back
+ * through the guest translation; relatives pass through. 8 hops. */
+static void sp_resolve_absolute_symlink(char host[SP_PATH_MAX]) {
+    char target[SP_PATH_MAX], dir[SP_PATH_MAX], tmp[SP_PATH_MAX];
+    for (int hop = 0; hop < 8; hop++) {
+        struct stat st;
+        if (lstat(host, &st) != 0 || !S_ISLNK(st.st_mode)) return;
+        ssize_t n = readlink(host, target, sizeof(target) - 1);
+        if (n < 0) return;
+        target[n] = '\0';
+        if (target[0] == '/') {
+            if (!sp_translate(&g_cfg, target, tmp)) return;
+            snprintf(host, SP_PATH_MAX, "%s", tmp);
+        } else {
+            snprintf(dir, sizeof(dir), "%s", host);
+            char *sl = strrchr(dir, '/');
+            if (!sl) return;
+            *sl = '\0';
+            snprintf(host, SP_PATH_MAX, "%s/%s", dir, target);
+        }
+    }
+}
+
 static int classify_host_file(const char *path, char interp_buf[SP_PATH_MAX],
                               char opt_buf[SP_PATH_MAX]) {
     FILE *f = fopen(path, "rb");
@@ -229,9 +266,12 @@ static int sp_rewrite_exec_to_loader(tracee_t *t, pid_t pid, struct user_pt_regs
         }
     }
 
-    /* compose new argv: loader --argv0 a0 --inhibit-cache --library-path lp hostprog rest... */
-    int fixed_nbase = 7;
-    /* entry COUNT (excluding NULL): 7 loader-chain items + orig args[1..] */
+    /* compose new argv: loader --argv0 a0 [--inhibit-cache] --library-path lp hostprog rest...
+     * (--inhibit-cache is glibc-only; musl ldso would reject unknown opts) */
+
+int musl = g_libc_kind == SP_LIBC_MUSL;
+    int fixed_nbase = musl ? 6 : 7;
+    /* entry COUNT (excluding NULL): N chain items + orig args[1..] */
     int new_argc = fixed_nbase + (argc - 1);
     if (new_argc > SP_EXEC_MAX_ARGS - 1) return 0;
 
@@ -289,7 +329,7 @@ static int sp_rewrite_exec_to_loader(tracee_t *t, pid_t pid, struct user_pt_regs
     new_args[w++] = g_loader;
     new_args[w++] = "--argv0";
     new_args[w++] = a0buf;
-    new_args[w++] = "--inhibit-cache";
+    if (!musl) new_args[w++] = "--inhibit-cache";
     new_args[w++] = "--library-path";
     new_args[w++] = g_libpath;
     new_args[w++] = host_prog;
@@ -521,7 +561,7 @@ static int chain_app_path(pid_t pid, char out[SP_PATH_MAX]) {
 static int classify_tracee_image(pid_t pid) {
     char app[SP_PATH_MAX];
     if (chain_app_path(pid, app))
-        return is_go_file(app) ? 2 : 0;
+        return is_go_file(app) ? 2 : (g_libc_kind == SP_LIBC_MUSL ? 3 : 0);
     char exe[64];
     snprintf(exe, sizeof(exe), "/proc/%d/exe", pid);
     FILE *f = fopen(exe, "rb");
@@ -759,6 +799,7 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
         if (guest_absolutize(pid, guest) != 0) return;
         char host[SP_PATH_MAX];
         if (!sp_translate(&g_cfg, guest, host)) return;
+        sp_resolve_absolute_symlink(host);
 
         char obuf[SP_PATH_MAX];
         char ibuf[SP_PATH_MAX];
@@ -910,6 +951,7 @@ int main(int argc, char **argv) {
     g_loader = getenv("SPROUT_LOADER");
     g_libpath = getenv("SPROUT_LIBRARY_PATH");
     g_guestpreload = getenv("SPROUT_GUEST_PRELOAD");
+    { const char *k = getenv("SPROUT_LIBC"); g_libc_kind = (k && strcmp(k, "musl") == 0) ? SP_LIBC_MUSL : 0; }
     g_rootfs = getenv("SPROUT_ROOTFS");
 
     /* Host env first; also empty bionic LD_* so the supervisor itself
@@ -1009,16 +1051,21 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[ptrace] %d SIGSYS stop eNR=%lld x8=%llu gsi_nr=%ld pc=%llx\n",
                             w, (long long)r.regs[8], r.regs[8], v.nr,
                             (unsigned long long)r.pc);
-                for (size_t i = 0; i < sizeof(SP_EMULATE_OK)/sizeof(*SP_EMULATE_OK); i++) {
-                    if ((long)r.regs[8] == SP_EMULATE_OK[i]) {
-                        r.regs[0] = 0;
-                        ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
-                        if (g_debug)
-                            fprintf(stderr, "[ptrace] %d SIGSYS swallowed: sysno=%llu emulated ok\n",
-                                    w, r.regs[8]);
-                        emulated = 1;
-                        break;
+                int use_musl_extra = (t->static_kind == 3) || (g_libc_kind == SP_LIBC_MUSL);
+                for (size_t i = 0; i < sizeof(SP_EMULATE_BASE)/sizeof(*SP_EMULATE_BASE) && !emulated; i++) {
+                    if ((long)r.regs[8] == SP_EMULATE_BASE[i]) emulated = 1;
+                }
+                if (!emulated && use_musl_extra) {
+                    for (size_t i = 0; i < sizeof(SP_EMULATE_MUSL_EXTRA)/sizeof(*SP_EMULATE_MUSL_EXTRA); i++) {
+                        if ((long)r.regs[8] == SP_EMULATE_MUSL_EXTRA[i]) { emulated = 1; break; }
                     }
+                }
+                if (emulated) {
+                    r.regs[0] = 0;
+                    ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
+                    if (g_debug)
+                        fprintf(stderr, "[ptrace] %d SIGSYS swallowed: sysno=%llu emulated ok\n",
+                                w, r.regs[8]);
                 }
             }
             /* swallow or deliver */

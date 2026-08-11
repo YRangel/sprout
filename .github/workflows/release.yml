@@ -23,7 +23,10 @@ jobs:
           test -n "$so" && cp "$so" dist/
           px=$(find target/release/build/sprout-ptrace-*/out -name sprout-ptrace | head -1)
           test -n "$px" && cp "$px" dist/
-          strip dist/sprout dist/libsprout-core.so dist/sprout-ptrace || true
+          # musl interposer: optional (built in-guest with musl-gcc when present)
+          mso=$(find target -name libsprout-core-musl.so 2>/dev/null | head -1)
+          if [ -n "$mso" ]; then cp "$mso" dist/; else echo "::warning:: musl interposer artifact not built (needs musl toolchain); see development.md"; fi
+          strip dist/sprout dist/libsprout-core.so dist/sprout-ptrace dist/libsprout-core-musl.so 2>/dev/null || true
           sha256sum dist/* > dist/SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:

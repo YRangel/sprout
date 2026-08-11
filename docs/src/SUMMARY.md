@@ -26,6 +26,7 @@
 - [0006: Android seccomp blocked syscalls](./adr/0006-android-seccomp-blocked-syscalls.md)
 - [0007: guest libc/ld.so sanitization](./adr/0007-guest-libc-sanitization.md)
 - [0008: supervisor design](./adr/0008-supervisor-design.md)
+- [0009: musl guests](./adr/0009-musl-guests.md)
 
 # Operations
 

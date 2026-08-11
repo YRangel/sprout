@@ -22,3 +22,16 @@ interposition per child (`posix_spawn`/`execve`/`system` wrappers). `find`
 leans hard on the `-flto` interposer's inline path translation.
 
 Reproduce: `bench/run.sh` (median-of-N comparative harness).
+
+
+## musl guests (v0.4, supervisor-routed)
+
+| workload | proot-distro (alpine) | sprout | speedup |
+|----------|-----------------------|--------|---------|
+| `busybox sh -c true` | 243 ms | 55 ms | **4.4×** |
+| `busybox ls /etc` | 242 ms | 72 ms | **3.4×** |
+
+Musl guests run under the supervisor (ADR-0009) because busybox's
+suid-drop and musl's `ld.so == libc` shape defeat glibc-style
+sanitization — yet still faster than proot, which pays ptrace per
+syscall everywhere.

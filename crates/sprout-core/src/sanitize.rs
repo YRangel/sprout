@@ -42,7 +42,20 @@ const PATCH_MOV_X0_XZR: [u8; 4] = [0xe0, 0x03, 0x1f, 0xaa];
 ///                        is glibc's documented fallback, 0 equally safe
 ///
 /// (Both verified live on Android 16 via the supervisor's trap log.)
-pub const EMULATED_SYSNOS: [u32; 2] = [99, 293];
+/// Syscalls currently *emulated as success* by in-place svc→`mov x0,xzr`
+/// replacement (aarch64). 99=set_robust_list, 293=rseq: ignored at
+/// call-site level by glibc's own errno propagation when ENOSYS'd.
+/// 48=faccessat: musl 1.2.6's `__libc_start_main` polls `faccessat("",
+/// R_OK, AT_EMPTY_PATH)` and gracefully tolerates failure — Android ≥15
+/// blocks 48 outright (SIGSYS), so we emulate success instead.
+/// glibc artifacts: ONLY the two progatics glibc tolerates ENOSYS for.
+pub const EMULATED_SYSNOS_GLIBC: [u32; 2] = [99, 293];
+/// musl artifacts: goto safety musl callers tolerate (faccessat poll) plus
+/// Android's blocked set*id family — emulating success here means "already
+/// at minimal privilege", the semantic a rootless sandbox provides.
+pub const EMULATED_SYSNOS_MUSL: [u32; 11] = [48, 99, 143, 144, 145, 146, 147, 149, 151, 152, 159];
+/// Back-compat union for old tests.
+pub const EMULATED_SYSNOS: [u32; 12] = [48, 99, 143, 144, 145, 146, 147, 149, 151, 152, 159, 293];
 
 /// Decode `mov x8, #imm` (MOVZ X8, #imm, LSL 0): insn 0xD2800068 | (imm << 5).
 fn mov_x8_imm(insn: u32) -> Option<u32> {
@@ -67,10 +80,14 @@ pub enum SanitizeError {
 }
 
 /// FNV-1a 64 over the file contents — deterministic cache key.
-fn content_hash(bytes: &[u8]) -> u64 {
+fn content_hash(bytes: &[u8], table: &[u32]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in bytes {
         h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    for &t in table {
+        h ^= t as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
     h
@@ -110,7 +127,7 @@ fn exec_ranges(bytes: &[u8]) -> Option<Vec<(usize, usize)>> {
 /// setup of any length between the mov and the svc is fine. Stops scanning
 /// each site at the first unconditional control-flow instruction (an
 /// `svc` in a different call site behind a branch is never ours).
-fn find_sites(bytes: &[u8], ranges: &[(usize, usize)]) -> Vec<usize> {
+fn find_sites_for(bytes: &[u8], ranges: &[(usize, usize)], sysnos: &[u32]) -> Vec<usize> {
     let mut sites = Vec::new();
     for &(start, end) in ranges {
         let seg = &bytes[start..end];
@@ -118,7 +135,7 @@ fn find_sites(bytes: &[u8], ranges: &[(usize, usize)]) -> Vec<usize> {
         while i + 8 <= seg.len() {
             let insn = u32::from_le_bytes(seg[i..i + 4].try_into().unwrap());
             if let Some(imm) = mov_x8_imm(insn) {
-                if EMULATED_SYSNOS.contains(&imm) {
+                if sysnos.contains(&imm) {
                     // look ahead up to 12 instructions for the svc
                     for back in 1..=12usize {
                         let j = i + back * 4;
@@ -152,7 +169,29 @@ fn find_sites(bytes: &[u8], ranges: &[(usize, usize)]) -> Vec<usize> {
 /// `kind` is a short tag embedded in the cache name ("libc", "ldso") so
 /// the two artifacts never collide.
 pub fn ensure_sanitized_glibc(lib: &Path, cache_dir: &Path, kind: &str) -> Result<PathBuf, SanitizeError> {
-    sanitize_impl(lib, cache_dir, kind)
+    sanitize_impl(lib, cache_dir, kind, &EMULATED_SYSNOS_GLIBC)
+}
+
+/// Sanitize a musl ld.so (which IS the libc): syncexec `{48, 99, 293}`.
+pub fn ensure_sanitized_musl(lib: &Path, cache_dir: &Path) -> Result<PathBuf, SanitizeError> {
+    sanitize_impl(lib, cache_dir, "musl-ldso", &EMULATED_SYSNOS_MUSL)
+}
+
+/// musl dedups libraries by filename, not SONAME: the sanitized ldso must
+/// appear under its REAL name (libc.musl-aarch64.so.1) in a shadow
+/// directory so that both (a) the loader itself and (b) every dynamic
+/// binary's DT_NEEDED libc.musl-aarch64.so.1 resolve to the sanitized
+/// copy. Returns the shadow path (guaranteed basename-preserving name).
+pub fn ensure_musl_shadow_ldso(lib: &Path, cache_dir: &Path) -> Result<PathBuf, SanitizeError> {
+    let sanitized = ensure_sanitized_musl(lib, cache_dir)?;
+    let shadow_dir = cache_dir.join("musl-shadow-lib");
+    std::fs::create_dir_all(&shadow_dir)?;
+    let dst = shadow_dir.join("libc.musl-aarch64.so.1");
+    // content-addressed src means: if it exists it is already correct
+    if !dst.exists() {
+        std::fs::hard_link(&sanitized, &dst).or_else(|_| std::fs::copy(&sanitized, &dst).map(|_| ()))?;
+    }
+    Ok(dst)
 }
 
 /// Back-compat alias for the libc entry point.
@@ -160,18 +199,18 @@ pub fn ensure_sanitized_libc(libc: &Path, cache_dir: &Path) -> Result<PathBuf, S
     ensure_sanitized_glibc(libc, cache_dir, "libc")
 }
 
-fn sanitize_impl(libc: &Path, cache_dir: &Path, kind: &str) -> Result<PathBuf, SanitizeError> {
+fn sanitize_impl(libc: &Path, cache_dir: &Path, kind: &str, sysnos: &[u32]) -> Result<PathBuf, SanitizeError> {
     let src = fs::read(libc)?;
     let ranges = exec_ranges(&src).ok_or_else(|| SanitizeError::NotElf64(libc.to_path_buf()))?;
     if ranges.is_empty() {
         return Err(SanitizeError::NoExecSegment(libc.to_path_buf()));
     }
-    let sites = find_sites(&src, &ranges);
+    let sites = find_sites_for(&src, &ranges, sysnos);
     if sites.is_empty() {
         return Err(SanitizeError::NoSites(libc.to_path_buf()));
     }
 
-    let hash = content_hash(&src);
+    let hash = content_hash(&src, sysnos);
     fs::create_dir_all(cache_dir)?;
     let out = cache_dir.join(format!("{kind}-sanitized-{hash:016x}.so"));
     if out.exists() {
@@ -227,7 +266,7 @@ mod tests {
         let bytes = fixture_libc();
         let ranges = exec_ranges(&bytes).unwrap();
         assert_eq!(ranges, vec![(256, 320)]);
-        let sites = find_sites(&bytes, &ranges);
+        let sites = find_sites_for(&bytes, &ranges, &EMULATED_SYSNOS_GLIBC);
         assert_eq!(sites, vec![268]);
     }
 
@@ -239,7 +278,7 @@ mod tests {
         let mov293 = (mov99 & !0x1fffe0) | (293 << 5);
         b[256..260].copy_from_slice(&mov293.to_le_bytes());
         let ranges = exec_ranges(&b).unwrap();
-        let sites = find_sites(&b, &ranges);
+        let sites = find_sites_for(&b, &ranges, &EMULATED_SYSNOS_GLIBC);
         assert_eq!(sites, vec![268]);
     }
 

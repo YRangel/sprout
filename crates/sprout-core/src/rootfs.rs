@@ -38,6 +38,15 @@ fn trim(p: &str) -> String {
     }
 }
 
+/// Guest libc flavor: how early-init + sanitization + loader argv are shaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibcFlavor {
+    /// GNU libc — needs sanitized copies on Android ≥15 (ADR-0007).
+    Glibc,
+    /// musl (Alpine & friends) — clean startup on Android, ldso is the libc.
+    Musl,
+}
+
 /// A validated guest root plus launch-time options.
 #[derive(Debug, Clone)]
 pub struct Rootfs {
@@ -51,6 +60,15 @@ pub struct Rootfs {
 }
 
 impl Rootfs {
+    /// Guest libc flavor detection: musl rootfses ship /lib/ld-musl-*.so.1
+    /// (which IS the libc); glibc rootfses ship ld-linux sources.
+    pub fn libc_flavor(&self) -> LibcFlavor {
+        if self.to_host(Path::new("/lib/ld-musl-aarch64.so.1")).exists() {
+            return LibcFlavor::Musl;
+        }
+        LibcFlavor::Glibc
+    }
+
     pub fn new(root: PathBuf) -> Result<Self, Error> {
         if !root.is_dir() {
             return Err(Error::RootfsMissing(root.display().to_string()));
@@ -97,8 +115,34 @@ impl Rootfs {
         Err(Error::ProgramNotFound(name.to_string()))
     }
 
+    /// Dereference a host path that is a symlink chain ending in an
+    /// absolute (guest-spelled) target, re-mapping it back into the rootfs.
+    /// Busybox alpine: /bin/echo -> /bin/busybox style. Up to 8 hops.
+    pub fn resolve_absolute_symlink(&self, host: &Path) -> Option<PathBuf> {
+        let mut cur = host.to_path_buf();
+        for _ in 0..8 {
+            let md = std::fs::symlink_metadata(&cur).ok()?;
+            if !md.file_type().is_symlink() {
+                return Some(cur);
+            }
+            let target = std::fs::read_link(&cur).ok()?;
+            if target.is_absolute() {
+                cur = self.to_host(&target);
+            } else {
+                cur = cur.parent()?.join(target);
+            }
+        }
+        None
+    }
+
     /// Locate the guest glibc dynamic loader (Ubuntu arm64 spellings).
     pub fn guest_loader(&self) -> Result<PathBuf, Error> {
+        if self.libc_flavor() == LibcFlavor::Musl {
+            let p = self.to_host(Path::new("/lib/ld-musl-aarch64.so.1"));
+            if p.exists() {
+                return Ok(p);
+            }
+        }
         const CANDIDATES: [&str; 3] = [
             "/lib/ld-linux-aarch64.so.1",
             "/lib64/ld-linux-aarch64.so.1",

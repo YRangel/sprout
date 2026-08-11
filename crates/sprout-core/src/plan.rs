@@ -18,6 +18,8 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
+
+use crate::rootfs::LibcFlavor;
 use std::process::ExitStatus;
 
 use crate::error::Error;
@@ -53,8 +55,71 @@ impl LaunchPlan {
         debug: bool,
         cache_dir: &std::path::Path,
     ) -> Result<Self, Error> {
+        let flavor = rootfs.libc_flavor();
         let loader = rootfs.guest_loader()?;
         let library_path = rootfs.library_path();
+
+        if flavor == LibcFlavor::Musl {
+            /* musl: the ldso IS the libc. Its early init (and every musl
+             * caller of set*id/faccessat!) crosses Android's blocked table
+             * → svc→mov-x0-xzr sanitization (ADR-0007). musl dedups by
+             * filename, so the shadow dir must host the artifact under
+             * its real SONAME (libc.musl-aarch64.so.1) and lead the
+             * --library-path order. */
+            let loader = crate::sanitize::ensure_musl_shadow_ldso(&loader, cache_dir)
+                .map_err(|e| crate::error::Error::Sanitize(e.to_string()))?;
+            let library_path = format!(
+                "{}:{}",
+                loader.parent().unwrap().display(),
+                library_path
+            );
+            let mut argv: Vec<OsString> = vec![
+                "--argv0".into(),
+                args.first()
+                    .cloned()
+                    .unwrap_or_else(|| guest_prog.clone().into_os_string()),
+                "--library-path".into(),
+                library_path.clone().into(),
+                guest_prog.clone().into_os_string(),
+            ];
+            argv.extend(args.iter().skip(1).cloned());
+
+            let guest_path = std::env::var("SPROUT_GUEST_PATH").unwrap_or_else(|_| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+            });
+            let mut env = vec![
+                ("PATH".into(), guest_path),
+                ("SPROUT_ROOTFS".into(), rootfs.root.display().to_string()),
+                ("LD_PRELOAD".into(), preload_so.display().to_string()),
+                ("LD_LIBRARY_PATH".into(), library_path.clone()),
+                ("SPROUT_LOADER".into(), loader.display().to_string()),
+                ("SPROUT_LIBRARY_PATH".into(), library_path),
+                ("SPROUT_LIBC".into(), "musl".into()),
+            ];
+            if !rootfs.bindings.is_empty() {
+                env.push(("SPROUT_BIND".into(), rootfs.binds_env()));
+            }
+            if rootfs.fakeroot {
+                env.push(("SPROUT_FAKEROOT".into(), "1".into()));
+            }
+            if rootfs.link2symlink {
+                env.push(("SPROUT_LINK2SYMLINK".into(), "1".into()));
+            }
+            if debug {
+                env.push(("SPROUT_DEBUG".into(), "1".into()));
+            }
+            return Ok(Self {
+                strategy: Strategy::Preload,
+                loader,
+                argv,
+                env,
+                cwd: rootfs
+                    .cwd
+                    .as_ref()
+                    .map(|c| rootfs.to_host(std::path::Path::new(c))),
+                display: guest_prog.display().to_string(),
+            });
+        }
 
         // ADR-0007: sanitized libc copy with set_robust_list emulated.
         let guest_libc = rootfs.find_libc()?;
@@ -177,6 +242,7 @@ impl LaunchPlan {
         preload_so: PathBuf,
         cache_dir: &std::path::Path,
     ) -> Result<Self, Error> {
+        let flavor = rootfs.libc_flavor();
         let mut argv: Vec<OsString> = vec!["--".into(), guest_prog.into_os_string()];
         argv.extend(args.iter().cloned());
 
@@ -193,7 +259,26 @@ impl LaunchPlan {
                 }),
             ),
         ];
-        if let (Ok(loader), Ok(libc)) = (rootfs.guest_loader(), rootfs.find_libc()) {
+        if flavor == LibcFlavor::Musl {
+            /* musl under the supervisor: same chain mechanics but pointing
+             * at the musl ld.so and the musl-built artifact; no sanitized
+             * copy (musl early-init never crosses Android's blocked list). */
+            if let Ok(loader) = rootfs.guest_loader() {
+                let loader = crate::sanitize::ensure_musl_shadow_ldso(&loader, cache_dir)
+                    .map_err(|e| crate::error::Error::Sanitize(e.to_string()))?;
+                env.push(("SPROUT_LOADER".into(), loader.display().to_string()));
+                env.push(("SPROUT_LIBRARY_PATH".into(), format!(
+                    "{}:{}",
+                    loader.parent().unwrap().display(),
+                    rootfs.library_path()
+                )));
+                env.push(("SPROUT_LIBC".into(), "musl".into()));
+                env.push((
+                    "SPROUT_GUEST_PRELOAD".into(),
+                    preload_so.display().to_string(),
+                ));
+            }
+        } else if let (Ok(loader), Ok(libc)) = (rootfs.guest_loader(), rootfs.find_libc()) {
             if let (Ok(loader_s), Ok(libc_s)) = (
                 crate::sanitize::ensure_sanitized_glibc(&loader, cache_dir, "ldso"),
                 crate::sanitize::ensure_sanitized_libc(&libc, cache_dir),

@@ -236,6 +236,46 @@ static void *sp_sym(const char *name) { return dlsym(RTLD_NEXT, name); }
         }                                                                  \
     } while (0)
 
+/* Translate + absolute-symlink chase. Alpine lays every applet out as an
+ * absolute symlink to /bin/busybox; the host kernel would resolve those
+ * targets on the HOST (missing). Only when the translation moved the path
+ * do we chase (host passthrough paths are the kernel's business).
+ * RTLD_NEXT syscalls keep us free of interposer recursion. */
+static int (*sp_real_lstat)(const char *, struct stat *) = NULL;
+static ssize_t (*sp_real_readlink)(const char *, char *, size_t) = NULL;
+static const char *sp_translate_x(const char *path, char buf[SP_PATH_MAX]) {
+    const char *out = sp_translate(&g_cfg, path, buf) ? buf : path;
+    if (out != buf) return out;
+    static int l2s_off = -1;
+    if (l2s_off < 0) l2s_off = getenv("SPROUT_DISABLE_L2S") ? 1 : 0;
+    if (l2s_off) return out;
+    char dir[SP_PATH_MAX], tmp[SP_PATH_MAX], lnk[SP_PATH_MAX];
+    for (int hop = 0; hop < 8; hop++) {
+        struct stat st;
+        if (!sp_real_lstat) sp_real_lstat = dlsym(RTLD_NEXT, "lstat");
+        if (!sp_real_lstat) break;
+        if (sp_real_lstat(buf, &st) != 0 || !S_ISLNK(st.st_mode)) break;
+        if (!sp_real_readlink) sp_real_readlink = dlsym(RTLD_NEXT, "readlink");
+        if (!sp_real_readlink) break;
+        ssize_t n = sp_real_readlink(buf, lnk, sizeof(lnk) - 1);
+        if (n < 0) break;
+        lnk[n] = '\0';
+        if (lnk[0] == '/') {
+            char back[SP_PATH_MAX];
+            if (!sp_translate(&g_cfg, lnk, back)) break;
+            snprintf(buf, SP_PATH_MAX, "%s", back);
+        } else {
+            snprintf(dir, sizeof(dir), "%s", buf);
+            char *sl = strrchr(dir, '/');
+            if (!sl) break;
+            *sl = '\0';
+            snprintf(tmp, sizeof(tmp), "%s/%s", dir, lnk);
+            snprintf(buf, SP_PATH_MAX, "%s", tmp);
+        }
+    }
+    return buf;
+}
+
 /* open-family: const char* path */
 int open(const char *path, int flags, ...) {
     static int (*SP_REAL(open))(const char *, int, ...) = NULL;
@@ -246,7 +286,7 @@ int open(const char *path, int flags, ...) {
         mode = va_arg(ap, mode_t); va_end(ap);
     }
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("open", path, p);
     return SP_REAL(open)(p, flags, mode);
 }
@@ -260,7 +300,7 @@ int open64(const char *path, int flags, ...) {
         mode = va_arg(ap, mode_t); va_end(ap);
     }
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("open64", path, p);
     return SP_REAL(open64)(p, flags, mode);
 }
@@ -274,7 +314,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
         mode = va_arg(ap, mode_t); va_end(ap);
     }
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("openat", path, p);
     return SP_REAL(openat)(dirfd, p, flags, mode);
 }
@@ -288,7 +328,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
         mode = va_arg(ap, mode_t); va_end(ap);
     }
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("openat64", path, p);
     return SP_REAL(openat64)(dirfd, p, flags, mode);
 }
@@ -297,7 +337,7 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
     static int (*SP_REAL(faccessat))(int, const char *, int, int) = NULL;
     SP_RESOLVE(faccessat);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("faccessat", path, p);
     return SP_REAL(faccessat)(dirfd, p, mode, flags);
 }
@@ -306,7 +346,7 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
     static int (*SP_REAL(statx))(int, const char *, int, unsigned int, struct statx *) = NULL;
     SP_RESOLVE(statx);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("statx", path, p);
     return SP_REAL(statx)(dirfd, p, flags, mask, buf);
 }
@@ -315,7 +355,7 @@ int mkdirat(int dirfd, const char *path, mode_t mode) {
     static int (*SP_REAL(mkdirat))(int, const char *, mode_t) = NULL;
     SP_RESOLVE(mkdirat);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("mkdirat", path, p);
     return SP_REAL(mkdirat)(dirfd, p, mode);
 }
@@ -324,7 +364,7 @@ int unlinkat(int dirfd, const char *path, int flags) {
     static int (*SP_REAL(unlinkat))(int, const char *, int) = NULL;
     SP_RESOLVE(unlinkat);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("unlinkat", path, p);
     return SP_REAL(unlinkat)(dirfd, p, flags);
 }
@@ -335,7 +375,7 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
     if (bufsiz == 0) return SP_REAL(readlinkat)(dirfd, path, buf, bufsiz);
     char x[SP_PATH_MAX];
     char target[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     ssize_t n = SP_REAL(readlinkat)(dirfd, p, target, SP_PATH_MAX - 1);
     if (n <= 0) return n;
     target[n] = '\0';
@@ -350,7 +390,7 @@ int chdir(const char *path) {
     static int (*SP_REAL(chdir))(const char *) = NULL;
     SP_RESOLVE(chdir);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("chdir", path, p);
     return SP_REAL(chdir)(p);
 }
@@ -388,7 +428,7 @@ char *realpath(const char *path, char *resolved) {
     static char *(*SP_REAL(realpath))(const char *, char *) = NULL;
     SP_RESOLVE(realpath);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     char tmp[SP_PATH_MAX];
     char *r = SP_REAL(realpath)(p, tmp);
     if (!r) return NULL;
@@ -407,7 +447,7 @@ int stat(const char *path, struct stat *st) {
     static int (*SP_REAL(stat))(const char *, struct stat *) = NULL;
     SP_RESOLVE(stat);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("stat", path, p);
     return SP_REAL(stat)(p, st);
 }
@@ -416,7 +456,7 @@ int stat64(const char *path, struct stat64 *st) {
     static int (*SP_REAL(stat64))(const char *, struct stat64 *) = NULL;
     SP_RESOLVE(stat64);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("stat64", path, p);
     return SP_REAL(stat64)(p, st);
 }
@@ -425,7 +465,7 @@ int lstat(const char *path, struct stat *st) {
     static int (*SP_REAL(lstat))(const char *, struct stat *) = NULL;
     SP_RESOLVE(lstat);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("lstat", path, p);
     return SP_REAL(lstat)(p, st);
 }
@@ -434,7 +474,7 @@ int lstat64(const char *path, struct stat64 *st) {
     static int (*SP_REAL(lstat64))(const char *, struct stat64 *) = NULL;
     SP_RESOLVE(lstat64);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("lstat64", path, p);
     return SP_REAL(lstat64)(p, st);
 }
@@ -443,7 +483,7 @@ int access(const char *path, int mode) {
     static int (*SP_REAL(access))(const char *, int) = NULL;
     SP_RESOLVE(access);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("access", path, p);
     return SP_REAL(access)(p, mode);
 }
@@ -454,7 +494,7 @@ ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
     if (bufsiz == 0) return SP_REAL(readlink)(path, buf, bufsiz);
     char x[SP_PATH_MAX];
     char target[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     /* Reserve one byte: readlink allows n == bufsiz, which would leave no
      * room for the NUL the reverse-translation step needs. */
     ssize_t n = SP_REAL(readlink)(p, target, SP_PATH_MAX - 1);
@@ -472,7 +512,7 @@ DIR *opendir(const char *name) {
     static DIR *(*SP_REAL(opendir))(const char *) = NULL;
     SP_RESOLVE(opendir);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, name, x) ? x : name;
+    const char *p = sp_translate_x(name, x);
     SP_TRACE("opendir", name, p);
     return SP_REAL(opendir)(p);
 }
@@ -482,7 +522,7 @@ int unlink(const char *path) {
     static int (*SP_REAL(unlink))(const char *) = NULL;
     SP_RESOLVE(unlink);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("unlink", path, p);
     return SP_REAL(unlink)(p);
 }
@@ -491,7 +531,7 @@ int rmdir(const char *path) {
     static int (*SP_REAL(rmdir))(const char *) = NULL;
     SP_RESOLVE(rmdir);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("rmdir", path, p);
     return SP_REAL(rmdir)(p);
 }
@@ -500,7 +540,7 @@ int mkdir(const char *path, mode_t mode) {
     static int (*SP_REAL(mkdir))(const char *, mode_t) = NULL;
     SP_RESOLVE(mkdir);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *p = sp_translate_x(path, x);
     SP_TRACE("mkdir", path, p);
     return SP_REAL(mkdir)(p, mode);
 }
@@ -509,8 +549,8 @@ int rename(const char *oldpath, const char *newpath) {
     static int (*SP_REAL(rename))(const char *, const char *) = NULL;
     SP_RESOLVE(rename);
     char xo[SP_PATH_MAX], xn[SP_PATH_MAX];
-    const char *po = sp_translate(&g_cfg, oldpath, xo) ? xo : oldpath;
-    const char *pn = sp_translate(&g_cfg, newpath, xn) ? xn : newpath;
+    const char *po = sp_translate_x(oldpath, xo);
+    const char *pn = sp_translate_x(newpath, xn);
     SP_TRACE("rename", oldpath, po);
     return SP_REAL(rename)(po, pn);
 }
@@ -519,7 +559,7 @@ int symlink(const char *target, const char *linkpath) {
     static int (*SP_REAL(symlink))(const char *, const char *) = NULL;
     SP_RESOLVE(symlink);
     char x[SP_PATH_MAX];
-    const char *lp = sp_translate(&g_cfg, linkpath, x) ? x : linkpath;
+    const char *lp = sp_translate_x(linkpath, x);
     /* target is guest-spelled by design; the reverse path is what readlink
      * hands back, so both directions stay consistent. */
     SP_TRACE("symlink", linkpath, lp);
@@ -527,8 +567,35 @@ int symlink(const char *target, const char *linkpath) {
 }
 
 /* ------------------------------------------------------------------ */
+
 /* execve chaining: rewriting exec targets through the guest loader    */
 /* ------------------------------------------------------------------ */
+
+/* Busybox-style appliance layouts make every tool an absolute symlink to
+ * /bin/busybox (or similar). On the host those absolute targets don't
+ * resolve; chase absolute symlinks back through the guest translation
+ * (relative ones are fine, the kernel resolves them on host). Mutates
+ * `host` in place, up to 8 hops. */
+static void sp_resolve_absolute_symlink(char host[SP_PATH_MAX]) {
+    char target[SP_PATH_MAX], dir[SP_PATH_MAX], tmp[SP_PATH_MAX];
+    for (int hop = 0; hop < 8; hop++) {
+        struct stat st;
+        if (lstat(host, &st) != 0 || !S_ISLNK(st.st_mode)) return;
+        ssize_t n = readlink(host, target, sizeof(target) - 1);
+        if (n < 0) return;
+        target[n] = '\0';
+        if (target[0] == '/') {
+            if (!sp_translate(&g_cfg, target, tmp)) return;
+            snprintf(host, SP_PATH_MAX, "%s", tmp);
+        } else {
+            snprintf(dir, sizeof(dir), "%s", host);
+            char *sl = strrchr(dir, '/');
+            if (!sl) return;
+            *sl = '\0';
+            snprintf(host, SP_PATH_MAX, "%s/%s", dir, target);
+        }
+    }
+}
 
 /* Return codes from sp_classify_host */
 #define SP_ELF_DYNAMIC 1
@@ -607,7 +674,7 @@ static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
         int w = snprintf(cand, sizeof(cand), "%s/%s", *dir ? dir : ".", name);
         if (w < 0 || (size_t)w >= sizeof(cand)) continue;
         char hostcand[SP_PATH_MAX];
-        const char *hc = sp_translate(&g_cfg, cand, hostcand) ? hostcand : cand;
+        const char *hc = sp_translate_x(cand, hostcand);
         if (access(hc, X_OK) == 0) {
             strcpy(out, cand);
             return 0;
@@ -625,15 +692,19 @@ static char **sp_build_loader_argv(const char *host_prog, char *const argv[],
     while (argv[argc]) argc++;
     const char *loader = getenv("SPROUT_LOADER");
     const char *lp = getenv("SPROUT_LIBRARY_PATH");
+    const char *libc_kind = getenv("SPROUT_LIBC"); /* "musl" or "glibc" (default) */
     if (!loader) return NULL;
-    int fixed = 6 + extra;  /* loader, --argv0, orig0, --inhibit-cache, --library-path, lp */
+    int musl = libc_kind && strcmp(libc_kind, "musl") == 0;
+    /* musl ldso has no cache: --inhibit-cache is a glibc-only flag and
+     * unknown options would make it bail out. */
+    int fixed = (6 + extra) - (musl ? 1 : 0);
     char **v = malloc((size_t)(fixed + argc) * sizeof(char *));
     if (!v) return NULL;
     int i = 0;
     v[i++] = (char *)loader;
     v[i++] = "--argv0";
     v[i++] = argv[0] ? argv[0] : (char *)host_prog;
-    v[i++] = "--inhibit-cache";
+    if (!musl) v[i++] = "--inhibit-cache";
     v[i++] = "--library-path";
     v[i++] = (char *)(lp ? lp : "");
     v[i++] = (char *)host_prog;
@@ -662,7 +733,11 @@ static int sp_real_execve(const char *path, char *const argv[], char *const envp
 static int sp_execve_chain(const char *path, char *const argv[], char *const envp[], int depth) {
     if (depth > 4) { errno = ELOOP; return -1; }
     char x[SP_PATH_MAX];
-    const char *host = sp_translate(&g_cfg, path, x) ? x : path;
+    const char *host_raw = sp_translate_x(path, x);
+    char hx[SP_PATH_MAX];
+    snprintf(hx, sizeof(hx), "%s", host_raw);
+    sp_resolve_absolute_symlink(hx);
+    const char *host = hx;
 
     char interp[SP_PATH_MAX];
     int cls = sp_classify_host(host, interp);
@@ -783,8 +858,11 @@ int system(const char *command) {
 /* ------------------------------------------------------------------ */
 #include <spawn.h>
 
-/* glibc's internal-but-frozen file_actions ABI layout (stable since 2.2;
- * introspected here exactly like proot/strace do). */
+/* libc-internal file_actions ABI. glibc: array of structs + __used count
+ * (frozen since 2.2). musl: doubly-linked struct fdop list, newest at
+ * head, executed tail→head (insertion order) — exactly what musl's own
+ * child does. Introspected here exactly like proot/strace do. */
+#if defined(__GLIBC__)
 struct sp_spawn_action {
     enum {
         sp_spawn_do_close,
@@ -839,6 +917,64 @@ static int sp_apply_file_actions(const posix_spawn_file_actions_t *fa) {
     return 0;
 }
 
+#define SP_ATTR_SIGMASK(a) ((a)->__ss)
+#define SP_ATTR_SIGDEF(a)  ((a)->__sd)
+
+#else /* __GLIBC__ not defined → musl */
+
+/* musl 1.2.x internal ABI (from src/process/fdop.h): */
+#define SP_FDOP_CLOSE  1
+#define SP_FDOP_DUP2   2
+#define SP_FDOP_OPEN   3
+#define SP_FDOP_CHDIR  4
+#define SP_FDOP_FCHDIR 5
+struct sp_musl_fdop {
+    struct sp_musl_fdop *next, *prev;
+    int cmd, fd, srcfd, oflag;
+    mode_t mode;
+    char path[]; /* flexible array (only OPEN carries one) */
+};
+
+static int sp_apply_file_actions(const posix_spawn_file_actions_t *fa) {
+    if (!fa || !fa->__actions) return 0;
+    /* newest action is at the head; musl executes tail→head (insertion
+     * order) — same traversal its own child does. */
+    const struct sp_musl_fdop *op = fa->__actions;
+    for (; op && op->next; op = op->next) {}
+    for (; op; op = op->prev) {
+        switch (op->cmd) {
+        case SP_FDOP_CLOSE:
+            close(op->fd);
+            break;
+        case SP_FDOP_DUP2:
+            if (dup2(op->srcfd, op->fd) < 0) return errno;
+            break;
+        case SP_FDOP_OPEN: {
+            int fd = open(op->path, op->oflag, op->mode);
+            if (fd < 0) return errno;
+            if (fd != op->fd) {
+                if (dup2(fd, op->fd) < 0) return errno;
+                close(fd);
+            }
+            break;
+        }
+        case SP_FDOP_CHDIR:
+            if (chdir(op->path) < 0) return errno;
+            break;
+        case SP_FDOP_FCHDIR:
+            if (fchdir(op->fd) < 0) return errno;
+            break;
+        default:
+            return EIO;
+        }
+    }
+    return 0;
+}
+
+#define SP_ATTR_SIGMASK(a) ((a)->__mask)
+#define SP_ATTR_SIGDEF(a)  ((a)->__def)
+#endif /* __GLIBC__ */
+
 static int sp_spawn_impl(pid_t *restrict pid, const char *path,
                          const posix_spawn_file_actions_t *fa,
                          const posix_spawnattr_t *attrp,
@@ -852,14 +988,14 @@ static int sp_spawn_impl(pid_t *restrict pid, const char *path,
         if (flags & POSIX_SPAWN_RESETIDS) { setgid(getgid()); setuid(getuid()); }
         if (flags & POSIX_SPAWN_SETPGROUP) setpgid(0, attrp->__pgrp);
         if (flags & POSIX_SPAWN_SETSIGMASK) {
-            sigset_t m; memcpy(&m, &attrp->__ss, sizeof(m));
+            sigset_t m; memcpy(&m, &SP_ATTR_SIGMASK(attrp), sizeof(m));
             sigprocmask(SIG_SETMASK, &m, NULL);
         }
         if (flags & POSIX_SPAWN_SETSIGDEF) {
             struct sigaction dfl; memset(&dfl, 0, sizeof(dfl));
             dfl.sa_handler = SIG_DFL;
             for (int s = 1; s < _NSIG; s++)
-                if (sigismember(&attrp->__sd, s)) sigaction(s, &dfl, NULL);
+                if (sigismember(&SP_ATTR_SIGDEF(attrp), s)) sigaction(s, &dfl, NULL);
         }
         int err = sp_apply_file_actions(fa);
         if (err) { errno = err; _exit(127); }

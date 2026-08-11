@@ -43,7 +43,32 @@ pub fn core_library_path() -> Option<PathBuf> {
     None
 }
 
-/// Absolute path to the natively-compiled translation unit-test binary.
+/// Absolute path to the musl-linked libsprout-core.so, if present.
+/// Same discovery order as core_library_path with distinct names.
+pub fn core_library_musl_path() -> Option<PathBuf> {
+    if let Ok(override_) = env::var("SPROUT_PRELOAD_MUSL_PATH") {
+        let p = PathBuf::from(override_);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("libsprout-core-musl.so");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    // sibling of the glibc artifact, when the launcher carries no copy yet
+    if let Some(so) = core_library_path() {
+        let p = so.with_file_name("libsprout-core-musl.so");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
 pub fn translate_test_binary() -> &'static Path {
     Path::new(env!("SPROUT_TRANSLATE_TEST_BIN"))
 }

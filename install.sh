@@ -27,6 +27,7 @@ pick() {
 }
 
 SP=$(pick sprout bin)
+MS=$(pick libsprout-core-musl.so)
 SO=$(pick libsprout-core.so)
 PX=$(pick sprout-ptrace)
 
@@ -45,6 +46,7 @@ mkdir -p "$DEST"
 cp "$SP" "$DEST/sprout"
 cp "$SO" "$DEST/libsprout-core.so"
 cp "$PX" "$DEST/sprout-ptrace"
+if [ -n "$MS" ]; then cp "$MS" "$DEST/libsprout-core-musl.so"; fi
 chmod 755 "$DEST/sprout" "$DEST/sprout-ptrace"
-echo "installed sprout + libsprout-core.so + sprout-ptrace -> $DEST"
+echo "installed sprout + libsprout-core.so + sprout-ptrace ${MS:++ libsprout-core-musl.so} -> $DEST"
 echo "verify:  $DEST/sprout --version && $DEST/sprout -r <rootfs> /bin/echo SPROUT-OK"
