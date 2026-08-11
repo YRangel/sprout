@@ -57,3 +57,12 @@ functions. There is no patching of `.text`, no PLT redirection beyond
 what `LD_PRELOAD` already does, no self-modifying anything. The
 supervisor's policy table is a single `switch` statement. Both are
 Deterministic and easy to argue about.
+
+## Supervisor layer (implemented, v0.3; ADR-0008)
+
+Static / preload-incapable images run under `sprout-ptrace`: SIGSYS swallow
+for {99, 293}, lazy per-pid classification (first syscall-stop, since
+TRACEEXEC never fires for the main image), dirfd-family path translation via
+stack-scratch poke (SP−16KiB), and full execve rewrite for static→dynamic /
+static→script targets building the sanitized-loader chain in tracee memory
+(SP−64KiB arena), injecting the complete plan context into envp.

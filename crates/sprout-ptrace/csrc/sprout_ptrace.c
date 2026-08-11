@@ -465,6 +465,27 @@ static int classify_tracee_image(pid_t pid) {
  * Current working directory of the tracee is not tracked, so only absolute
  * guest paths are rewritten (documented gap; at-family syscalls with a
  * real dirfd are skipped by callers). Returns 1 when regs were modified. */
+/* Turn a relative guest path absolute using the tracee's cwd (host view
+ * via /proc/<pid>/cwd, stripped of the rootfs prefix so it re-enters the
+ * guest spelling). Returns 0 on success; -1 when cwd is outside the
+ * guest rootfs (kernel judges then). */
+static int guest_absolutize(pid_t pid, char guest[SP_PATH_MAX]) {
+    if (guest[0] == '/') return 0;
+    char cw[SP_PATH_MAX];
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/%d/cwd", pid);
+    ssize_t n = readlink(link, cw, sizeof(cw) - 1);
+    if (n <= 0) return -1;
+    cw[n] = '\0';
+    size_t rl = strlen(g_cfg.rootfs);
+    if (strncmp(cw, g_cfg.rootfs, rl) != 0) return -1;
+    char joined[SP_PATH_MAX];
+    int w = snprintf(joined, sizeof(joined), "%s/%s", cw[rl] ? cw + rl : "/", guest);
+    if (w < 0 || (size_t)w >= sizeof(joined)) return -1;
+    snprintf(guest, SP_PATH_MAX, "%s", joined);
+    return 0;
+}
+
 static int translate_reg_path(tracee_t *t, pid_t pid, struct user_pt_regs *r, int argi,
                               const char *name) {
     (void)t;
@@ -472,7 +493,7 @@ static int translate_reg_path(tracee_t *t, pid_t pid, struct user_pt_regs *r, in
     if (ptr == 0 || ptr >= 0x800000000000ULL) return 0;
     char guest[SP_PATH_MAX];
     if (peek_str(pid, ptr, guest, sizeof(guest)) < 0) return 0;
-    if (guest[0] != '/') return 0;
+    if (guest_absolutize(pid, guest) != 0) return 0;
     char host[SP_PATH_MAX];
     if (!sp_translate(&g_cfg, guest, host)) return 0;
     size_t hl = strlen(host);
@@ -612,7 +633,7 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
         if (pptr == 0 || pptr >= 0x800000000000ULL) return;
         char guest[SP_PATH_MAX];
         if (peek_str(pid, pptr, guest, sizeof(guest)) < 0) return;
-        if (guest[0] != '/') return;
+        if (guest_absolutize(pid, guest) != 0) return;
         char host[SP_PATH_MAX];
         if (!sp_translate(&g_cfg, guest, host)) return;
 
