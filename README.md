@@ -18,12 +18,15 @@ ptrace syscall-stop overhead, plus an automatic ptrace fallback for static/Go bi
 > Status: **v0.1 in development.** See [`docs/src/adr/`](docs/src/adr/) for decisions and
 > [`docs/src/`](docs/src/) for the book.
 
+**User walkthrough: [QUICKSTART.md](QUICKSTART.md).**
+
 ## Quick reference
 
 ```console
 $ sprout -r ~/ubuntu -w /root -0 --link2symlink -- /bin/bash -l
 $ sprout -r ~/ubuntu /usr/bin/node server.js
 $ sprout --fallback=ptrace -r ~/ubuntu /usr/local/bin/static-go-server
+$ sprout -r ~/ubuntu --shared-tmp /usr/bin/xterm          # X11 via termux-x11
 ```
 
 `proot` CLI compatibility is a goal: `sprout` accepts `-r -b -q -0 --link2symlink -w`
