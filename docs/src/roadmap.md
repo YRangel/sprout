@@ -2,8 +2,8 @@
 
 | Milestone | Scope | Status |
 |---|---|---|
-| **v0.1** | Core: workspace, ELF classify → preload strategy, loader-launch, CLI surface | **in flight** |
-| **v0.2** | execve chaining: shebang scripts, `sh -c`, subprocesses inherit `LD_PRELOAD` | planned |
+| **v0.1** | Core: workspace, ELF classify → preload strategy, loader-launch, CLI surface | **done** (`-b/-w/-0/--link2symlink/-0` accepted; `--fallback` reserved for ptrace path) |
+| **v0.2** | execve chaining + shebang scripts + `system()`/`posix_spawn()` wrappers so guests spawn guests inside sprout | **done** |
 | **v0.3** | ptrace fallback: static/Go binaries work out of the box | planned |
 | **v0.4** | musl/Alpine guests (own loader name, no `--library-path`) | planned |
 | **v0.5** | embeddable `.so` + Android Library (AAR) for other apps | planned |
@@ -20,7 +20,7 @@ own ADR.
 - `--dry-run` documents the full exec plan for any guest ELF.
 - No `.text` patching, no `ptrace`, no temp files created at run time.
 
-## v0.2 design sketch (execve chains)
+## v0.3 design sketch (static binaries / exec-fallback supervisor; ptrace last resort, ADR-0002/)
 
 The preload core's `execve` wrapper becomes real: it prepends the loader
 to the target argv, keeps its own `SPROUT_*` env, and injects itself into

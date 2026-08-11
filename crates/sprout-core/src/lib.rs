@@ -11,6 +11,8 @@ mod plan;
 mod rootfs;
 mod strategy;
 
+pub mod sanitize;
+
 pub use elf::{classify, ElfError, GuestClass};
 pub use error::Error;
 pub use plan::LaunchPlan;

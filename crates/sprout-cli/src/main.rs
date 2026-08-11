@@ -111,7 +111,15 @@ fn run() -> Result<u8, Error> {
 
     let preload_so = sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?;
 
-    let plan = LaunchPlan::preload(&rootfs, program_host, &cli.cmd, preload_so, cli.verbose)?;
+    let cache_dir = cache_dir();
+    let plan = LaunchPlan::preload(
+        &rootfs,
+        program_host,
+        &cli.cmd,
+        preload_so,
+        cli.verbose,
+        &cache_dir,
+    )?;
 
     if cli.dry_run {
         eprintln!("{}", plan.explain());
@@ -119,7 +127,20 @@ fn run() -> Result<u8, Error> {
     }
 
     let status = plan.run()?;
-    Ok(status.code().map(|c| (c % 256) as u8).unwrap_or(1))
+    Ok(status.code().map(|c| c as u8).unwrap_or(1))
+}
+
+/// Where the sanitized-libc cache lives (ADR-0007). Override with
+/// SPROUT_CACHE_DIR; defaults to $HOME/.cache/sprout, or the system temp
+/// dir when HOME is unset.
+fn cache_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("SPROUT_CACHE_DIR") {
+        return PathBuf::from(p);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".cache").join("sprout");
+    }
+    std::env::temp_dir().join("sprout")
 }
 
 fn main() -> ExitCode {

@@ -22,6 +22,7 @@
 
 #include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -29,6 +30,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------------ */
@@ -277,6 +279,129 @@ int openat(int dirfd, const char *path, int flags, ...) {
     return SP_REAL(openat)(dirfd, p, flags, mode);
 }
 
+int openat64(int dirfd, const char *path, int flags, ...) {
+    static int (*SP_REAL(openat64))(int, const char *, int, ...) = NULL;
+    SP_RESOLVE(openat64);
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    SP_TRACE("openat64", path, p);
+    return SP_REAL(openat64)(dirfd, p, flags, mode);
+}
+
+int faccessat(int dirfd, const char *path, int mode, int flags) {
+    static int (*SP_REAL(faccessat))(int, const char *, int, int) = NULL;
+    SP_RESOLVE(faccessat);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    SP_TRACE("faccessat", path, p);
+    return SP_REAL(faccessat)(dirfd, p, mode, flags);
+}
+
+int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *buf) {
+    static int (*SP_REAL(statx))(int, const char *, int, unsigned int, struct statx *) = NULL;
+    SP_RESOLVE(statx);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    SP_TRACE("statx", path, p);
+    return SP_REAL(statx)(dirfd, p, flags, mask, buf);
+}
+
+int mkdirat(int dirfd, const char *path, mode_t mode) {
+    static int (*SP_REAL(mkdirat))(int, const char *, mode_t) = NULL;
+    SP_RESOLVE(mkdirat);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    SP_TRACE("mkdirat", path, p);
+    return SP_REAL(mkdirat)(dirfd, p, mode);
+}
+
+int unlinkat(int dirfd, const char *path, int flags) {
+    static int (*SP_REAL(unlinkat))(int, const char *, int) = NULL;
+    SP_RESOLVE(unlinkat);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    SP_TRACE("unlinkat", path, p);
+    return SP_REAL(unlinkat)(dirfd, p, flags);
+}
+
+ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
+    static ssize_t (*SP_REAL(readlinkat))(int, const char *, char *, size_t) = NULL;
+    SP_RESOLVE(readlinkat);
+    if (bufsiz == 0) return SP_REAL(readlinkat)(dirfd, path, buf, bufsiz);
+    char x[SP_PATH_MAX];
+    char target[SP_PATH_MAX];
+    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    ssize_t n = SP_REAL(readlinkat)(dirfd, p, target, SP_PATH_MAX - 1);
+    if (n <= 0) return n;
+    target[n] = '\0';
+    n = (ssize_t)sp_reverse(&g_cfg, target, target, sizeof(target));
+    if ((size_t)n > bufsiz) n = (ssize_t)bufsiz;
+    memcpy(buf, target, (size_t)n);
+    SP_TRACE("readlinkat", path, target);
+    return n;
+}
+
+int chdir(const char *path) {
+    static int (*SP_REAL(chdir))(const char *) = NULL;
+    SP_RESOLVE(chdir);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    SP_TRACE("chdir", path, p);
+    return SP_REAL(chdir)(p);
+}
+
+char *getcwd(char *buf, size_t size) {
+    static char *(*SP_REAL(getcwd))(char *, size_t) = NULL;
+    SP_RESOLVE(getcwd);
+    char tmp[SP_PATH_MAX];
+    char *r = SP_REAL(getcwd)(tmp, sizeof(tmp));
+    if (!r) return NULL;
+    char out[SP_PATH_MAX];
+    size_t n = sp_reverse(&g_cfg, tmp, out, sizeof(out));
+    n++; /* include NUL */
+    if (buf) {
+        if (size < n) { errno = ERANGE; return NULL; }
+        memcpy(buf, out, n);
+        return buf;
+    }
+    /* buf == NULL: glibc allocates; mimic: malloc of max(size, n+1) */
+    size_t want = size > n ? size : n;
+    char *m = malloc(want);
+    if (!m) return NULL;
+    memcpy(m, out, n);
+    return m;
+}
+
+static char *sp_strdup(const char *out) {
+    size_t n = strlen(out) + 1;
+    char *p = malloc(n);
+    if (p) memcpy(p, out, n);
+    return p;
+}
+
+char *realpath(const char *path, char *resolved) {
+    static char *(*SP_REAL(realpath))(const char *, char *) = NULL;
+    SP_RESOLVE(realpath);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate(&g_cfg, path, x) ? x : path;
+    char tmp[SP_PATH_MAX];
+    char *r = SP_REAL(realpath)(p, tmp);
+    if (!r) return NULL;
+    char out[SP_PATH_MAX];
+    sp_reverse(&g_cfg, tmp, out, sizeof(out));
+    if (!resolved) {
+        resolved = sp_strdup(out);
+    } else {
+        strcpy(resolved, out);
+    }
+    return resolved;
+}
+
 /* stat-family */
 int stat(const char *path, struct stat *st) {
     static int (*SP_REAL(stat))(const char *, struct stat *) = NULL;
@@ -399,6 +524,365 @@ int symlink(const char *target, const char *linkpath) {
      * hands back, so both directions stay consistent. */
     SP_TRACE("symlink", linkpath, lp);
     return SP_REAL(symlink)(target, lp);
+}
+
+/* ------------------------------------------------------------------ */
+/* execve chaining: rewriting exec targets through the guest loader    */
+/* ------------------------------------------------------------------ */
+
+/* Return codes from sp_classify_host */
+#define SP_ELF_DYNAMIC 1
+#define SP_ELF_STATIC  2
+#define SP_SCRIPT      3
+#define SP_NOT_ELF     0
+
+/* Minimal ELF64 inspection: classify host path as dynamic ELF (writes the
+ * PT_INTERP string into interp) / static ELF / script. Only reads header + a
+ * few hundred bytes. */
+static int sp_classify_host(const char *host, char interp[SP_PATH_MAX]) {
+    FILE *f = fopen(host, "rb");
+    if (!f) return SP_NOT_ELF;
+    unsigned char head[256];
+    size_t n = fread(head, 1, sizeof(head), f);
+    if (n >= 2 && head[0] == '#' && head[1] == '!') {
+        /* script: copy the interpreter word into interp */
+        size_t i = 2;
+        while (i < n && (head[i] == ' ' || head[i] == '\t')) i++;
+        size_t j = 0;
+        while (i < n && j < SP_PATH_MAX - 1 && head[i] != ' ' && head[i] != '\t'
+               && head[i] != '\n' && head[i] != '\r') {
+            interp[j++] = (char)head[i++];
+        }
+        interp[j] = '\0';
+        fclose(f);
+        return SP_SCRIPT;
+    }
+    if (n < 64 || head[0] != 0x7f || memcmp(head + 1, "ELF", 3) != 0 || head[4] != 2) {
+        fclose(f);
+        return SP_NOT_ELF;
+    }
+    unsigned int e_phoff = (unsigned int)(*(unsigned long long *)(head + 32));
+    unsigned short e_phentsize = *(unsigned short *)(head + 54);
+    unsigned short e_phnum = *(unsigned short *)(head + 56);
+    if (e_phentsize < 56 || e_phnum == 0 || e_phnum > 64) {
+        fclose(f);
+        return SP_NOT_ELF;
+    }
+    interp[0] = '\0';
+    for (unsigned int i = 0; i < e_phnum; i++) {
+        if (fseek(f, (long)(e_phoff + i * e_phentsize), SEEK_SET) != 0) break;
+        unsigned char ph[56];
+        if (fread(ph, 1, 56, f) != 56) break;
+        unsigned int p_type = *(unsigned int *)ph;
+        if (p_type != 3) continue; /* PT_INTERP */
+        unsigned long long p_offset = *(unsigned long long *)(ph + 8);
+        unsigned long long p_filesz = *(unsigned long long *)(ph + 32);
+        if (p_filesz == 0 || p_filesz >= SP_PATH_MAX) break;
+        if (fseek(f, (long)p_offset, SEEK_SET) != 0) break;
+        if (fread(interp, 1, (size_t)p_filesz, f) != (size_t)p_filesz) break;
+        interp[p_filesz - 1] = '\0';
+        fclose(f);
+        return interp[0] ? SP_ELF_DYNAMIC : SP_NOT_ELF;
+    }
+    fclose(f);
+    return SP_ELF_STATIC;
+}
+
+/* Resolve `name` against guest PATH (absolute or relative), writing the
+ * resulting GUEST-absolute candidate into out. Returns 0 on success,
+ * -1 when nothing matched. */
+static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
+    if (strchr(name, '/') != NULL) {
+        /* already path-qualified */
+        if (strlen(name) >= SP_PATH_MAX) return -1;
+        strcpy(out, name);
+        return 0;
+    }
+    const char *path = getenv("PATH");
+    const char *def = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "%s", path ? path : def);
+    for (char *dir = strtok(buf, ":"); dir; dir = strtok(NULL, ":")) {
+        char cand[SP_PATH_MAX];
+        int w = snprintf(cand, sizeof(cand), "%s/%s", *dir ? dir : ".", name);
+        if (w < 0 || (size_t)w >= sizeof(cand)) continue;
+        char hostcand[SP_PATH_MAX];
+        const char *hc = sp_translate(&g_cfg, cand, hostcand) ? hostcand : cand;
+        if (access(hc, X_OK) == 0) {
+            strcpy(out, cand);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Build the loader-chain argv for a dynamic guest program:
+ *   loader --argv0 <orig> --inhibit-cache --library-path <lp> <hostprog> [args...]
+ * into into allocated memory; caller frees with sp_free_argv. */
+static char **sp_build_loader_argv(const char *host_prog, char *const argv[],
+                                   int extra, int *outc) {
+    int argc = 0;
+    while (argv[argc]) argc++;
+    const char *loader = getenv("SPROUT_LOADER");
+    const char *lp = getenv("SPROUT_LIBRARY_PATH");
+    if (!loader) return NULL;
+    int fixed = 6 + extra;  /* loader, --argv0, orig0, --inhibit-cache, --library-path, lp */
+    char **v = malloc((size_t)(fixed + argc) * sizeof(char *));
+    if (!v) return NULL;
+    int i = 0;
+    v[i++] = (char *)loader;
+    v[i++] = "--argv0";
+    v[i++] = argv[0] ? argv[0] : (char *)host_prog;
+    v[i++] = "--inhibit-cache";
+    v[i++] = "--library-path";
+    v[i++] = (char *)(lp ? lp : "");
+    v[i++] = (char *)host_prog;
+    for (int k = 1; k < argc; k++) v[i++] = argv[k];
+    v[i] = NULL;
+    if (outc) *outc = i;
+    return v;
+}
+
+/* Execute path/argv/envp under the guest loader when dynamic; script
+ * shebangs resolve their interpreter first. depth guards recursion. */
+/* Resolve the REAL execve once for chain tails (we cannot call our own
+ * exported symbol — self-recursion). Direct declaration would collide with
+ * ours, so keep it under a private name and use a union (POSIX-sanctioned
+ * dlsym conversion). */
+static int sp_real_execve(const char *path, char *const argv[], char *const envp[]) {
+    static int (*f)(const char *, char *const *, char *const *) = NULL;
+    if (!f) {
+        union { void *p; __typeof__(f) q; } u;
+        u.p = dlsym(RTLD_NEXT, "execve");
+        f = u.q;
+    }
+    return f(path, argv, envp);
+}
+
+static int sp_execve_chain(const char *path, char *const argv[], char *const envp[], int depth) {
+    if (depth > 4) { errno = ELOOP; return -1; }
+    char x[SP_PATH_MAX];
+    const char *host = sp_translate(&g_cfg, path, x) ? x : path;
+
+    char interp[SP_PATH_MAX];
+    int cls = sp_classify_host(host, interp);
+    if (g_cfg.debug)
+        fprintf(stderr, "[sprout] execve('%s') host='%s' class=%d\n", path, host, cls);
+    switch (cls) {
+    case SP_ELF_DYNAMIC: {
+        char **v = sp_build_loader_argv(host, argv, 0, NULL);
+        if (!v) { errno = EIO; return -1; }
+        int rc = sp_real_execve(getenv("SPROUT_LOADER"), v, envp);
+        free(v);
+        return rc;
+    }
+    case SP_SCRIPT: {
+        /* script: interpret the shebang's interpreter via recursion, then
+         * append script path (guest spelling) + remaining argv */
+        char ires[SP_PATH_MAX];
+        if (sp_guest_path_search(interp, ires) != 0) { errno = ENOENT; return -1; }
+        /* build argv: [interp, script, argv+1...] */
+        int argc = 0;
+        while (argv[argc]) argc++;
+        char **v = malloc((size_t)(argc + 2) * sizeof(char *));
+        if (!v) { errno = ENOMEM; return -1; }
+        v[0] = ires;
+        v[1] = (char *)path;
+        for (int k = 1; k < argc; k++) v[1 + k] = argv[k];
+        v[1 + argc] = NULL;
+        int rc = sp_execve_chain(ires, v, envp, depth + 1);
+        free(v);
+        return rc;
+    }
+    case SP_ELF_STATIC:
+        /* static guest: no libc to interpose, raw syscalls bypass us;
+         * full support = v0.3 supervisor. */
+        errno = EINVAL;
+        if (g_cfg.debug)
+            fprintf(stderr, "[sprout] execve: static ELF '%s' needs the supervisor (v0.3)\n", path);
+        return -1;
+    default:
+        errno = ENOEXEC;
+        return -1;
+    }
+}
+
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    /* glibc binaries execve() never returns on success; the C interposer
+     * branches into the guest loader chain or hands through for host-auto
+     * cases (only for paths EXPLICITLY excluded from translation? none
+     * today: everything goes through the chain when dynamic). */
+    return sp_execve_chain(path, argv, envp, 0);
+}
+
+int execv(const char *path, char *const argv[]) {
+    return sp_execve_chain(path, argv, environ, 0);
+}
+
+int execvp(const char *path, char *const argv[]) {
+    char cand[SP_PATH_MAX];
+    if (sp_guest_path_search(path, cand) != 0) { errno = ENOENT; return -1; }
+    return sp_execve_chain(cand, argv, environ, 0);
+}
+
+int execvpe(const char *path, char *const argv[], char *const envp[]) {
+    char cand[SP_PATH_MAX];
+    if (sp_guest_path_search(path, cand) != 0) { errno = ENOENT; return -1; }
+    return sp_execve_chain(cand, argv, envp, 0);
+}
+
+int fexecve(int fd, char *const argv[], char *const envp[]) {
+    /* Map fd → host path; if it sits inside the guest rootfs we can chain
+     * normally, otherwise the host kernel must deal with it */
+    char link[64], host[SP_PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, host, sizeof(host) - 1);
+    if (n <= 0) { errno = ENOENT; return -1; }
+    host[n] = '\0';
+    char interp[SP_PATH_MAX];
+    switch (sp_classify_host(host, interp)) {
+    case SP_ELF_DYNAMIC: {
+        char **v = sp_build_loader_argv(host, argv, 0, NULL);
+        if (!v) { errno = EIO; return -1; }
+        int rc = sp_real_execve(getenv("SPROUT_LOADER"), v, envp);
+        free(v);
+        return rc;
+    }
+    default:
+        errno = ENOEXEC;
+        return -1;
+    }
+}
+
+/* glibc's system() bypasses our execve (it calls __execve internally),
+ * so we implement it with the public fork/exec pair instead. */
+int system(const char *command) {
+    if (!command) {
+        /* presence test: /bin/sh in guest */
+        char x[SP_PATH_MAX];
+        const char *p = sp_translate(&g_cfg, "/bin/sh", x) ? x : "/bin/sh";
+        return access(p, X_OK) == 0;
+    }
+    /* keep it simple: fork + exec /bin/sh -c command */
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return st;
+}
+
+/* ------------------------------------------------------------------ */
+/* posix_spawn/posix_spawnp: glibc's fast path calls __execvpe          */
+/* internally, which bypasses PLT interposition entirely. We implement   */
+/* the spawn contract as fork + setup + our own exec chain. POSIX        */
+/* explicitly permits a fork/exec implementation.                        */
+/* ------------------------------------------------------------------ */
+#include <spawn.h>
+
+/* glibc's internal-but-frozen file_actions ABI layout (stable since 2.2;
+ * introspected here exactly like proot/strace do). */
+struct sp_spawn_action {
+    enum {
+        sp_spawn_do_close,
+        sp_spawn_do_dup2,
+        sp_spawn_do_open,
+        sp_spawn_do_chdir,
+        sp_spawn_do_fchdir
+    } tag;
+    union {
+        struct { int fd; } close_action;
+        struct { int fd; int newfd; } dup2_action;
+        struct { int fd; char *path; int oflag; mode_t mode; } open_action;
+        struct { char *path; } chdir_action;
+        struct { int fd; } fchdir_action;
+    } action;
+};
+
+static int sp_apply_file_actions(const posix_spawn_file_actions_t *fa) {
+    if (!fa || !fa->__actions) return 0;
+    const struct sp_spawn_action *acts =
+        (const struct sp_spawn_action *)fa->__actions;
+    for (int i = 0; i < fa->__used; i++) {
+        const struct sp_spawn_action *a = &acts[i];
+        switch (a->tag) {
+        case sp_spawn_do_close:
+            close(a->action.close_action.fd);
+            break;
+        case sp_spawn_do_dup2:
+            if (dup2(a->action.dup2_action.fd, a->action.dup2_action.newfd) < 0)
+                return errno;
+            break;
+        case sp_spawn_do_open: {
+            int fd = open(a->action.open_action.path, a->action.open_action.oflag,
+                          a->action.open_action.mode);
+            if (fd < 0) return errno;
+            if (fd != a->action.open_action.fd) {
+                if (dup2(fd, a->action.open_action.fd) < 0) return errno;
+                close(fd);
+            }
+            break;
+        }
+        case sp_spawn_do_chdir:
+            if (chdir(a->action.chdir_action.path) < 0) return errno;
+            break;
+        case sp_spawn_do_fchdir:
+            if (fchdir(a->action.fchdir_action.fd) < 0) return errno;
+            break;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+
+static int sp_spawn_impl(pid_t *restrict pid, const char *path,
+                         const posix_spawn_file_actions_t *fa,
+                         const posix_spawnattr_t *attrp,
+                         char *const argv[], char *const envp[], int use_path) {
+    short flags = attrp ? attrp->__flags : 0;
+
+    pid_t child = fork();
+    if (child < 0) return errno;
+    if (child == 0) {
+        /* --- child side of spawn --- */
+        if (flags & POSIX_SPAWN_RESETIDS) { setgid(getgid()); setuid(getuid()); }
+        if (flags & POSIX_SPAWN_SETPGROUP) setpgid(0, attrp->__pgrp);
+        if (flags & POSIX_SPAWN_SETSIGMASK) {
+            sigset_t m; memcpy(&m, &attrp->__ss, sizeof(m));
+            sigprocmask(SIG_SETMASK, &m, NULL);
+        }
+        if (flags & POSIX_SPAWN_SETSIGDEF) {
+            struct sigaction dfl; memset(&dfl, 0, sizeof(dfl));
+            dfl.sa_handler = SIG_DFL;
+            for (int s = 1; s < _NSIG; s++)
+                if (sigismember(&attrp->__sd, s)) sigaction(s, &dfl, NULL);
+        }
+        int err = sp_apply_file_actions(fa);
+        if (err) { errno = err; _exit(127); }
+        if (use_path) execvp(path, argv);
+        else execve(path, argv, envp);
+        _exit(127);
+    }
+    if (pid) *pid = child;
+    return 0;
+}
+
+int posix_spawn(pid_t *restrict pid, const char *restrict path,
+                const posix_spawn_file_actions_t *fa,
+                const posix_spawnattr_t *restrict attrp,
+                char *const argv[restrict], char *const envp[restrict]) {
+    return sp_spawn_impl(pid, path, fa, attrp, argv, envp, 0);
+}
+
+int posix_spawnp(pid_t *restrict pid, const char *restrict file,
+                 const posix_spawn_file_actions_t *fa,
+                 const posix_spawnattr_t *restrict attrp,
+                 char *const argv[restrict], char *const envp[restrict]) {
+    return sp_spawn_impl(pid, file, fa, attrp, argv, envp, 1);
 }
 
 /* uid/gid spoofing for -0 / --root-id */

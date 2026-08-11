@@ -135,6 +135,26 @@ impl Rootfs {
             .join(":")
     }
 
+    /// Locate the guest's libc.so.6 (a real shared object, not the
+    /// `/usr/lib/.../libc.so` linker script).
+    pub fn find_libc(&self) -> Result<PathBuf, Error> {
+        const CANDIDATES: [&str; 4] = [
+            "/lib/aarch64-linux-gnu/libc.so.6",
+            "/usr/lib/aarch64-linux-gnu/libc.so.6",
+            "/lib64/libc.so.6",
+            "/lib/libc.so.6",
+        ];
+        for c in CANDIDATES {
+            let p = self.to_host(Path::new(c));
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+        Err(Error::LoaderMissing {
+            tried: CANDIDATES.iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
     /// Serialized `SPROUT_BIND` value consumed by the preload core.
     pub fn binds_env(&self) -> String {
         self.bindings

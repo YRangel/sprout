@@ -51,9 +51,22 @@ impl LaunchPlan {
         args: &[OsString],
         preload_so: PathBuf,
         debug: bool,
+        cache_dir: &std::path::Path,
     ) -> Result<Self, Error> {
         let loader = rootfs.guest_loader()?;
         let library_path = rootfs.library_path();
+
+        // ADR-0007: sanitized libc copy with set_robust_list emulated.
+        let guest_libc = rootfs.find_libc()?;
+        let sanitized = crate::sanitize::ensure_sanitized_libc(&guest_libc, cache_dir)
+            .map_err(|e| crate::error::Error::Sanitize(e.to_string()))?;
+
+        // The loader is statically linked and carries its OWN early-init copy
+        // of the blocked syscalls (verified: Devuan6 ld.so sites at 0x10618
+        // and 0x106d0). Sanitize it the same way; this is the object the
+        // kernel actually execs, so the fast path's entry point must be clean.
+        let loader = crate::sanitize::ensure_sanitized_glibc(&loader, cache_dir, "ldso")
+            .map_err(|e| crate::error::Error::Sanitize(e.to_string()))?;
 
         let mut argv: Vec<OsString> = vec![
             "--argv0".into(),
@@ -67,10 +80,16 @@ impl LaunchPlan {
         ];
         argv.extend(args.iter().skip(1).cloned());
 
+        // Order matters: libsprout-core.so FIRST so its wrappers win symbol
+        // resolution over libc (verified via dladdr probing: LD_PRELOAD is
+        // resolved left-to-right).
+        let ld_preload = format!("{}:{}", preload_so.display(), sanitized.display());
         let mut env = vec![
             ("SPROUT_ROOTFS".into(), rootfs.root.display().to_string()),
-            ("LD_PRELOAD".into(), preload_so.display().to_string()),
-            ("LD_LIBRARY_PATH".into(), library_path),
+            ("LD_PRELOAD".into(), ld_preload),
+            ("LD_LIBRARY_PATH".into(), library_path.clone()),
+            ("SPROUT_LOADER".into(), loader.display().to_string()),
+            ("SPROUT_LIBRARY_PATH".into(), library_path),
         ];
         if !rootfs.bindings.is_empty() {
             env.push(("SPROUT_BIND".into(), rootfs.binds_env()));
@@ -145,12 +164,39 @@ mod tests {
         let r = t.path();
         fs::create_dir_all(r.join("lib/aarch64-linux-gnu")).unwrap();
         fs::create_dir_all(r.join("usr/bin")).unwrap();
-        fs::write(r.join("lib/ld-linux-aarch64.so.1"), b"fake-loader").unwrap();
+        fs::write(r.join("lib/ld-linux-aarch64.so.1"), fake_libc_bytes()).unwrap();
         fs::write(r.join("usr/bin/mytool"), b"fake").unwrap();
         set_exec(r.join("usr/bin/mytool"));
+        fs::write(
+            r.join("lib/aarch64-linux-gnu/libc.so.6"),
+            fake_libc_bytes(),
+        )
+        .unwrap();
         let mut fsroot = Rootfs::new(r.to_path_buf()).unwrap();
         fsroot.cwd = Some("/root".into());
         (t, fsroot)
+    }
+
+    /// Same minimal ELF64 with a patchable set_robust_list site as the
+    /// sanitize tests' fixture (kept self-contained here).
+    fn fake_libc_bytes() -> Vec<u8> {
+        let mut b = vec![0u8; 1024];
+        b[0..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2;
+        b[5] = 1;
+        b[16..18].copy_from_slice(&3u16.to_le_bytes());
+        b[32..40].copy_from_slice(&64u64.to_le_bytes());
+        b[54..56].copy_from_slice(&56u16.to_le_bytes());
+        b[56..58].copy_from_slice(&1u16.to_le_bytes());
+        b[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[68..72].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        b[72..80].copy_from_slice(&256u64.to_le_bytes());
+        b[96..104].copy_from_slice(&64u64.to_le_bytes());
+        let text: [u32; 4] = [0xd2800c68, 0xf9400400, 0x91400000, 0xd4000001];
+        for (i, w) in text.iter().enumerate() {
+            b[256 + i * 4..260 + i * 4].copy_from_slice(&w.to_le_bytes());
+        }
+        b
     }
 
     #[cfg(unix)]
@@ -166,11 +212,19 @@ mod tests {
         let (_t, rootfs) = fake_rootfs();
         let prog = rootfs.find_program("mytool").unwrap();
         let args = vec![OsString::from("mytool"), OsString::from("--flag")];
-        let plan = LaunchPlan::preload(&rootfs, prog.clone(), &args, PathBuf::from("/so.so"), true)
+        let plan = LaunchPlan::preload(&rootfs, prog.clone(), &args, PathBuf::from("/so.so"), true, _t.path())
             .unwrap();
 
         assert_eq!(plan.strategy, Strategy::Preload);
-        assert_eq!(plan.loader.file_name().unwrap(), "ld-linux-aarch64.so.1");
+        assert!(
+            plan.loader
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ldso-sanitized-"),
+            "loader should be the sanitized copy: {:?}",
+            plan.loader
+        );
         // --argv0 preserves the original argv[0]
         let argv: Vec<_> = plan
             .argv
@@ -182,7 +236,12 @@ mod tests {
         assert_eq!(argv.last().unwrap(), "--flag");
         // env contract for the preload core
         let env: std::collections::HashMap<_, _> = plan.env.iter().cloned().collect();
-        assert_eq!(env["LD_PRELOAD"], "/so.so");
+        // LD_PRELOAD is sprout-core:sanitized-libc (ADR-0007), colon-separated
+        let ld = &env["LD_PRELOAD"];
+        assert!(ld.starts_with("/so.so:"), "LD_PRELOAD was {ld}");
+        assert!(ld.contains("libc-sanitized-"));
+        assert_eq!(env["SPROUT_LIBRARY_PATH"], env["LD_LIBRARY_PATH"]);
+        assert!(env.contains_key("SPROUT_LOADER"));
         assert_eq!(env["SPROUT_ROOTFS"], rootfs.root.display().to_string());
         assert!(env.contains_key("LD_LIBRARY_PATH"));
     }
@@ -197,10 +256,11 @@ mod tests {
             &[OsString::from("x")],
             PathBuf::from("/s"),
             false,
+            _t.path(),
         )
         .unwrap();
         let text = plan.explain();
         assert!(text.contains("LD_PRELOAD"));
-        assert!(text.contains("ld-linux-aarch64.so.1"));
+        assert!(text.contains("ldso-sanitized-"));
     }
 }

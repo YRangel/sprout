@@ -307,9 +307,30 @@ int main(int argc, char **argv) {
                 if (g_debug) {
                     struct user_pt_regs r;
                     struct iovec iov = { &r, sizeof(r) };
-                    if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &iov) == 0)
+                    if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &iov) == 0) {
                         fprintf(stderr, "[ptrace] died sig=%d pc=%llx x8=%llu\n",
                                 WTERMSIG(status), (unsigned long long)r.pc, r.regs[8]);
+                        /* Symbolize: which mapping contains pc? */
+                        char mapfile[64];
+                        snprintf(mapfile, sizeof(mapfile), "/proc/%d/maps", w);
+                        FILE *mf = fopen(mapfile, "r");
+                        if (mf) {
+                            char line[1024];
+                            unsigned long long pc = (unsigned long long)r.pc;
+                            while (fgets(line, sizeof(line), mf)) {
+                                unsigned long long lo, hi;
+                                if (sscanf(line, "%llx-%llx", &lo, &hi) == 2 && pc >= lo && pc < hi) {
+                                    unsigned long long off;
+                                    char path[512] = "?";
+                                    if (sscanf(line, "%*x-%*x %*s %llx %*s %*s %511[^\n]",
+                                               &off, path) < 1) off = 0;
+                                    fprintf(stderr, "[ptrace] pc module: %s +%llx\n", path, pc - lo + off);
+                                    break;
+                                }
+                            }
+                            fclose(mf);
+                        }
+                    }
                 }
                 return 128 + WTERMSIG(status);
             }

@@ -34,6 +34,9 @@ pub enum Error {
     #[error("libsprout-core.so not found. Either set SPROUT_PRELOAD_PATH=/path/to/libsprout-core.so, install it beside the `sprout` binary, or build it on a glibc host (docs/src/development.md).")]
     PreloadNotFound,
 
+    #[error("libc sanitization failed: {0}")]
+    Sanitize(String),
+
     #[error(transparent)]
     Elf(#[from] ElfError),
 
