@@ -1,37 +1,63 @@
 # Benchmarks
 
-Method: median of 5 runs after 1 warmup, on-device (Android 16, aarch64,
-kernel 6.12.23), guest **Debian 13 (trixie, glibc 2.41)** from proot-distro
-v5 containers. Both tools ran the exact same guest binaries each row.
+Method: wall-clock medians, on-device (Android 16, aarch64, kernel
+6.12.23). Same guest rootfs and same command lines on both sides;
+`proot-distro v5 ... login` is the incumbent baseline. Reproduce with
+`bench/run.sh [rootfs] [iterations]` (honors `SPROUT_BIN=...`).
 
-Recorded 2026-08-11 — `target/release/sprout` (Rust `-O3`/opt) +
-interposer C built with gcc `-O3 -flto` in-guest.
+## glibc guest — LD_PRELOAD fast path (release build, median-of-5)
 
-| workload | proot-distro | sprout | speedup |
-|----------|--------------|--------|---------|
-| `python3 -c pass` | 239 ms | 41 ms | **5.8×** |
-| `bash -c 'for i in $(seq 20); do /bin/true; done'` (exec-chain) | 285 ms | 49 ms | **5.8×** |
-| `find /etc -maxdepth 2 -type f` | 214 ms | 24 ms | **8.9×** |
+Guest: **Debian 13 (trixie, glibc 2.41)** (`proot-distro/containers/debian`).
 
-Debug build (`cargo build`, `-O2` interposer) for reference: ~2.2–3.7× —
-release mode roughly doubles the margin again.
+| workload                        | proot-distro | sprout | speedup |
+|---------------------------------|--------------|--------|---------|
+| `python3 -c pass`               | 251 ms       | 48 ms  | **5.2×** |
+| `bash -c true`                  | 236 ms       | 30 ms  | **7.9×** |
+| exec-chain (20× `/bin/true`)    | 316 ms       | 71 ms  | **4.5×** |
+| `find /etc -maxdepth 2 -type f` | 283 ms       | 34 ms  | **8.3×** |
 
-Why the chains/exec case dominates: proot pays ptrace round-trips per
-execve, sprout pays one loader launch for the *first* exec and then a PLT
-interposition per child (`posix_spawn`/`execve`/`system` wrappers). `find`
-leans hard on the `-flto` interposer's inline path translation.
+Debug build for reference: 2.6–3.0× on the same workloads.
 
-Reproduce: `bench/run.sh` (median-of-N comparative harness).
+Why sprout wins: proot pays ptrace round-trips for **every** path-bearing
+syscall in the guest; sprout's dynamic path pays one loader launch for the
+first exec and then a PLT interposition per child (`posix_spawn`/`execve`/
+`system` wrappers) with native syscalls in between.
 
+The exec-chain cell is ~45% slower than v0.3 (was 5.8×): ADR-0009's
+absolute-symlink chase (`sp_translate_x`) adds an `lstat` per translated
+exec path — the price of correct Alpine applet semantics on the interposer
+hot path.
 
-## musl guests (v0.4, supervisor-routed)
+## musl guest + supervisor-routed workloads (release build, median-of-7)
 
-| workload | proot-distro (alpine) | sprout | speedup |
-|----------|-----------------------|--------|---------|
-| `busybox sh -c true` | 243 ms | 55 ms | **4.4×** |
-| `busybox ls /etc` | 242 ms | 72 ms | **3.4×** |
+Guests: **Alpine (musl 1.2.6, busybox)** (`proot-distro/containers/alpine`)
+and supervisor-mode binaries in the Debian rootfs. Musl/static/Go classes
+always pay ptrace stops (ADR-0008/0009) — yet still beat the incumbent's
+ptrace-everything model:
 
-Musl guests run under the supervisor (ADR-0009) because busybox's
-suid-drop and musl's `ld.so == libc` shape defeat glibc-style
-sanitization — yet still faster than proot, which pays ptrace per
-syscall everywhere.
+| workload                        | proot-distro | sprout | speedup |
+|---------------------------------|--------------|--------|---------|
+| busybox `sh -c true` (musl)     | 221 ms       | 29 ms  | **7.6×** |
+| busybox `ls /etc/apk` (musl)    | 209 ms       | 36 ms  | **5.8×** |
+| musl `python3 -c pass`          | 249 ms       | 107 ms | **2.3×** |
+| musl-static binary (exit 42)    | 217 ms       | 27 ms  | **8.0×** |
+| nolibc-static (openat+exit 42)  | 228 ms       | 33 ms  | **6.9×** |
+| Go static (CGO_ENABLED=0)       | 231 ms       | 47 ms  | **4.9×** |
+
+Honest notes:
+
+- `busybox ls /etc` exits 1 under sprout because `/etc/mtab`
+  (relative → `../proc/mounts`) is unresolvable: sprout deliberately does
+  not bind-fake `/proc` (proot-distro does). The `/etc/apk` cell is the
+  clean comparison.
+- musl python3 (2.3×) is the busiest traced-process profile measured so
+  far — dense futex/signal/syscall traffic under kind=3 tracing.
+- Go-static at 4.9×: even the worst-case profile (per-syscall tracing of a
+  runtime that never lets LD_PRELOAD near its paths) is materially faster
+  than proot.
+
+## Historical (v0.3 toolchain sweep, 2026-08-11, same host)
+
+First published release pass: python3 239→41 (5.8×), exec-chain 285→49
+(5.8×), find 214→24 (8.9×). Kept for comparison with the table above
+(post-v0.4 numbers trade exec-chain speed for musl correctness).
