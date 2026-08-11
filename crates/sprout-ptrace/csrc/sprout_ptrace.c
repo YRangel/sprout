@@ -61,6 +61,27 @@
 
 #define AT_FDCWD_VAL         (-100)
 
+/* PTRACE_SET_SYSCALL rewrites the *cached* syscall number
+ * (regs->syscallno) that both seccomp and the dispatcher consult on
+ * aarch64. Writing x8 via PTRACE_SETREGSET is NOT sufficient — the kernel
+ * already latched the original nr at entry. Value 23 is the arch-fixed
+ * request on arm64; bionic headers simply don't export it. */
+#define SP_PTRACE_SET_SYSCALL 23
+
+/* Syscalls we are willing to silently emulate as success when seccomp
+ * traps them (signal-stop fallback path).
+ *
+ * Known on Android 15+:
+ *   SYS_set_robust_list  — glibc ≥ 2.39 unconditionally; robust-list is
+ *                          advisory, so zeroing is fully safe.
+ *   SYS_rseq             — glibc 2.41's rseq registration; treated as
+ *                          ENOSYS on Android (rseq registration denied).
+ *                          0 is safe: glibc falls back to non-rseq path.
+ *
+ * Unknown traps are still forwarded to the tracee with the original
+ * signal so we don't silently mask real seccomp policy. */
+static const long SP_EMULATE_OK[] = { SYS_set_robust_list /*99*/, 293 /*rseq*/ };
+
 /* Linux 5.3+ exposes structured syscall info. */
 #ifndef PTRACE_GET_SYSCALL_INFO
 #define PTRACE_GET_SYSCALL_INFO 0x420e
@@ -76,9 +97,10 @@ static int g_debug = 0;
 typedef struct {
     pid_t pid;
     int   sysno;
-    unsigned long long arg0;   /* original x0 on entry */
-    unsigned long long argN;   /* original xN on entry */
-    int   got_robust_list;     /* we replaced set_robust_list */
+    int   in_sys;              /* 1 while inside a syscall (fallback state) */
+    unsigned long long arg0;
+    unsigned long long argN;
+    int   got_robust_list;
 } tracee_t;
 
 static tracee_t g_tracees[SP_MAX_TRACEES];
@@ -96,14 +118,6 @@ static tracee_t *find_or_add(pid_t pid) {
 }
 
 /* helpers */
-
-static int set_sysno_getpid(pid_t pid) {
-    struct user_pt_regs r;
-    struct iovec iov = { &r, sizeof(r) };
-    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) != 0) return -1;
-    r.regs[8] = SYS_getpid;
-    return ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov);
-}
 
 static int set_ret_0(pid_t pid) {
     struct user_pt_regs r;
@@ -145,8 +159,17 @@ static int poke_str(pid_t pid, unsigned long long addr, const char *s, size_t le
     return 0;
 }
 
-/* Query the current syscall via PTRACE_GET_SYSCALL_INFO. */
-static int get_sysno_and_nr(pid_t pid, long *sysno, unsigned long long args[6]) {
+typedef struct {
+    int ok;             /* 1 if GSI is available and op == ENTRY */
+    long nr;            /* syscall number (kernel view, cached in regs->syscallno) */
+    unsigned long long args[6];
+} sp_syscall_view;
+
+/* Fetch syscall info. GSI returns the *authoritative* nr; if GSI is not
+ * supported, fall back to x8 from the register set. */
+static sp_syscall_view sp_view_syscall(pid_t pid, struct user_pt_regs *regs) {
+    sp_syscall_view v = {0};
+
     struct {
         unsigned char op;
         unsigned char pad[3];
@@ -154,20 +177,26 @@ static int get_sysno_and_nr(pid_t pid, long *sysno, unsigned long long args[6]) 
         unsigned long long ip, sp;
         union {
             struct { unsigned long long nr; unsigned long long args[6]; } entry;
-            struct { long long rval; unsigned char is_error; } exit_;
+            struct { long long      rval; unsigned char     is_error; } exit_;
         } u;
     } info;
-    long n = ptrace(PTRACE_GET_SYSCALL_INFO, pid, (void *)sizeof(info), &info);
-    if (n < 0) return -1;
-    if (info.op == 1) {              /* ENTRY */
-        *sysno = (long)info.u.entry.nr;
-        for (int i = 0; i < 6; i++) args[i] = info.u.entry.args[i];
-        return 1;
+
+    long rc = ptrace((int)0x420e /*PTRACE_GET_SYSCALL_INFO*/,
+                     pid, (void *)sizeof(info), &info);
+    if (rc > 0 && info.op == 1 /*PTRACE_SYSCALL_INFO_ENTRY*/) {
+        v.ok = 1;
+        v.nr = (long)info.u.entry.nr;
+        for (int i = 0; i < 6; i++) v.args[i] = info.u.entry.args[i];
+        /* regs is authoritative for the rest of the policy code anyway */
+        return v;
     }
-    if (info.op == 2) {              /* EXIT */
-        return 2;
+    /* Fallback: nr from x8 in regs (caller must have already GETREGSET'd). */
+    if (regs) {
+        v.ok = 0;
+        v.nr = (long)regs->regs[8];
+        for (int i = 0; i < 6; i++) v.args[i] = regs->regs[i];
     }
-    return 0;
+    return v;
 }
 
 /* On aarch64, GET_SYSCALL_INFO arguments: for ENTRY the six args are at
@@ -175,11 +204,23 @@ static int get_sysno_and_nr(pid_t pid, long *sysno, unsigned long long args[6]) 
 static void apply_policy_entry(tracee_t *t, pid_t pid,
                                 long sysno, unsigned long long x0, unsigned long long x1) {
     switch (sysno) {
-    case SYS_set_robust_list:
-        if (set_sysno_getpid(pid) != 0) break;
+    case SYS_set_robust_list: {
+        /* Rewrite the cached syscall number via PTRACE_SET_SYSCALL so
+         * seccomp evaluates getpid (always allowed) instead. errno
+         * distinguishes "no support" (EINVAL/ENOTSUP) from "stopped
+         * mid-syscall" (EIO) etc. */
+        errno = 0;
+        long rc = ptrace((int)23, pid, (void *)0, (void *)(long)SYS_getpid);
+        if (rc != 0) {
+            if (g_debug) fprintf(stderr,
+                "[ptrace] %d PTRACE_SET_SYSCALL failed rc=%ld errno=%d; relying on SIGSYS-swallow fallback\n",
+                pid, rc, errno);
+            break; /* signal-stop fallback below will handle it */
+        }
         t->got_robust_list = 1;
         if (g_debug) SP_TRACE("[%d] set_robust_list → getpid\n", pid);
         break;
+    }
 
     case SYS_openat: case SYS_openat2: case SYS_newfstatat:
     case SYS_faccessat: case SYS_faccessat2: case SYS_readlinkat:
@@ -282,17 +323,53 @@ int main(int argc, char **argv) {
         tracee_t *t = find_or_add(w);
         if (!t) goto cont;
 
+        /* Safety net: SECCOMP_RET_TRAP delivers SIGSYS as a signal-stop
+         * *before* the syscall executes (registers untouched). If the
+         * trapped syscall is on our emulate-OK whitelist, swallow the
+         * signal and forge x0=0; the guest believes the call succeeded. */
+        if (sig == SIGSYS) {
+            struct user_pt_regs r;
+            struct iovec iov = { &r, sizeof(r) };
+            int emulated = 0;
+            if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &iov) == 0) {
+                sp_syscall_view v = sp_view_syscall(w, &r); if (g_debug) fprintf(stderr, "[sprt20] %d sys-stop e_ld=%lld x0=%llu x8=%llu\n", w, (long long)r.regs[8], r.regs[0], r.regs[8]);
+                if (g_debug)
+                    fprintf(stderr, "[ptrace] %d SIGSYS stop eNR=%lld x8=%llu gsi_nr=%ld pc=%llx\n",
+                            w, (long long)r.regs[8], r.regs[8], v.nr,
+                            (unsigned long long)r.pc);
+                for (size_t i = 0; i < sizeof(SP_EMULATE_OK)/sizeof(*SP_EMULATE_OK); i++) {
+                    if ((long)r.regs[8] == SP_EMULATE_OK[i]) {
+                        r.regs[0] = 0;
+                        ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
+                        if (g_debug)
+                            fprintf(stderr, "[ptrace] %d SIGSYS swallowed: sysno=%llu emulated ok\n",
+                                    w, r.regs[8]);
+                        emulated = 1;
+                        break;
+                    }
+                }
+            }
+            /* swallow or deliver */
+            ptrace(PTRACE_SYSCALL, w, 0, emulated ? (void *)0 : (void *)(long)sig);
+            continue;
+        }
+
         if (sig == (SIGTRAP | 0x80)) {  /* syscall-stop */
-            long sysno = -1;
-            unsigned long long args6[6] = {0};
-            int kind = get_sysno_and_nr(w, &sysno, args6);
-            if (kind == 1) {           /* ENTRY */
-                t->sysno = sysno;
-                apply_policy_entry(t, w, sysno, args6[0], args6[1]);
-            } else if (kind == 2) {    /* EXIT */
-                if (t->got_robust_list) {
-                    set_ret_0(w);
-                    t->got_robust_list = 0;
+            struct user_pt_regs r;
+            struct iovec iov = { &r, sizeof(r) };
+            if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &iov) != 0) goto cont;
+            sp_syscall_view v = sp_view_syscall(w, &r);
+            if (v.ok) {                /* GSI ENTRY */
+                t->sysno = v.nr;
+                apply_policy_entry(t, w, v.nr, v.args[0], v.args[1]);
+            } else {                   /* no GSI: use x8 + local in_sys toggle */
+                if (!t->in_sys) {
+                    t->sysno = v.nr;
+                    apply_policy_entry(t, w, v.nr, v.args[0], v.args[1]);
+                    t->in_sys = 1;
+                } else {
+                    if (t->got_robust_list) { set_ret_0(w); t->got_robust_list = 0; }
+                    t->in_sys = 0;
                 }
             }
             goto cont;
