@@ -36,10 +36,11 @@ is intra-process (e.g. `/bin/true` 20×).
   (abstract namespace) are untouched** — kernel-only namespace, no
   filesystem semantics to redirect. **No symlink chasing on sockets**
   (bind *creates* the pathname).
-- ptrace supervisor (musl/static/Go): forward-only v1 — `bind(200)`,
-  `connect(203)`, `sendto(206)` rewritten via the stack-scratch arena;
-  `sendmsg`(211)/reverse noted in code as a documented gap (X11 stream
-  workloads only ever need the connect direction).
+- ptrace supervisor (musl/static/Go): `bind(200)`, `connect(203)`,
+  `sendto(206)`, `sendmsg(211)` via stack-scratch arena + pending-reverse
+  state consumed at the EXIT stop for `getsockname(204)`, `recvfrom(207)`,
+  `recvmsg(212)` (GSI op==2 detected when available; in_sys toggle
+  fallback on kernels without PTRACE_GET_SYSCALL_INFO).
 - 108-byte `sun_path` limit: if the translated pathname would exceed,
   pass through unchanged (kernel's own EFAULT/ECONNREFUSED is always
   more honest than a silently truncated path).
@@ -62,8 +63,8 @@ is intra-process (e.g. `/bin/true` 20×).
   host-enforced PT_INTERP).
 - On-device verified: glibc Python client ↔ host X-socket server rc=42;
   musl, musl-static, Go-dynamic, Go-static all rc=42; abstract socket
-  round-trip verified; `getsockname` returns the **guest spelling** after
-  translation.
+  round-trip verified; `getsockname`/`recvmsg` return the **guest spelling**
+  on BOTH layers (supervisor reverse provoof via musl datagram cohort).
 - `--dry-run` lists the injected `SPROUT_BIND=...` line; unprivileged
   verification of proot-distro `--shared-tmp` parity completed.
 

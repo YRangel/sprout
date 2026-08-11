@@ -112,6 +112,11 @@ typedef struct {
     unsigned long long arg0;
     unsigned long long argN;
     int   got_robust_list;
+    /* pending reverse-AF_UNIX translation: armed at ENTRY for
+     * getsockname/recvfrom/recvmsg, consumed at the matching EXIT stop. */
+    long  rev_sysno;               /* 0 = none */
+    unsigned long long rev_addr;   /* sockaddr* (or msghdr* for recvmsg 212) */
+    unsigned long long rev_lenp;   /* socklen_t* for 204/207 */
     /* -1 = not yet classified at exec event, 0 = dynamic (preload governs),
      * 1 = static: no LD_PRELOAD possible, supervisor must translate. */
     int   static_kind;
@@ -674,6 +679,7 @@ static int translate_reg_path(tracee_t *t, pid_t pid, struct user_pt_regs *r, in
 
 typedef struct {
     int ok;             /* 1 if GSI is available and op == ENTRY */
+    int op;             /* 1=ENTRY 2=EXIT 0=unknown (GSI absent/failed) */
     long nr;            /* syscall number (kernel view, cached in regs->syscallno) */
     unsigned long long args[6];
 } sp_syscall_view;
@@ -696,6 +702,7 @@ static sp_syscall_view sp_view_syscall(pid_t pid, struct user_pt_regs *regs) {
 
     long rc = ptrace((int)0x420e /*PTRACE_GET_SYSCALL_INFO*/,
                      pid, (void *)sizeof(info), &info);
+    if (rc > 0) v.op = info.op;
     if (rc > 0 && info.op == 1 /*PTRACE_SYSCALL_INFO_ENTRY*/) {
         v.ok = 1;
         v.nr = (long)info.u.entry.nr;
@@ -803,10 +810,112 @@ static const sp_sock_rule SP_SOCK_RULES[] = {
     { 200 /*SYS_bind*/,    1, 2, "bind"    },
     { 203 /*SYS_connect*/, 1, 2, "connect" },
     { 206 /*SYS_sendto*/,  4, 5, "sendto"  },
-    /* sendmsg(211): msg_name lives through a user struct — needs deeper
-     * peek; covered by the interposer for dynamic tracees; documented
-     * supervisor gap for v1 (datagram X11 is rare). */
 };
+
+/* sendmsg(211): msghdr.msg_name may carry a pathname sockaddr. Layout on
+ * aarch64 LP64: msg_name(0..8), msg_namelen(8..12), then iov/control/... */
+static int translate_reg_sendmsg(pid_t pid, struct user_pt_regs *r) {
+    unsigned long long mptr = r->regs[1];
+    if (mptr == 0 || mptr >= 0x800000000000ULL) return 0;
+    errno = 0;
+    long q0 = ptrace(PTRACE_PEEKDATA, pid, (void *)mptr, NULL);
+    if (q0 == -1 && errno) return 0;
+    unsigned long long name = (unsigned long long)q0;
+    long q1 = ptrace(PTRACE_PEEKDATA, pid, (void *)(mptr + 8), NULL);
+    if (q1 == -1 && errno) return 0;
+    unsigned int namelen = (unsigned int)(q1 & 0xffffffffu);
+    if (name == 0 || namelen < 4 || namelen > 256) return 0;
+    /* reuse the sockaddr recognizer: family+path at `name` */
+    unsigned short fam = (unsigned short)(ptrace(PTRACE_PEEKDATA, pid, (void *)name, NULL) & 0xffffu);
+    if (fam != AF_UNIX) return 0;
+    char guest[108];
+    ssize_t n = peek_str(pid, name + offsetof(struct sockaddr_un, sun_path), guest, sizeof(guest));
+    if (n <= 0 || guest[0] == '\0') return 0;
+    if (guest_absolutize(pid, guest) != 0) return 0;
+    char host[SP_PATH_MAX];
+    if (!sp_translate(&g_cfg, guest, host)) return 0;
+    size_t off = offsetof(struct sockaddr_un, sun_path);
+    size_t hl = strlen(host);
+    if (hl + off + 1 > 108) return 0;
+    struct sockaddr_un out;
+    memset(&out, 0, sizeof(out));
+    out.sun_family = AF_UNIX;
+    memcpy(out.sun_path, host, hl + 1);
+    /* scratch plan: sockaddr_un at [base), msghdr copy at [base+128) */
+    unsigned long long base = r->sp - 16000;
+    errno = 0;
+    if (ptrace(PTRACE_PEEKDATA, pid, (void *)base, NULL) == -1 && errno) return 0;
+    if (poke_str(pid, base, (const char *)&out, off + hl) != 0) return 0;
+    /* copy the 56-byte msghdr body */
+    for (size_t o = 0; o < 56; o += sizeof(long)) {
+        long w = ptrace(PTRACE_PEEKDATA, pid, (void *)(mptr + o), NULL);
+        if (w == -1 && errno) return 0;
+        if (ptrace(PTRACE_POKEDATA, pid, (void *)(base + 128 + o), (void *)w) == -1) return 0;
+    }
+    if (ptrace(PTRACE_POKEDATA, pid, (void *)(base + 128), (void *)(long)base) == -1) return 0;
+    long newlen = (long)(off + hl + 1);
+    /* msg_namelen: 32-bit field at +8; preserve upper 32 bits of its word */
+    long q2 = ptrace(PTRACE_PEEKDATA, pid, (void *)(base + 128 + 8), NULL);
+    if (q2 == -1 && errno) return 0;
+    q2 = (q2 & ~0xffffffffLL) | (long)newlen;
+    if (ptrace(PTRACE_POKEDATA, pid, (void *)(base + 128 + 8), (void *)q2) == -1) return 0;
+    r->regs[1] = base + 128;
+    if (g_debug) SP_TRACE("[%d] sendmsg msg_name %s -> %s\n", pid, guest, host);
+    return 1;
+}
+
+/* Reverse-translate an AF_UNIX pathname in tracee memory AFTER the kernel
+ * filled it. Pathname only shrinks (prefix is stripped), safe in place.
+ * mp=0: addr is a bare sockaddr* with its socklen in the tracee at lenp;
+ * mp=1: addr is an msghdr* (getsockname-style name+namelen at +0/+8). */
+static void reverse_pending_addr(pid_t pid, tracee_t *t) {
+    unsigned long long addr, lenp = 0;
+    int mp = 0;
+    if (t->rev_sysno == 206) {} /* not tracked */
+    if (t->rev_sysno == 204 || t->rev_sysno == 207) { addr = t->rev_addr; lenp = t->rev_lenp; }
+    else if (t->rev_sysno == 212) { addr = t->rev_addr; mp = 1; }
+    else { t->rev_sysno = 0; return; }
+    struct user_pt_regs r;
+    struct iovec iov = { &r, sizeof(r) };
+    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) != 0) { t->rev_sysno = 0; return; }
+    if ((long long)r.regs[0] < 0) { t->rev_sysno = 0; return; } /* syscall failed */
+    if (mp) {
+        errno = 0;
+        long q0 = ptrace(PTRACE_PEEKDATA, pid, (void *)addr, NULL);
+        if (q0 == -1 && errno) { t->rev_sysno = 0; return; }
+        long q1 = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr + 8), NULL);
+        if (q1 == -1 && errno) { t->rev_sysno = 0; return; }
+        addr = (unsigned long long)q0;
+        lenp = t->rev_addr + 8;
+    }
+    if (addr == 0) { t->rev_sysno = 0; return; }
+    errno = 0;
+    long f = ptrace(PTRACE_PEEKDATA, pid, (void *)addr, NULL);
+    if (f == -1 && errno) { t->rev_sysno = 0; return; }
+    if ((unsigned short)(f & 0xffffu) != AF_UNIX) { t->rev_sysno = 0; return; }
+    size_t off = offsetof(struct sockaddr_un, sun_path);
+    char host[120];
+    ssize_t n = peek_str(pid, addr + off, host, sizeof(host));
+    if (n <= 0 || host[0] == '\0') { t->rev_sysno = 0; return; }
+    char guest[SP_PATH_MAX];
+    size_t gl = sp_reverse(&g_cfg, host, guest, sizeof(guest));
+    if (!gl) { t->rev_sysno = 0; return; }
+    /* sister discipline (ADR-0010): pathname reverse only *shrinks*. */
+    if (poke_str(pid, addr + off, guest, gl) != 0) { t->rev_sysno = 0; return; }
+    if (lenp) {
+        errno = 0;
+        long q2 = ptrace(PTRACE_PEEKDATA, pid, (void *)lenp, NULL);
+        if (!(q2 == -1 && errno)) {
+            unsigned long long newlen = (unsigned long long)(off + gl + 1);
+            q2 = (q2 & ~0xffffffffLL) | (long)newlen;
+            ptrace(PTRACE_POKEDATA, pid, (void *)lenp, (void *)q2);
+        }
+    }
+    if (g_debug) SP_TRACE("[%d] %s reverse sun_path %s -> %s\n", pid,
+                          t->rev_sysno == 204 ? "getsockname" : t->rev_sysno == 207 ? "recvfrom" : "recvmsg",
+                          host, guest);
+    t->rev_sysno = 0;
+}
 
 static void apply_policy_entry(tracee_t *t, pid_t pid,
                                 long sysno, unsigned long long x0, unsigned long long x1) {
@@ -988,6 +1097,34 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
         return;
     }
 
+    /* sendmsg: msg_name through the 56-byte msghdr struct */
+    if (sysno == 211 /*SYS_sendmsg*/) {
+        struct user_pt_regs rchk;
+        struct iovec iovchk = { &rchk, sizeof(rchk) };
+        if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovchk) != 0) return;
+        if (translate_reg_sendmsg(pid, &rchk))
+            ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovchk);
+        return;
+    }
+
+    /* reverse-capable entries: the kernel fills the sockaddr on EXIT; arm
+     * pending state and consume it at the matching exit stop. */
+    if (sysno == 204 /*getsockname*/ || sysno == 207 /*recvfrom*/) {
+        struct user_pt_regs rchk;
+        struct iovec iovchk = { &rchk, sizeof(rchk) };
+        if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovchk) != 0) return;
+        if (sysno == 204) { t->rev_addr = rchk.regs[1]; t->rev_lenp = rchk.regs[2]; }
+        else              { t->rev_addr = rchk.regs[4]; t->rev_lenp = rchk.regs[5]; }
+        t->rev_sysno = (t->rev_addr && t->rev_lenp) ? sysno : 0;
+        /* no forward rewrite needed; fall through to default continuation */
+    } else if (sysno == 212 /*recvmsg*/) {
+        struct user_pt_regs rchk;
+        struct iovec iovchk = { &rchk, sizeof(rchk) };
+        if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovchk) != 0) return;
+        t->rev_addr = rchk.regs[1];
+        t->rev_sysno = t->rev_addr ? sysno : 0;
+    }
+
     for (size_t i = 0; i < sizeof(SP_PATH_RULES)/sizeof(*SP_PATH_RULES); i++) {
         const sp_path_rule *rule = &SP_PATH_RULES[i];
         if (rule->sysno != sysno) continue;
@@ -1158,6 +1295,10 @@ int main(int argc, char **argv) {
             struct iovec iov = { &r, sizeof(r) };
             if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &iov) != 0) goto cont;
             sp_syscall_view v = sp_view_syscall(w, &r);
+            if (v.op == 2) {           /* GSI EXIT stop: no entry-policy */
+                if (t->rev_sysno) reverse_pending_addr(w, t);
+                goto cont;
+            }
             if (v.ok) {                /* GSI ENTRY */
                 t->sysno = v.nr;
                 apply_policy_entry(t, w, v.nr, v.args[0], v.args[1]);
@@ -1168,6 +1309,7 @@ int main(int argc, char **argv) {
                     t->in_sys = 1;
                 } else {
                     if (t->got_robust_list) { set_ret_0(w); t->got_robust_list = 0; }
+                    if (t->rev_sysno) reverse_pending_addr(w, t);
                     t->in_sys = 0;
                 }
             }
