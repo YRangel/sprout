@@ -1,0 +1,16 @@
+name: Termux self-hosted device matrix
+
+# Manual-only: a job bound to a [self-hosted] label stays QUEUED for 24h when
+# no such runner is registered, which would poison push CI's green state.
+# Trigger workflow_dispatch when a Termux runner is attached to the repo.
+on:
+  workflow_dispatch:
+
+jobs:
+  test-termux:
+    name: test (Termux aarch64 self-hosted)
+    runs-on: [self-hosted, linux, arm64, termux]
+    steps:
+      - uses: actions/checkout@v4
+      - run: pkg show rust >/dev/null 2>&1 || pkg install -y rust clang
+      - run: cargo test --workspace --all-targets

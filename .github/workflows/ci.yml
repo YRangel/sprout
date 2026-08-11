@@ -38,14 +38,6 @@ jobs:
           # glibc-linked: must *not* reference Android-only symbols
           ! readelf -d "$so" | grep -qi android
 
-  test-termux:
-    name: test (Termux aarch64 self-hosted)
-    runs-on: [self-hosted, linux, arm64, termux]
-    if: ${{ always() }}  # skip gracefully when no runner registered
-    steps:
-      - uses: actions/checkout@v4
-      - run: pkg show rust >/dev/null 2>&1 || pkg install -y rust clang
-      - run: cargo test --workspace --all-targets
 
   build-cdylib:
     name: build libsprout-core.so (glibc)

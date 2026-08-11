@@ -60,3 +60,32 @@ bench/            # repro benchmarks vs proot (see benchmark.md)
 - Every behavior change lands with (a) a test and (b) an ADR if it
   crosses strategy decisions.
 - `cargo fmt --check` and `cargo clippy -- -D warnings` are CI-enforced.
+
+## First-push CI checklist (todo #16)
+
+Local dry-run (all green 2026-08-11, Android 16 / Termux):
+`cargo fmt --check` ✓ · `cargo clippy -D warnings` ✓ · `cargo test` 23/23 ✓ ·
+`actionlint` (rhysd/actionlint v1.7.8) on all 3 workflows ✓ ·
+`mdbook build` (v0.4.52, static musl binary) ✓ · `cargo audit -n` rc=0 over 45 deps ✓.
+
+Found-and-fixed before first push:
+1. `docs/book.toml`: `[output.linkcheck]` must be `optional = true` — CI's
+   actions-mdbook installs mdbook only; without the flag `mdbook build` fails
+   rc=101 (verified locally).
+2. `release.yml` docs job: `publish_dir: docs/book/html` — with two backends
+   (html + optional linkcheck) mdbook ≥0.4.36 nests each backend's output;
+   publishing `docs/book` would 404.
+3. `test-termux` job moved to `termux-selfhosted.yml` (workflow_dispatch only):
+   a `[self-hosted]` job with no registered runner queues 24h → CI red.
+4. `.github/actionlint.yaml` declares the custom `termux` runner label.
+
+Handoff (user action required — needs network + GitHub account):
+- repo MUST be **public** for free `ubuntu-24.04-arm` runners (private repos
+  need paid larger runners; otherwise switch test/build jobs to ubuntu-latest + QEMU)
+- update `git-repository-url` in docs/book.toml + README links (currently the
+  placeholder org `sprout-os/sprout`)
+- `git remote add origin <url> && git push -u origin main`
+- `gh run watch` (or Actions tab) for first green checkmarks
+- `git tag v0.4.0 && git push --tags` exercises release.yml end-to-end
+  (collects sprout + libsprout-core.so + sprout-ptrace + optional musl .so,
+  strips, SHA256SUMS, GitHub Release, gh-pages docs deploy)

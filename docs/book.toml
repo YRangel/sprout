@@ -13,3 +13,7 @@ edit-url-template = "https://github.com/sprout-os/sprout/edit/main/docs/{path}"
 
 [output.linkcheck]
 follow-web-links = false
+# CI (peaceiris/actions-mdbook) installs mdbook only — without the linkcheck
+# binary `mdbook build` hard-fails (rc=101). optional=true keeps CI green and
+# still runs linkcheck locally when the plugin exists.
+optional = true
