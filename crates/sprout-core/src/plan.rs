@@ -330,4 +330,37 @@ mod tests {
         assert!(text.contains("LD_PRELOAD"));
         assert!(text.contains("ldso-sanitized-"));
     }
+
+    /// Regression guard: the supervisor plan env MUST spell the prefix
+    /// SPROUT_ (a single-letter typo like SPROOT_ROOTFS compiles fine but
+    /// breaks the supervisor at runtime — burned one iteration live).
+    #[test]
+    fn supervisor_plan_env_spells_sprout_keys() {
+        let (_t, rootfs) = fake_rootfs();
+        let cache = ::tempfile::tempdir().unwrap();
+        let plan = LaunchPlan::supervisor(
+            &rootfs,
+            PathBuf::from("/host/sprout-ptrace"),
+            rootfs.find_program("mytool").unwrap(),
+            "mytool",
+            &[OsString::from("--flag")],
+            false,
+            PathBuf::from("/host/libsprout-core.so"),
+            cache.path(),
+        )
+        .unwrap();
+        let has = |k: &str| plan.env.iter().any(|(ek, _)| ek == k);
+        assert!(has("SPROUT_ROOTFS"), "env must carry SPROUT_ROOTFS");
+        assert!(has("SPROUT_LOADER"), "env must carry SPROUT_LOADER");
+        assert!(has("SPROUT_LIBRARY_PATH"));
+        assert!(has("SPROUT_GUEST_PRELOAD"));
+        assert!(has("PATH"), "env must carry guest PATH default");
+        for (k, _) in &plan.env {
+            assert!(
+                !k.starts_with("SPROOT"),
+                "typo prefix SPROOT_ leaked into env: {k}"
+            );
+        }
+        assert_eq!(plan.argv[0], OsString::from("--"));
+    }
 }

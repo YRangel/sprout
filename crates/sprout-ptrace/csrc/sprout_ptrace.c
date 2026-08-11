@@ -881,7 +881,7 @@ int main(int argc, char **argv) {
             struct iovec iov = { &r, sizeof(r) };
             int emulated = 0;
             if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &iov) == 0) {
-                sp_syscall_view v = sp_view_syscall(w, &r); if (g_debug) fprintf(stderr, "[sprt20] %d sys-stop e_ld=%lld x0=%llu x8=%llu\n", w, (long long)r.regs[8], r.regs[0], r.regs[8]);
+                sp_syscall_view v = sp_view_syscall(w, &r);
                 if (g_debug)
                     fprintf(stderr, "[ptrace] %d SIGSYS stop eNR=%lld x8=%llu gsi_nr=%ld pc=%llx\n",
                             w, (long long)r.regs[8], r.regs[8], v.nr,
