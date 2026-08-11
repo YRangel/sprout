@@ -13,7 +13,7 @@ Guest: **Debian 13 (trixie, glibc 2.41)** (`proot-distro/containers/debian`).
 |---------------------------------|--------------|--------|---------|
 | `python3 -c pass`               | 251 ms       | 48 ms  | **5.2×** |
 | `bash -c true`                  | 236 ms       | 30 ms  | **7.9×** |
-| exec-chain (20× `/bin/true`)    | 316 ms       | 71 ms  | **4.5×** |
+| exec-chain (20× `/bin/true`)    | 258 ms       | 51 ms  | **5.1×** |
 | `find /etc -maxdepth 2 -type f` | 283 ms       | 34 ms  | **8.3×** |
 
 Debug build for reference: 2.6–3.0× on the same workloads.
@@ -23,10 +23,10 @@ syscall in the guest; sprout's dynamic path pays one loader launch for the
 first exec and then a PLT interposition per child (`posix_spawn`/`execve`/
 `system` wrappers) with native syscalls in between.
 
-The exec-chain cell is ~45% slower than v0.3 (was 5.8×): ADR-0009's
-absolute-symlink chase (`sp_translate_x`) adds an `lstat` per translated
-exec path — the price of correct Alpine applet semantics on the interposer
-hot path.
+v0.4.1 note (ADR-0010): the symlink-chase cost that regressed this cell
+to 4.5× is now amortized by the per-process translate memoization table
+— 51 ms / 5.1×. Marginal per-exec cost sits at the ld.so load floor
+(~2 ms), which any PT_INTERP-respecting launcher pays.
 
 ## musl guest + supervisor-routed workloads (release build, median-of-7)
 
