@@ -166,6 +166,7 @@ impl LaunchPlan {
     /// Executes `sprout-ptrace -- <host-program> [args...]` with
     /// `SPROUT_ROOTFS` set so the supervisor's syscall-entry hook can
     /// translate absolute pathname arguments.
+    #[allow(clippy::too_many_arguments)]
     pub fn supervisor(
         rootfs: &Rootfs,
         supervisor: PathBuf,
@@ -173,24 +174,49 @@ impl LaunchPlan {
         display_program: &str,
         args: &[OsString],
         debug: bool,
-    ) -> Self {
+        preload_so: PathBuf,
+        cache_dir: &std::path::Path,
+    ) -> Result<Self, Error> {
         let mut argv: Vec<OsString> = vec!["--".into(), guest_prog.into_os_string()];
         argv.extend(args.iter().cloned());
-        let mut env: Vec<(String, String)> = vec![(
-            "SPROUT_ROOTFS".into(),
-            rootfs.root.display().to_string(),
-        )];
+
+        // The supervisor rewrites static→dynamic execve into the loader
+        // chain; give it the same sanitized assets the preload plan uses.
+        // Failure is non-fatal: without them, only static→static exec is
+        // possible under the supervisor.
+        let mut env: Vec<(String, String)> = vec![
+            ("SPROUT_ROOTFS".into(), rootfs.root.display().to_string()),
+            (
+                "PATH".into(),
+                std::env::var("SPROUT_GUEST_PATH").unwrap_or_else(|_| {
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+                }),
+            ),
+        ];
+        if let (Ok(loader), Ok(libc)) = (rootfs.guest_loader(), rootfs.find_libc()) {
+            if let (Ok(loader_s), Ok(libc_s)) = (
+                crate::sanitize::ensure_sanitized_glibc(&loader, cache_dir, "ldso"),
+                crate::sanitize::ensure_sanitized_libc(&libc, cache_dir),
+            ) {
+                env.push(("SPROUT_LOADER".into(), loader_s.display().to_string()));
+                env.push(("SPROUT_LIBRARY_PATH".into(), rootfs.library_path()));
+                env.push((
+                    "SPROUT_GUEST_PRELOAD".into(),
+                    format!("{}:{}", preload_so.display(), libc_s.display()),
+                ));
+            }
+        }
         if debug {
             env.push(("SPROUT_DEBUG".into(), "1".into()));
         }
-        Self {
+        Ok(Self {
             strategy: Strategy::Ptrace,
             loader: supervisor,
             argv,
             env,
             cwd: None,
             display: display_program.to_string(),
-        }
+        })
     }
 }
 

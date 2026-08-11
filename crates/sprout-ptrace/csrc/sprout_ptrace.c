@@ -109,6 +109,256 @@ typedef struct {
 static tracee_t g_tracees[SP_MAX_TRACEES];
 static sp_config_t g_cfg;
 
+/* Loader-chain context for rewriting static→dynamic execve (empty-/lib64
+ * guest rootfs cannot satisfy PT_INTERP on the host). Provided by the CLI
+ * plan via env; see LaunchPlan::supervisor. */
+/* helpers defined below (forward decls for the exec rewriter) */
+static long peek_str(pid_t pid, unsigned long long addr, char *out, size_t cap);
+static int poke_str(pid_t pid, unsigned long long addr, const char *s, size_t len);
+
+static const char *g_loader;      /* SPROUT_LOADER: sanitized guest loader (host) */
+static const char *g_libpath;     /* SPROUT_LIBRARY_PATH: guest lib dirs (host) */
+static const char *g_guestpreload;/* SPROUT_GUEST_PRELOAD: interposer:sanitized-libc */
+static const char *g_rootfs;      /* SPROUT_ROOTFS (guest root, host absolute) */
+
+/* Host-file ELF inspection (open + phdrs). Returns 1 static, 0 dynamic,
+ * 2 shebang-script (interp copied into buf), -1 not recognized. */
+static int classify_host_file(const char *path, char interp_buf[SP_PATH_MAX],
+                              char opt_buf[SP_PATH_MAX]) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    unsigned char head[256];
+    size_t n = fread(head, 1, sizeof(head), f);
+    if (n >= 2 && head[0] == '#' && head[1] == '!') {
+        size_t i = 2;
+        while (i < n && (head[i] == ' ' || head[i] == '\t')) i++;
+        size_t j = 0;
+        while (i < n && j < SP_PATH_MAX - 1 && head[i] != ' ' && head[i] != '\t'
+               && head[i] != '\n' && head[i] != '\r') {
+            interp_buf[j++] = (char)head[i++];
+        }
+        interp_buf[j] = '\0';
+        /* ONE optional argument (kernel semantics): rest of the line */
+        while (i < n && (head[i] == ' ' || head[i] == '\t')) i++;
+        size_t k = 0;
+        while (i < n && k < SP_PATH_MAX - 1 && head[i] != '\n' && head[i] != '\r') {
+            opt_buf[k++] = (char)head[i++];
+        }
+        while (k > 0 && (opt_buf[k - 1] == ' ' || opt_buf[k - 1] == '\t')) k--;
+        opt_buf[k] = '\0';
+        fclose(f);
+        return j ? 2 : -1;
+    }
+    if (n < 64 || memcmp(head, "\x7f" "ELF", 4) != 0 || head[4] != 2) { fclose(f); return -1; }
+    unsigned long long e_phoff = *(unsigned long long *)(head + 32);
+    unsigned short e_phentsize = *(unsigned short *)(head + 54);
+    unsigned short e_phnum = *(unsigned short *)(head + 56);
+    for (unsigned int i = 0; i < e_phnum && i < 32; i++) {
+        if (fseek(f, (long)(e_phoff + i * e_phentsize), SEEK_SET) != 0) break;
+        unsigned char ph[56];
+        if (fread(ph, 1, sizeof(ph), f) != sizeof(ph)) break;
+        if (*(unsigned int *)ph == PT_INTERP) { fclose(f); return 0; }
+    }
+    fclose(f);
+    return 1;
+}
+
+static long peek_u64(pid_t pid, unsigned long long addr) {
+    errno = 0;
+    long v = ptrace(PTRACE_PEEKDATA, pid, (void *)addr, NULL);
+    if (v == -1 && errno) return -1;
+    return v;
+}
+
+/* Rewrite a STATIC tracee's execve of a DYNAMIC target into the sanitized
+ * loader with the standard chain argv (mirrors the interposer's chain).
+ * All new strings/arrays are built in the tracee's stack scratch area.
+ * envp is rebuilt too, with LD_PRELOAD set so the chained (dynamic) child
+ * gets the interposer (single-layer translation discipline). */
+#define SP_EXEC_SCRATCH_BELOW_SP 65536
+#define SP_EXEC_MAX_ARGS 256
+#define SP_EXEC_STRING_CAP (SP_EXEC_SCRATCH_BELOW_SP - 4*4096)
+
+static int sp_rewrite_exec_to_loader(tracee_t *t, pid_t pid, struct user_pt_regs *r,
+                                     const char *host_prog, const char *guest_prog,
+                                     int path_argi, int depth) {
+    (void)t;
+    if (!g_loader || !g_libpath || !g_rootfs) {
+        SP_TRACE("[%d] rewrite bail: g_loader=%p g_libpath=%p g_rootfs=%p\n", pid, (void*)g_loader, (void*)g_libpath, (void*)g_rootfs);
+        return 0;
+    }
+    if (depth > 2) { SP_TRACE("[%d] rewrite bail: depth\n", pid); return 0; }
+
+    /* fetch original argv/envp */
+    unsigned long long orig_argv = r->regs[path_argi + 1];
+    unsigned long long orig_envp = r->regs[path_argi + 2];
+
+    char *arg_strs[SP_EXEC_MAX_ARGS];
+    int argc = 0;
+    for (; argc < SP_EXEC_MAX_ARGS; argc++) {
+        unsigned long long sp_ = (unsigned long long)peek_u64(pid, orig_argv + (unsigned long long)argc * 8);
+        if (sp_ == 0 || sp_ == (unsigned long long)-1) break;
+        arg_strs[argc] = malloc(SP_PATH_MAX);
+        if (!arg_strs[argc]) return 0;
+        long nn = peek_str(pid, sp_, arg_strs[argc], SP_PATH_MAX);
+        (void)nn;
+        if (nn < 0) { free(arg_strs[argc]); break; }
+    }
+    if (argc == 0) { SP_TRACE("[%d] rewrite bail: argc==0 orig_argv=%llx\n", pid, orig_argv); return 0; }
+
+    int envc = 0;
+    char *env_strs[SP_EXEC_MAX_ARGS];
+    if (orig_envp) {
+        for (; envc < SP_EXEC_MAX_ARGS; envc++) {
+            unsigned long long sp_ = (unsigned long long)peek_u64(pid, orig_envp + (unsigned long long)envc * 8);
+            if (sp_ == 0 || sp_ == (unsigned long long)-1) break;
+            env_strs[envc] = malloc(SP_PATH_MAX);
+            if (!env_strs[envc]) return 0;
+            long nn = peek_str(pid, sp_, env_strs[envc], SP_PATH_MAX);
+            if (nn < 0) { free(env_strs[envc]); break; }
+        }
+    }
+
+    /* compose new argv: loader --argv0 a0 --inhibit-cache --library-path lp hostprog rest... */
+    int fixed_nbase = 7;
+    /* entry COUNT (excluding NULL): 7 loader-chain items + orig args[1..] */
+    int new_argc = fixed_nbase + (argc - 1);
+    if (new_argc > SP_EXEC_MAX_ARGS - 1) return 0;
+
+    /* envp append/update set */
+    char ld_preload[SP_PATH_MAX];
+    snprintf(ld_preload, sizeof(ld_preload), "LD_PRELOAD=%s", g_guestpreload ? g_guestpreload : "");
+    char env_loader[SP_PATH_MAX];
+    snprintf(env_loader, sizeof(env_loader), "SPROUT_LOADER=%s", g_loader);
+    char env_libpath[SP_PATH_MAX];
+    snprintf(env_libpath, sizeof(env_libpath), "SPROUT_LIBRARY_PATH=%s", g_libpath);
+    char env_rootfs[SP_PATH_MAX];
+    snprintf(env_rootfs, sizeof(env_rootfs), "SPROUT_ROOTFS=%s", g_rootfs);
+    char env_path[1024];
+    snprintf(env_path, sizeof(env_path), "PATH=%s", getenv("PATH") ? getenv("PATH") : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    const char *inject_env_dbg[6];
+    const char **inject_env = NULL;
+    if (g_debug) {
+        inject_env_dbg[0] = ld_preload;
+        inject_env_dbg[1] = env_loader;
+        inject_env_dbg[2] = env_libpath;
+        inject_env_dbg[3] = "LD_DEBUG=libs";
+        inject_env_dbg[4] = env_rootfs;
+        inject_env_dbg[5] = env_path;
+        inject_env = inject_env_dbg;
+    } else {
+        static const char *ie[6] = { NULL };
+        ie[0] = ld_preload; ie[1] = env_loader; ie[2] = env_libpath;
+        ie[3] = env_rootfs; ie[4] = env_path;
+        inject_env = ie;
+    }
+    size_t inject_n = g_debug ? 6 : 5;
+
+    unsigned long long base = (unsigned long long)r->sp - SP_EXEC_SCRATCH_BELOW_SP;
+    /* probe *mapped-ness of the arena*/
+    errno = 0;
+    if (ptrace(PTRACE_PEEKDATA, pid, (void *)base, NULL) == -1 && errno) {
+        SP_TRACE("[%d] rewrite bail: scratch probe @%llx errno=%d\n", pid, base, errno);
+        return 0;
+    }
+
+    /* layout: argv array | envp array | strings arena */
+    int new_envc = envc + (int)inject_n;
+    unsigned long long argv_arr = base;
+    unsigned long long envp_arr = argv_arr + (unsigned long long)(new_argc + 1) * 8;
+    unsigned long long str_cur = envp_arr + (unsigned long long)(new_envc + 1) * 8;
+    unsigned long long str_end = base + (unsigned long long)(2*4096) + 24*1024;
+    if (str_end > base + SP_EXEC_SCRATCH_BELOW_SP) str_end = base + SP_EXEC_SCRATCH_BELOW_SP;
+
+    char a0buf[SP_PATH_MAX];
+    snprintf(a0buf, sizeof(a0buf), "%s", arg_strs[0][0] ? arg_strs[0] : guest_prog);
+
+    const char **new_args = calloc((size_t)new_argc + 1, sizeof(char *));
+    if (!new_args) return 0;
+    int w = 0;
+    new_args[w++] = g_loader;
+    new_args[w++] = "--argv0";
+    new_args[w++] = a0buf;
+    new_args[w++] = "--inhibit-cache";
+    new_args[w++] = "--library-path";
+    new_args[w++] = g_libpath;
+    new_args[w++] = host_prog;
+    for (int i = 1; i < argc; i++) new_args[w++] = arg_strs[i];
+    new_args[w] = NULL;
+
+    /* envp: copy, replacing our injected keys if present */
+    const char **new_env = calloc((size_t)new_envc + 1, sizeof(char *));
+    if (!new_env) { free(new_args); return 0; }
+    size_t injected_mask = 0; /* bit i = inject_env[i] matched an existing key */
+    int ew = 0;
+    for (int i = 0; i < envc; i++) {
+        const char *e = env_strs[i];
+        int replaced = 0;
+        for (size_t k = 0; k < inject_n; k++) {
+            const char *ik = inject_env[k];
+            size_t knl = strchr(ik, '=') - ik + 1;
+            if (strncmp(e, ik, knl) == 0) {
+                new_env[ew++] = ik;
+                injected_mask |= (1u << k);
+                replaced = 1;
+                break;
+            }
+        }
+        if (!replaced) new_env[ew++] = e;
+    }
+    for (size_t k = 0; k < inject_n; k++)
+        if (!(injected_mask & (1u << k))) new_env[ew++] = inject_env[k];
+    new_env[ew] = NULL;
+    new_envc = ew;
+
+    /* now write arrays + strings into tracee */
+    unsigned long long strptr[SP_EXEC_MAX_ARGS * 2];
+    int nstr = 0;
+    int total = 0;
+    for (int i = 0; i < new_argc; i++) total += (int)strlen(new_args[i]) + 1;
+    for (int i = 0; i < new_envc; i++) total += (int)strlen(new_env[i]) + 1;
+    if ((unsigned long long)(str_cur + (unsigned long long)total) > str_end) {
+        free(new_args); free(new_env); return 0;
+    }
+
+    /* write strings, record their tracee addrs */
+    unsigned long long sc = str_cur;
+    for (int i = 0; i < new_argc + new_envc; i++) {
+        const char *s = (i < new_argc) ? new_args[i] : new_env[i - new_argc];
+        size_t sl = strlen(s);
+        if (poke_str(pid, sc, s, sl) != 0) { free(new_args); free(new_env); return 0; }
+        strptr[nstr++] = sc;
+        sc += ((unsigned long long)sl + 8) & ~7ULL; /* keep 8-aligned */
+    }
+    /* write argv array */
+    for (int i = 0; i <= new_argc; i++) {
+        unsigned long long val = (i == new_argc) ? 0 : strptr[i];
+        if (ptrace(PTRACE_POKEDATA, pid, (void *)(argv_arr + (unsigned long long)i * 8), (void *)val) == -1) {
+            free(new_args); free(new_env); return 0;
+        }
+    }
+    /* write envp array */
+    for (int i = 0; i <= new_envc; i++) {
+        unsigned long long val = (i == new_envc) ? 0 : strptr[new_argc + i];
+        if (ptrace(PTRACE_POKEDATA, pid, (void *)(envp_arr + (unsigned long long)i * 8), (void *)val) == -1) {
+            free(new_args); free(new_env); return 0;
+        }
+    }
+    r->regs[path_argi] = strptr[0];           /* loader path as exec target */
+    r->regs[path_argi + 1] = argv_arr;
+    r->regs[path_argi + 2] = envp_arr;
+
+    if (g_debug) {
+        SP_TRACE("[%d] static→dynamic exec: %s via loader (%d args, %d env)\n",
+                 pid, guest_prog, new_argc, new_envc);
+    }
+
+    for (int i = 0; i < argc; i++) free(arg_strs[i]);
+    for (int i = 0; i < envc; i++) free(env_strs[i]);
+    free(new_args); free(new_env);
+    return 1;
+}
+
 static tracee_t *find_or_add(pid_t pid) {
     for (int i = 0; i < SP_MAX_TRACEES; i++)
         if (g_tracees[i].pid == pid) return &g_tracees[i];
@@ -187,6 +437,18 @@ static int classify_tracee_image(pid_t pid) {
         if (p_type == PT_INTERP) { fclose(f); return 0; }
     }
     fclose(f);
+    /* No PT_INTERP: could be a static binary OR our sanitized guest
+     * loader, which is static-PIE (ET_DYN). Loader-chain children exec it
+     * by its SPROUT_LOADER path; that image is the dynamic runtime, not a
+     * static target, so leave its host paths alone. */
+    if (g_loader) {
+        char link[SP_PATH_MAX];
+        ssize_t nl = readlink(exe, link, sizeof(link) - 1);
+        if (nl > 0) {
+            link[nl] = '\0';
+            if (strcmp(link, g_loader) == 0) return 0;
+        }
+    }
     return 1;
 }
 
@@ -335,6 +597,132 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
      * the LD_PRELOAD interposer (this supervisor is a last resort). */
     if (t->static_kind != 1) return;
 
+    /* execve/execveat of a DYNAMIC (or script) target from a static
+     * process: the kernel cannot satisfy PT_INTERP on the host (empty
+     * /lib64 in proot-distro containers), so we rewrite the call into
+     * the sanitized-loader chain (same shape the interposer uses). */
+    if (sysno == SYS_execve || sysno == SYS_execveat) {
+        int path_argi = (sysno == SYS_execve) ? 0 : 1;
+        struct user_pt_regs rex;
+        struct iovec iovex = { &rex, sizeof(rex) };
+        if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovex) != 0) return;
+        if (sysno == SYS_execveat && (int)rex.regs[0] != AT_FDCWD_VAL) return;
+
+        unsigned long long pptr = rex.regs[path_argi];
+        if (pptr == 0 || pptr >= 0x800000000000ULL) return;
+        char guest[SP_PATH_MAX];
+        if (peek_str(pid, pptr, guest, sizeof(guest)) < 0) return;
+        if (guest[0] != '/') return;
+        char host[SP_PATH_MAX];
+        if (!sp_translate(&g_cfg, guest, host)) return;
+
+        char obuf[SP_PATH_MAX];
+        char ibuf[SP_PATH_MAX];
+        int cls = classify_host_file(host, ibuf, obuf);
+        if (g_debug) SP_TRACE("[%d] exec target %s -> host %s cls=%d\n", pid, guest, host, cls);
+        if (cls == 0) {
+            /* dynamic: full loader-chain rewrite */
+            if (sp_rewrite_exec_to_loader(t, pid, &rex, host, guest, path_argi, 0))
+                ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovex);
+            return;
+        }
+        if (cls == 2) {
+            /* script from a static process: resolve interpreter via guest
+             * PATH (fallback default), build argv [interp, opt?, script,
+             * rest...] and try to chain once more (depth-guarded inside). */
+            char cand[SP_PATH_MAX];
+            int found = 0;
+            if (ibuf[0] == '/' || strchr(ibuf, '/') != NULL) {
+                /* absolute or path-qualified interpreter: use as-is */
+                snprintf(cand, sizeof(cand), "%s", ibuf);
+                char hc0[SP_PATH_MAX];
+                const char *h0 = sp_translate(&g_cfg, cand, hc0) ? hc0 : cand;
+                found = (access(h0, X_OK) == 0);
+            } else {
+                const char *sp_ = getenv("SPROUT_GUEST_PATH");
+                if (!sp_) sp_ = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+                char pbuf[4096];
+                snprintf(pbuf, sizeof(pbuf), "%s", sp_);
+                for (char *d = strtok(pbuf, ":"); d && !found; d = strtok(NULL, ":")) {
+                    char cc[SP_PATH_MAX];
+                    int n = snprintf(cc, sizeof(cc), "%s/%s", *d ? d : ".", ibuf);
+                    if (n < 0 || (size_t)n >= sizeof(cc)) continue;
+                    char hc[SP_PATH_MAX];
+                    const char *h = sp_translate(&g_cfg, cc, hc) ? hc : cc;
+                    if (access(h, X_OK) == 0) { snprintf(cand, sizeof(cand), "%s", cc); found = 1; }
+                }
+            }
+            if (!found) return; /* honest ENOENT for the kernel */
+            char hcan[SP_PATH_MAX];
+            if (!sp_translate(&g_cfg, cand, hcan)) return;
+            char ibuf2[SP_PATH_MAX];
+            int cls2 = classify_host_file(hcan, ibuf2, obuf);
+            if (cls2 == 0) {
+                /* interp is dynamic: rewrite exec with interp as target and
+                 * argv [interp, opt?, script, rest]. We re-use the loader
+                 * rewriter by constructing a synthetic argv in the tracee:
+                 * simpler path: rewrite argv array first (interp, script + rest)
+                 * then let the loader rewriter consume it. */
+                /* build synthetic argv in scratch: strings [interp, script, rest1...] */
+                unsigned long long base = (unsigned long long)rex.sp - SP_EXEC_SCRATCH_BELOW_SP;
+                errno = 0;
+                if (ptrace(PTRACE_PEEKDATA, pid, (void *)base, NULL) == -1 && errno) return;
+                unsigned long long orig_argv = rex.regs[path_argi + 1];
+                long strings_base = (long)(base + (unsigned long long)(SP_EXEC_MAX_ARGS * 8));
+                unsigned long long sc = (unsigned long long)strings_base;
+                unsigned long long end = base + SP_EXEC_SCRATCH_BELOW_SP;
+                unsigned long long arr_ptrs[SP_EXEC_MAX_ARGS];
+                int na = 0;
+                const char *head2[3];
+                int nh = 0;
+                head2[nh++] = cand;             /* interp (guest path) */
+                if (obuf[0]) head2[nh++] = obuf; /* optional shebang arg */
+                head2[nh++] = guest;            /* script path */
+                for (int i = 0; i < nh && na < SP_EXEC_MAX_ARGS - 1; i++) {
+                    size_t sl = strlen(head2[i]);
+                    if (sc + sl + 16 >= end) return;
+                    if (poke_str(pid, sc, head2[i], sl) != 0) return;
+                    arr_ptrs[na++] = sc;
+                    sc += ((unsigned long long)sl + 8) & ~7ULL;
+                }
+                for (int i = 1; na < SP_EXEC_MAX_ARGS - 1; i++) {
+                    unsigned long long pa = (unsigned long long)peek_u64(pid, orig_argv + (unsigned long long)i * 8);
+                    if (pa == 0 || pa == (unsigned long long)-1) break;
+                    char abuf[SP_PATH_MAX];
+                    if (peek_str(pid, pa, abuf, sizeof(abuf)) < 0) break;
+                    size_t sl = strlen(abuf);
+                    if (sc + sl + 16 >= end) break;
+                    if (poke_str(pid, sc, abuf, sl) != 0) break;
+                    arr_ptrs[na++] = sc;
+                    sc += ((unsigned long long)sl + 8) & ~7ULL;
+                }
+                unsigned long long arr = base;
+                for (int i = 0; i <= na; i++)
+                    if (ptrace(PTRACE_POKEDATA, pid, (void *)(arr + (unsigned long long)i * 8),
+                               (void *)(i == na ? 0 : arr_ptrs[i])) == -1) return;
+                rex.regs[path_argi] = arr_ptrs[0];   /* exec target = interp guest path… but kernel needs HOST */
+                /* interp is dynamic: exec target must be the loader, not cand.
+                 * Recurse through the dynamic rewriter with the synthetic argv. */
+                rex.regs[path_argi + 1] = arr;
+                /* pretend the program is the interp: rewriter expects
+                 * host_prog to EXEC, argv[0] = interp */
+                if (sp_rewrite_exec_to_loader(t, pid, &rex, hcan, cand, path_argi, 1))
+                    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovex);
+                return;
+            }
+            /* static INTERP under a static parent: not wired (deepest
+             * corner: scripts whose shebang points at a static binary).
+             * Honest no-op: kernel returns ENOEXEC on the script, which
+             * matches the behavior one gets without translation anyway. */
+            return;
+        }
+        /* static target (or unknown): plain single-string path translation */
+        int changed = translate_reg_path(t, pid, &rex, path_argi, "execve");
+        if (changed)
+            ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovex);
+        return;
+    }
+
     for (size_t i = 0; i < sizeof(SP_PATH_RULES)/sizeof(*SP_PATH_RULES); i++) {
         const sp_path_rule *rule = &SP_PATH_RULES[i];
         if (rule->sysno != sysno) continue;
@@ -374,6 +762,11 @@ int main(int argc, char **argv) {
     }
     g_debug = getenv("SPROUT_DEBUG") != NULL;
     sp_config_load(&g_cfg);
+    /* Loader-chain context (LaunchPlan::supervisor passes these in). */
+    g_loader = getenv("SPROUT_LOADER");
+    g_libpath = getenv("SPROUT_LIBRARY_PATH");
+    g_guestpreload = getenv("SPROUT_GUEST_PRELOAD");
+    g_rootfs = getenv("SPROUT_ROOTFS");
 
     /* Host env first; also empty bionic LD_* so the supervisor itself
      * doesn't get tangled in bionic dynamic-linker state. */

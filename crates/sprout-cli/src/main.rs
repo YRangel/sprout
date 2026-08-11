@@ -136,8 +136,11 @@ fn run() -> Result<u8, Error> {
 
     let plan = if strategy == Strategy::Ptrace {
         /* Last-resort path (ADR-0002): supervisor translates syscall args
-         * for static / preload-incapable images. */
+         * for static / preload-incapable images, and rewrites static→dynamic
+         * exec into the sanitized loader chain. */
         let supervisor = sprout_ptrace::supervisor_path().ok_or(Error::PtraceUnimplemented)?;
+        let preload_so = sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?;
+        let cache_dir = cache_dir();
         LaunchPlan::supervisor(
             &rootfs,
             supervisor,
@@ -145,7 +148,9 @@ fn run() -> Result<u8, Error> {
             &program_name,
             &cli.cmd,
             cli.verbose,
-        )
+            preload_so,
+            &cache_dir,
+        )?
     } else {
         let preload_so = sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?;
         let cache_dir = cache_dir();
