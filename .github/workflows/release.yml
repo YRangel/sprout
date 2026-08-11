@@ -21,7 +21,9 @@ jobs:
           cp target/release/sprout dist/
           so=$(find target/release/build/sprout-preload-*/out -name libsprout-core.so | head -1)
           test -n "$so" && cp "$so" dist/
-          strip dist/sprout dist/libsprout-core.so || true
+          px=$(find target/release/build/sprout-ptrace-*/out -name sprout-ptrace | head -1)
+          test -n "$px" && cp "$px" dist/
+          strip dist/sprout dist/libsprout-core.so dist/sprout-ptrace || true
           sha256sum dist/* > dist/SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
