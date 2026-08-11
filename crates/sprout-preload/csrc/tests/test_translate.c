@@ -61,6 +61,13 @@ static sp_config_t make_cfg(void) {
     memset(&c, 0, sizeof(c));
     strcpy(c.rootfs, "/data/local/rootfs");
     c.rootfs_len = strlen(c.rootfs);
+    /* default passthroughs (matches sp_config_load) */
+    static const char *pt[] = { "/proc", "/sys", "/dev" };
+    for (int i = 0; i < 3; i++) {
+        c.passthrough[c.npassthrough].prefix = pt[i];
+        c.passthrough[c.npassthrough].len = strlen(pt[i]);
+        c.npassthrough++;
+    }
 
     strcpy(c.binds[0].host, "/sdcard");
     c.binds[0].host_len = strlen(c.binds[0].host);
@@ -102,6 +109,14 @@ int main(void) {
     EXPECT_REV(&cfg, "/data/local/rootfs/usr/bin/node", "/usr/bin/node");
     EXPECT_REV(&cfg, "/data/local/home-u1/x", "/home/u1/x");
     EXPECT_REV(&cfg, "/proc/cpuinfo", "/proc/cpuinfo");
+
+    /* passthrough: default kernel pseudo-fs must NEVER be translated */
+    EXPECT_NONE(&cfg, "/proc/cpuinfo");
+    EXPECT_NONE(&cfg, "/dev/urandom");
+    EXPECT_NONE(&cfg, "/sys/class");
+    /* but unset-as-default bind-ish prefixes DO translate normally */
+    EXPECT_T(&cfg, "/apex/x", "/data/local/rootfs/apex/x");
+    EXPECT_T(&cfg, "/system/app", "/data/local/rootfs/system/app");
 
     /* no rootfs: everything passes through */
     sp_config_t empty;

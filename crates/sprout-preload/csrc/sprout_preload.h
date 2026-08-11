@@ -28,6 +28,8 @@ typedef struct {
     size_t guest_len;
 } sp_bind_t;
 
+#define SP_MAX_PASSTHROUGH 16
+
 typedef struct {
     /* Absolute host path of the guest root (no trailing slash, unless "/"). */
     char rootfs[SP_PATH_MAX];
@@ -36,6 +38,12 @@ typedef struct {
     /* Bindings, pre-sorted longest-guest-first at parse time. */
     sp_bind_t binds[SP_MAX_BINDS];
     int nbinds;
+
+    /* Prefixes that are NEVER translated (host pseudo-fs: kernel-mounted
+     * namespaces the guest must see host-side). Default: /proc /sys /dev.
+     * Overridable via SPROUT_PASSTHROUGH="/proc;/sys;/dev;/my/host". */
+    struct { const char *prefix; size_t len; } passthrough[SP_MAX_PASSTHROUGH];
+    int npassthrough;
 
     int debug;          /* SPROUT_DEBUG=1: trace every translation */
     int fakeroot;       /* -0 / --root-id: spoof uid/gid 0 */

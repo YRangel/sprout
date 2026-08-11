@@ -284,6 +284,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sprout-ptrace"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

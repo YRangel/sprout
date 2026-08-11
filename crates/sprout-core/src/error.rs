@@ -31,6 +31,9 @@ pub enum Error {
     #[error("guest loader not found: tried {tried:?} inside rootfs")]
     LoaderMissing { tried: Vec<String> },
 
+    #[error("libsprout-core.so not found. Either set SPROUT_PRELOAD_PATH=/path/to/libsprout-core.so, install it beside the `sprout` binary, or build it on a glibc host (docs/src/development.md).")]
+    PreloadNotFound,
+
     #[error(transparent)]
     Elf(#[from] ElfError),
 

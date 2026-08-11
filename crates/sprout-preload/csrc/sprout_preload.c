@@ -64,6 +64,29 @@ void sp_config_load(sp_config_t *cfg) {
     const char *l2s = getenv("SPROUT_LINK2SYMLINK");
     cfg->link2symlink = l2s && l2s[0] == '1';
 
+    /* passthrough: default kernel pseudo-fs; override via env */
+    static const char *default_pt[] = { "/proc", "/sys", "/dev" };
+    const char *pt_env = getenv("SPROUT_PASSTHROUGH");
+    if (!pt_env || !*pt_env) {
+        cfg->npassthrough = 3;
+        for (int i = 0; i < 3; i++) {
+            cfg->passthrough[i].prefix = default_pt[i];
+            cfg->passthrough[i].len = strlen(default_pt[i]);
+        }
+    } else {
+        char pbuf[2048];
+        copy_str(pbuf, sizeof(pbuf), pt_env);
+        char *psave = NULL;
+        for (char *tok = strtok_r(pbuf, ";", &psave);
+             tok && cfg->npassthrough < SP_MAX_PASSTHROUGH;
+             tok = strtok_r(NULL, ";", &psave)) {
+            if (tok[0] != '/') continue;
+            cfg->passthrough[cfg->npassthrough].prefix = strdup(tok);
+            cfg->passthrough[cfg->npassthrough].len = strlen(tok);
+            cfg->npassthrough++;
+        }
+    }
+
     /* SPROUT_BIND: "host=guest;host=guest;..." */
     const char *binds = getenv("SPROUT_BIND");
     if (!binds) return;
@@ -116,6 +139,12 @@ int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]
     /* Idempotence: a path that is already host-side must not be re-prefixed. */
     if (cfg->rootfs_len > 0 && path_within(cfg->rootfs, cfg->rootfs_len, path))
         return 0;
+
+    /* Never translate host pseudo-filesystem mountpoints. */
+    for (int i = 0; i < cfg->npassthrough; i++) {
+        if (path_within(cfg->passthrough[i].prefix, cfg->passthrough[i].len, path))
+            return 0;
+    }
 
     for (int i = 0; i < cfg->nbinds; i++) {
         const sp_bind_t *b = &cfg->binds[i];
@@ -186,9 +215,23 @@ __attribute__((constructor)) static void sprout_init(void) {
     } while (0)
 
 #define SP_REAL(name) real_##name
+
+/* POSIX explicitly blesses assigning dlsym()'s void* to a function pointer;
+ * ISO C pedantically forbids it, so we take the one documented POSIX escape
+ * hatch (memcpy through a union). The union is typed with the *pointer* so
+ * the assignment stays object-pointer, never function-declared. */
+static void *sp_sym(const char *name) { return dlsym(RTLD_NEXT, name); }
+
 #define SP_RESOLVE(name)                                                   \
     do {                                                                   \
-        if (!SP_REAL(name)) SP_REAL(name) = dlsym(RTLD_NEXT, #name);       \
+        if (!SP_REAL(name)) {                                              \
+            union {                                                        \
+                void *raw;                                                 \
+                __typeof__(SP_REAL(name)) fn;                              \
+            } u = { NULL };                                                \
+            u.raw = sp_sym(#name);                                         \
+            SP_REAL(name) = u.fn;                                          \
+        }                                                                  \
     } while (0)
 
 /* open-family: const char* path */
@@ -280,7 +323,7 @@ int access(const char *path, int mode) {
     return SP_REAL(access)(p, mode);
 }
 
-int readlink(const char *path, char *buf, size_t bufsiz) {
+ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
     static ssize_t (*SP_REAL(readlink))(const char *, char *, size_t) = NULL;
     SP_RESOLVE(readlink);
     if (bufsiz == 0) return SP_REAL(readlink)(path, buf, bufsiz);

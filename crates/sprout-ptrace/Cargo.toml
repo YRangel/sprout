@@ -1,0 +1,18 @@
+[package]
+name = "sprout-ptrace"
+version = "0.1.0"
+description = "ptrace supervisor for sprout: spawns the guest under seccomp emulation, rewrites blocked or guest-relative syscalls"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+# Same shape as sprout-preload: the heavy lifting is pure C (no allocator
+# in a tracer), this crate is only the build + discovery shell.
+crate-type = ["rlib"]
+
+[dependencies]
+
+[build-dependencies]
+cc.workspace = true

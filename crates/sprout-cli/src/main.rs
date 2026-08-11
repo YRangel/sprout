@@ -109,19 +109,9 @@ fn run() -> Result<u8, Error> {
         return Err(Error::PtraceUnimplemented);
     }
 
-    let preload_so = sprout_preload::core_library_path().ok_or_else(|| {
-        Error::LoaderMissing {
-            tried: vec!["libsprout-core.so: not built on this host (needs glibc aarch64 toolchain; see docs/src/development.md)".into()],
-        }
-    })?;
+    let preload_so = sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?;
 
-    let plan = LaunchPlan::preload(
-        &rootfs,
-        program_host,
-        &cli.cmd,
-        preload_so.to_path_buf(),
-        cli.verbose,
-    )?;
+    let plan = LaunchPlan::preload(&rootfs, program_host, &cli.cmd, preload_so, cli.verbose)?;
 
     if cli.dry_run {
         eprintln!("{}", plan.explain());

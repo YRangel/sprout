@@ -4,6 +4,7 @@ members = [
     "crates/sprout-cli",
     "crates/sprout-core",
     "crates/sprout-preload",
+    "crates/sprout-ptrace",
 ]
 
 [workspace.package]
@@ -17,11 +18,10 @@ readme = "README.md"
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+cc = "1.1"
 nix = { version = "0.29", features = ["process", "ptrace", "signal", "fs"] }
 thiserror = "1.0"
 
-# The LD_PRELOAD core is C11, not Rust (see ADR-0001). Only Rust binaries
-# below get profile tuning; the C shared object has its own build flags.
 [profile.release]
 lto = "thin"
 codegen-units = 1
