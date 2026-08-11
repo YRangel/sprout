@@ -373,13 +373,112 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     return SP_REAL(openat64)(dirfd, p, flags, mode);
 }
 
+/* ---- access-family EMULATION (blocked-syscall class) ------------------
+ * Android untrusted-app seccomp kills faccessat(48) and faccessat2(439).
+ * glibc's access() implements via those *inside* libc, so calling glibc's
+ * versions from a wrapper only dies later. Answer POSIX here directly,
+ * via newfstatat(79 — allowed) + uid/gid bits. No libc patching, no lies:
+ * [ -r file ] test = real answer. */
+static uid_t  (*sp_real_getuid)(void) = NULL;
+static uid_t  (*sp_real_geteuid)(void) = NULL;
+static gid_t  (*sp_real_getgid)(void) = NULL;
+static gid_t  (*sp_real_getegid)(void) = NULL;
+static int    (*sp_real_getgroups)(int, gid_t *) = NULL;
+static int    (*sp_real_fstatat)(int, const char *, struct stat *, int) = NULL;
+static void sp_resolve_access_emul(void) {
+    if (!sp_real_fstatat) {
+        sp_real_fstatat   = dlsym(RTLD_NEXT, "fstatat");
+        sp_real_getuid    = dlsym(RTLD_NEXT, "getuid");
+        sp_real_geteuid   = dlsym(RTLD_NEXT, "geteuid");
+        sp_real_getgid    = dlsym(RTLD_NEXT, "getgid");
+        sp_real_getegid   = dlsym(RTLD_NEXT, "getegid");
+        sp_real_getgroups = dlsym(RTLD_NEXT, "getgroups");
+    }
+}
+static int sp_emulate_access_impl(int dirfd, const char *path, int mode, int flags,
+                                  int use_eid) {
+    sp_resolve_access_emul();
+    if (!sp_real_fstatat || !sp_real_getuid || !sp_real_getgid) { errno = ENOSYS; return -1; }
+    struct stat st;
+    int atflags = flags & (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT);
+    if (sp_real_fstatat(dirfd, path, &st, atflags) != 0) return -1; /* errno from fstatat */
+    if (mode == F_OK) return 0;
+    uid_t uid = use_eid && sp_real_geteuid ? sp_real_geteuid() : sp_real_getuid();
+    gid_t gid = use_eid && sp_real_getegid ? sp_real_getegid() : sp_real_getgid();
+    unsigned need = ((mode & R_OK) ? 4 : 0) | ((mode & W_OK) ? 2 : 0) | ((mode & X_OK) ? 1 : 0);
+    unsigned bits;
+    if (uid == 0) {
+        /* root: R/W always, X iff any exec bit set */
+        bits = (need & 6) | (((st.st_mode & 0111) != 0) ? 1 : 0);
+        return ((bits & need) == need) ? 0 : (errno = EACCES, -1);
+    }
+    if (st.st_uid == uid) bits = st.st_mode >> 6;
+    else if (st.st_gid == gid) bits = st.st_mode >> 3;
+    else {
+        bits = st.st_mode;
+        if (sp_real_getgroups) {
+            gid_t tabs[64];
+            int n = sp_real_getgroups(64, tabs);
+            for (int i = 0; i < n && n > 0; i++)
+                if (tabs[i] == st.st_gid) { bits = st.st_mode >> 3; break; }
+        }
+    }
+    return ((bits & need) == need) ? 0 : (errno = EACCES, -1);
+}
+
+int access(const char *path, int mode) {
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("access", path, p);
+    return sp_emulate_access_impl(AT_FDCWD, p, mode, 0, 0);
+}
+
+int eaccess(const char *path, int mode) {
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("eaccess", path, p);
+    return sp_emulate_access_impl(AT_FDCWD, p, mode, 0, 1);
+}
+
 int faccessat(int dirfd, const char *path, int mode, int flags) {
-    static int (*SP_REAL(faccessat))(int, const char *, int, int) = NULL;
-    SP_RESOLVE(faccessat);
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("faccessat", path, p);
-    return SP_REAL(faccessat)(dirfd, p, mode, flags);
+    return sp_emulate_access_impl(dirfd, p, mode, flags, flags & AT_EACCESS);
+}
+
+int faccessat2(int dirfd, const char *path, int mode, int flags) {
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("faccessat2", path, p);
+    return sp_emulate_access_impl(dirfd, p, mode, flags, flags & AT_EACCESS);
+}
+
+/* ---- setfsuid/setfsgid (203/204) identity emulation -------------------
+ * ncurses `_nc_safe_fopen()` probes fsuid by calling setfsuid(getuid())
+ * unconditionally (Linux has no getfsuid(2)); Android blocks BOTH raw
+ * syscalls for untrusted apps — without emulation every readline-using
+ * guest dies at interactive shell startup (verified via strace -k:
+ * _nc_safe_fopen on every terminfo read).
+ *
+ * Rootless truth table:
+ *   setfsuid(uid) where uid == current uid/euid  → the kernel computes
+ *     this as a no-op for unprivileged callers AND returns the prior
+ *     fsuid (== uid, since fsuid==uid throughout a rootless guest);
+ *   setfsuid(other) → kernel answer for an unprivileged caller is EPERM.
+ * Emulating exactly that — nothing else — keeps the contract truthful. */
+#include <sys/fsuid.h>
+int setfsuid(uid_t fsuid) {
+    sp_resolve_access_emul();
+    if (sp_real_getuid && sp_real_geteuid && (fsuid == sp_real_getuid() || fsuid == sp_real_geteuid()))
+        return (int)fsuid;              /* prior fsuid == uid in a rootless guest */
+    errno = EPERM; return -1;           /* kernel's honest answer when switching */
+}
+int setfsgid(gid_t fsgid) {
+    sp_resolve_access_emul();
+    if (sp_real_getgid && sp_real_getegid && (fsgid == sp_real_getgid() || fsgid == sp_real_getegid()))
+        return (int)fsgid;
+    errno = EPERM; return -1;
 }
 
 int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *buf) {
@@ -655,14 +754,6 @@ int lstat64(const char *path, struct stat64 *st) {
     return SP_REAL(lstat64)(p, st);
 }
 
-int access(const char *path, int mode) {
-    static int (*SP_REAL(access))(const char *, int) = NULL;
-    SP_RESOLVE(access);
-    char x[SP_PATH_MAX];
-    const char *p = sp_translate_x(path, x);
-    SP_TRACE("access", path, p);
-    return SP_REAL(access)(p, mode);
-}
 
 ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
     static ssize_t (*SP_REAL(readlink))(const char *, char *, size_t) = NULL;
