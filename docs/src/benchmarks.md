@@ -11,10 +11,10 @@ Guest: **Debian 13 (trixie, glibc 2.41)** (`proot-distro/containers/debian`).
 
 | workload                        | proot-distro | sprout | speedup |
 |---------------------------------|--------------|--------|---------|
-| `python3 -c pass`               | 251 ms       | 48 ms  | **5.2×** |
-| `bash -c true`                  | 236 ms       | 30 ms  | **7.9×** |
-| exec-chain (20× `/bin/true`)    | 258 ms       | 51 ms  | **5.1×** |
-| `find /etc -maxdepth 2 -type f` | 283 ms       | 34 ms  | **8.3×** |
+| `python3 -c pass`               | 270 ms       | 43 ms  | **6.3×** |
+| `bash -c true`                  | 266 ms       | 28 ms  | **9.5×** |
+| exec-chain (20× `/bin/true`)    | 325 ms       | 77 ms  | **4.2×** |
+| `find /etc -maxdepth 2 -type f` | 300 ms       | 30 ms  | **10.0×** |
 
 Debug build for reference: 2.6–3.0× on the same workloads.
 
@@ -24,9 +24,13 @@ first exec and then a PLT interposition per child (`posix_spawn`/`execve`/
 `system` wrappers) with native syscalls in between.
 
 v0.4.1 note (ADR-0010): the symlink-chase cost that regressed this cell
-to 4.5× is now amortized by the per-process translate memoization table
-— 51 ms / 5.1×. Marginal per-exec cost sits at the ld.so load floor
-(~2 ms), which any PT_INTERP-respecting launcher pays.
+to 4.5× is now amortized by the per-process translate memoization table.
+Marginal per-exec cost sits near the ld.so load floor (~2 ms), which any
+PT_INTERP-respecting launcher pays.
+
+**Device variance**: cells drift ±30% across thermal states (same session
+measured 51 ms and 77 ms for exec-chain medians across different device
+states). Ranges are honest; speedup within one session is stable.
 
 ## musl guest + supervisor-routed workloads (release build, median-of-7)
 
@@ -37,12 +41,12 @@ ptrace-everything model:
 
 | workload                        | proot-distro | sprout | speedup |
 |---------------------------------|--------------|--------|---------|
-| busybox `sh -c true` (musl)     | 221 ms       | 29 ms  | **7.6×** |
-| busybox `ls /etc/apk` (musl)    | 209 ms       | 36 ms  | **5.8×** |
-| musl `python3 -c pass`          | 249 ms       | 107 ms | **2.3×** |
-| musl-static binary (exit 42)    | 217 ms       | 27 ms  | **8.0×** |
-| nolibc-static (openat+exit 42)  | 228 ms       | 33 ms  | **6.9×** |
-| Go static (CGO_ENABLED=0)       | 231 ms       | 47 ms  | **4.9×** |
+| busybox `sh -c true` (musl)     | 245 ms       | 40 ms  | **6.1×** |
+| busybox `ls /etc/apk` (musl)    | 261 ms       | 40 ms  | **6.5×** |
+| musl `python3 -c pass`          | 290 ms       | 107 ms | **2.7×** |
+| musl-static binary (exit 42)    | 239 ms       | 36 ms  | **6.6×** |
+| nolibc-static (openat+exit 42)  | 247 ms       | 39 ms  | **6.3×** |
+| Go static (CGO_ENABLED=0)       | 223 ms       | 40 ms  | **5.6×** |
 
 Honest notes:
 
