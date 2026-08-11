@@ -89,3 +89,29 @@ Handoff (user action required — needs network + GitHub account):
 - `git tag v0.4.0 && git push --tags` exercises release.yml end-to-end
   (collects sprout + libsprout-core.so + sprout-ptrace + optional musl .so,
   strips, SHA256SUMS, GitHub Release, gh-pages docs deploy)
+
+## Stable invariants for future refactors (ADR-0010 §"Refactor invariants")
+
+If you ever restructure this codebase, these are load-bearing; violating
+them silently regresses musl/X11/exec-chain behavior:
+
+1. **Translation order** everywhere (interposer C, supervisor C, Rust
+   helpers): bind grafts first → rootfs prefix → passthrough. Lookups
+   use longest-prefix match (the bind table is sorted descending by
+   guest length at load).
+2. **AF_UNIX pathname discipline**: pathname sockets translate; abstract
+   (NUL-first) sockets pass through; NO lstat/chase for sockets; 108-byte
+   sun_path cap = passthrough.
+3. **Memoization contract** (`sp_xcache`): positive results only, keyed
+   on the GHUEST path string, config frozen at init, collisions tolerated
+   as extra probe, NOT shared between processes (process-local only).
+4. **Sanitize cache key** = `content_hash(input_bytes || table_bytes)`;
+   the table version bumps automatically invalidate.
+5. **Plan env keys** (Rust side both layers honor):
+   `SPROOT_ROOTFS`, `SPROOT_LIBRARY_PATH`, `SPROUT_GUEST_PRELOAD`,
+   `SPROUT_LOADER`, `SPROUT_BIND`, `SPROUT_LIBC`, `SPROT_SUP_TIMEOUT`.
+   Do not renumber or respell without updating plan.rs tests.
+6. **Supervisor tracee kinds** (int): -1 unclassified, 0 dynamic
+   (preload-governed), 1 static, 2 dynamic-Go, 3 musl-dynamic.
+7. `--shared-tmp` is sugar for a single `Binding`; do not add side
+   effects to it.

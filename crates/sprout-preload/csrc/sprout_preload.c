@@ -236,6 +236,43 @@ static void *sp_sym(const char *name) { return dlsym(RTLD_NEXT, name); }
         }                                                                  \
     } while (0)
 
+/* Translate memoization. sp_translate()+chase is a pure function of the
+ * guest path (per-process env+binds are frozen at init), yet the chase
+ * costs an lstat+readlink (~1.1ms bulk) for EVERY translated path —
+ * dominates exec-chains (20x /bin/true = 19 wasted lookups). Small
+ * process-lifetime open-addressing cache kills the repeat cost.
+ * Positive results only; unresolvable/excluded paths are cheap already.
+ * See ADR-0010. */
+#define SP_XCACHE_CAP 128
+struct sp_xentry { char g[SP_PATH_MAX]; char h[SP_PATH_MAX]; unsigned char used; };
+static struct sp_xentry sp_xcache[SP_XCACHE_CAP];
+static unsigned long sp_xhash(const char *s) {
+    unsigned long h = 5381;
+    while (*s) h = h * 33 + (unsigned char)*s++;
+    return h;
+}
+static int sp_xcache_get(const char *g, char h[SP_PATH_MAX]) {
+    unsigned long i = sp_xhash(g) % SP_XCACHE_CAP;
+    for (int hop = 0; hop < 8; hop++) {
+        struct sp_xentry *e = &sp_xcache[(i + hop) % SP_XCACHE_CAP];
+        if (!e->used) return 0;
+        if (!strcmp(e->g, g)) { strcpy(h, e->h); return 1; }
+    }
+    return 0;
+}
+static void sp_xcache_put(const char *g, const char *h) {
+    unsigned long i = sp_xhash(g) % SP_XCACHE_CAP;
+    for (int hop = 0; hop < 8; hop++) {
+        struct sp_xentry *e = &sp_xcache[(i + hop) % SP_XCACHE_CAP];
+        if (!e->used || !strcmp(e->g, g)) {
+            strncpy(e->g, g, SP_PATH_MAX - 1); e->g[SP_PATH_MAX - 1] = 0;
+            strncpy(e->h, h, SP_PATH_MAX - 1); e->h[SP_PATH_MAX - 1] = 0;
+            e->used = 1;
+            return;
+        }
+    }
+}
+
 /* Translate + absolute-symlink chase. Alpine lays every applet out as an
  * absolute symlink to /bin/busybox; the host kernel would resolve those
  * targets on the HOST (missing). Only when the translation moved the path
@@ -244,6 +281,8 @@ static void *sp_sym(const char *name) { return dlsym(RTLD_NEXT, name); }
 static int (*sp_real_lstat)(const char *, struct stat *) = NULL;
 static ssize_t (*sp_real_readlink)(const char *, char *, size_t) = NULL;
 static const char *sp_translate_x(const char *path, char buf[SP_PATH_MAX]) {
+    /* fast path: cache hit (covers the exec-chain hot loop) */
+    if (sp_xcache_get(path, buf)) return buf;
     const char *out = sp_translate(&g_cfg, path, buf) ? buf : path;
     if (out != buf) return out;
     static int l2s_off = -1;
@@ -273,6 +312,7 @@ static const char *sp_translate_x(const char *path, char buf[SP_PATH_MAX]) {
             snprintf(buf, SP_PATH_MAX, "%s", tmp);
         }
     }
+    sp_xcache_put(path, buf);
     return buf;
 }
 
@@ -415,6 +455,142 @@ char *getcwd(char *buf, size_t size) {
     if (!m) return NULL;
     memcpy(m, out, n);
     return m;
+}
+
+/* ---- AF_UNIX pathname translation (ADR-0010) ------------------------- */
+/* X11/Wayland/VirGL/virpipe/ssh-agent all speak over pathname UNIX sockets.
+ * proot translates sun_path; without this the guest cannot reach host or
+ * bound-dir sockets at all. Rules:
+ *  - pathname sockets ONLY (sun_path[1] != '\0' where the first byte is
+ *    the conventional "abstract" marker? NO — abstract sockets have
+ *    sun_path[0] == '\0'; pathnames sun_path[0] != '\0')
+ *  - bind table first, then rootfs (identical order to sp_translate)
+ *  - translated path must fit sockaddr_un/sun_path (108 incl. NUL); else
+ *    passthrough faithfully (kernel EFAULT rather than lie)
+ *  - NO symlink chase on sockets (bind CREATES the pathname; chase is
+ *    file-semantics, not socket-semantics)
+ *  Reverse direction (getsockname/getpeername/recvfrom) strips the
+ *  rootfs/bind prefix to present guest spelling.
+ */
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stddef.h>
+#include <errno.h>
+
+/* returns replaced length, or 0 for passthrough */
+static socklen_t sp_addr_fwd_unix(const struct sockaddr *addr, socklen_t len,
+                                  struct sockaddr_un *out) {
+    if (!addr || addr->sa_family != AF_UNIX) return 0;
+    size_t off = offsetof(struct sockaddr_un, sun_path);
+    if (len <= (socklen_t)(off + 1)) return 0;
+    const struct sockaddr_un *u = (const struct sockaddr_un *)addr;
+    if (u->sun_path[0] == '\0') return 0; /* abstract namespace: kernel-only */
+    size_t plen = strnlen(u->sun_path, len - off);
+    if (plen == 0) return 0;
+    char x[SP_PATH_MAX];
+    if (!sp_translate(&g_cfg, u->sun_path, x)) return 0;
+    size_t xl = strlen(x);
+    if (off + xl + 1 > sizeof(out->sun_path) + off) return 0; /* > 108 */
+    memset(out, 0, sizeof(*out));
+    out->sun_family = AF_UNIX;
+    memcpy(out->sun_path, x, xl + 1);
+    return (socklen_t)(off + xl + 1);
+}
+
+/* reverse-rootfs after kernel fills addr; in-place shrink when possible */
+static void sp_addr_rev_unix(struct sockaddr *addr, socklen_t *len) {
+    if (!addr || !len || addr->sa_family != AF_UNIX) return;
+    size_t off = offsetof(struct sockaddr_un, sun_path);
+    if (*len <= (socklen_t)(off + 1)) return;
+    struct sockaddr_un *u = (struct sockaddr_un *)addr;
+    if (u->sun_path[0] == '\0') return;
+    char out[SP_PATH_MAX];
+    size_t n = sp_reverse(&g_cfg, u->sun_path, out, sizeof(out));
+    if (!n) return;              /* kernel path not under our rootfs/binds */
+    if (off + n + 1 > (size_t)*len) return;
+    memcpy(u->sun_path, out, n + 1);
+    *len = (socklen_t)(off + n + 1);
+}
+
+int bind(int fd, const struct sockaddr *addr, socklen_t len) {
+    static int (*SP_REAL(bind))(int, const struct sockaddr *, socklen_t) = NULL;
+    SP_RESOLVE(bind);
+    struct sockaddr_un x;
+    socklen_t xl = sp_addr_fwd_unix(addr, len, &x);
+    if (xl) return SP_REAL(bind)(fd, (const struct sockaddr *)&x, xl);
+    return SP_REAL(bind)(fd, addr, len);
+}
+
+int connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    static int (*SP_REAL(connect))(int, const struct sockaddr *, socklen_t) = NULL;
+    SP_RESOLVE(connect);
+    struct sockaddr_un x;
+    socklen_t xl = sp_addr_fwd_unix(addr, len, &x);
+    if (xl) return SP_REAL(connect)(fd, (const struct sockaddr *)&x, xl);
+    return SP_REAL(connect)(fd, addr, len);
+}
+
+ssize_t sendto(int fd, const void *bufv, size_t n, int flags,
+               const struct sockaddr *addr, socklen_t len) {
+    static ssize_t (*SP_REAL(sendto))(int, const void *, size_t, int,
+                                      const struct sockaddr *, socklen_t) = NULL;
+    SP_RESOLVE(sendto);
+    struct sockaddr_un x;
+    socklen_t xl = sp_addr_fwd_unix(addr, len, &x);
+    if (xl) return SP_REAL(sendto)(fd, bufv, n, flags, (const struct sockaddr *)&x, xl);
+    return SP_REAL(sendto)(fd, bufv, n, flags, addr, len);
+}
+
+ssize_t sendmsg(int fd, const struct msghdr *msg, int flags) {
+    static ssize_t (*SP_REAL(sendmsg))(int, const struct msghdr *, int) = NULL;
+    SP_RESOLVE(sendmsg);
+    if (!msg || !msg->msg_name) return SP_REAL(sendmsg)(fd, msg, flags);
+    struct sockaddr_un x;
+    socklen_t xl = sp_addr_fwd_unix((const struct sockaddr *)msg->msg_name,
+                                    (socklen_t)msg->msg_namelen, &x);
+    if (!xl) return SP_REAL(sendmsg)(fd, msg, flags);
+    struct msghdr m = *msg;
+    m.msg_name = &x;
+    m.msg_namelen = xl;
+    return SP_REAL(sendmsg)(fd, &m, flags);
+}
+
+ssize_t recvfrom(int fd, void *bufv, size_t n, int flags,
+                 struct sockaddr *addr, socklen_t *len) {
+    static ssize_t (*SP_REAL(recvfrom))(int, void *, size_t, int,
+                                        struct sockaddr *, socklen_t *) = NULL;
+    SP_RESOLVE(recvfrom);
+    ssize_t r = SP_REAL(recvfrom)(fd, bufv, n, flags, addr, len);
+    if (r >= 0 && addr && len) sp_addr_rev_unix(addr, len);
+    return r;
+}
+
+ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
+    static ssize_t (*SP_REAL(recvmsg))(int, struct msghdr *, int) = NULL;
+    SP_RESOLVE(recvmsg);
+    ssize_t r = SP_REAL(recvmsg)(fd, msg, flags);
+    if (r >= 0 && msg && msg->msg_name) {
+        socklen_t l = (socklen_t)msg->msg_namelen;
+        sp_addr_rev_unix((struct sockaddr *)msg->msg_name, &l);
+        msg->msg_namelen = l;
+    }
+    return r;
+}
+
+int getsockname(int fd, struct sockaddr *addr, socklen_t *len) {
+    static int (*SP_REAL(getsockname))(int, struct sockaddr *, socklen_t *) = NULL;
+    SP_RESOLVE(getsockname);
+    int r = SP_REAL(getsockname)(fd, addr, len);
+    if (!r && addr && len) sp_addr_rev_unix(addr, len);
+    return r;
+}
+
+int getpeername(int fd, struct sockaddr *addr, socklen_t *len) {
+    static int (*SP_REAL(getpeername))(int, struct sockaddr *, socklen_t *) = NULL;
+    SP_RESOLVE(getpeername);
+    int r = SP_REAL(getpeername)(fd, addr, len);
+    if (!r && addr && len) sp_addr_rev_unix(addr, len);
+    return r;
 }
 
 static char *sp_strdup(const char *out) {

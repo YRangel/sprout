@@ -27,6 +27,7 @@
 - [0007: guest libc/ld.so sanitization](./adr/0007-guest-libc-sanitization.md)
 - [0008: supervisor design](./adr/0008-supervisor-design.md)
 - [0009: musl guests](./adr/0009-musl-guests.md)
+- [0010: perf cache + AF_UNIX + shared-tmp](./adr/0010-perf-cache-and-afunix-sharedtmp.md)
 
 # Operations
 

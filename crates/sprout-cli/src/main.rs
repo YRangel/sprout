@@ -35,6 +35,13 @@ struct Cli {
     #[arg(short = '0', long = "root-id", default_value_t = false)]
     root_id: bool,
 
+    /// proot-distro `--shared-tmp` parity: bind the host $PREFIX/tmp into the
+    /// guest at /tmp, preserving X11/Wayland/VirGL/virpipe/ssh-agent sockets
+    /// (the guest sees the live host socket dir, so X11 apps transact with the
+    /// Termux X server like proot-distro login --shared-tmp).
+    #[arg(long = "shared-tmp", default_value_t = false)]
+    shared_tmp: bool,
+
     /// Convert hardlinks to symlinks on guest writes.
     #[arg(long = "link2symlink", default_value_t = false)]
     link2symlink: bool,
@@ -74,6 +81,13 @@ fn run() -> Result<u8, Error> {
     rootfs.link2symlink = cli.link2symlink;
     for spec in &cli.binds {
         rootfs.bindings.push(Binding::parse(spec)?);
+    }
+    if cli.shared_tmp {
+        // host $PREFIX/tmp → guest /tmp (proot-distro --shared-tmp)
+        let tmp = std::env::var("PREFIX")
+            .map(|p| format!("{}/tmp", p))
+            .unwrap_or_else(|_| std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
+        rootfs.bindings.push(Binding::parse(&format!("{}:/tmp", tmp))?);
     }
 
     let mut program_name = cli.cmd[0].to_string_lossy().into_owned();

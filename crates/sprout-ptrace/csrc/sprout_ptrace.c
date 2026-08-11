@@ -743,6 +743,71 @@ static const sp_path_rule SP_PATH_RULES[] = {
     { SYS_execveat,    0, 1, "execveat"    },
 };
 
+/* ---- AF_UNIX pathname translation (ADR-0010) -------------------------- */
+/* Forward direction only in v1: bind/connect/sendto/sendmsg. Reverse
+ * (getsockname/recvfrom) for supervisor tracees is a documented gap;
+ * streamed workloads (X11 stream need connect only) work anyway.
+ * Shared scratch stack below SP (same arena translate_reg_path uses):
+ * path content and sockaddr struct are placed at distinct offsets. */
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stddef.h>
+
+/* Try translating the sockaddr_un at tracee memory `sa` (len bytes).
+ * On success: build the translated sockaddr_un in the scratch area at
+ * scratch_off below SP, update regs SA/LEN, return 1. Passthrough: 0. */
+static int translate_reg_sockaddr(pid_t pid, struct user_pt_regs *r,
+                                  int sa_argi, int len_argi, const char *name,
+                                  unsigned long long scratch_off) {
+    unsigned long long sa = r->regs[sa_argi];
+    unsigned long long len = r->regs[len_argi];
+    if (sa == 0 || sa >= 0x800000000000ULL) return 0;
+    if (len < 4 || len > 256) return 0;
+    unsigned short fam = 0;
+    errno = 0;
+    long w = ptrace(PTRACE_PEEKDATA, pid, (void *)sa, NULL);
+    if (w == -1 && errno) return 0;
+    fam = (unsigned short)(w & 0xffff);
+    if (fam != AF_UNIX) return 0;
+    size_t off = offsetof(struct sockaddr_un, sun_path);
+    char guest[108];
+    size_t cap = (size_t)(len > off ? len - off : 0);
+    if (cap > sizeof(guest) - 1) cap = sizeof(guest) - 1;
+    if (cap == 0) return 0;
+    ssize_t n = peek_str(pid, sa + off, guest, sizeof(guest));
+    if (n <= 0) return 0;
+    (void)cap;
+    if (guest[0] == '\0') return 0; /* abstract: kernel-only namespace */
+    if (guest_absolutize(pid, guest) != 0) return 0;
+    char host[SP_PATH_MAX];
+    if (!sp_translate(&g_cfg, guest, host)) return 0;
+    size_t hl = strlen(host);
+    if (hl + off + 1 > 108) return 0; /* doesn't fit sun_path; honest pass */
+    if (hl >= SP_SCRATCH_CAP) return 0;
+    struct sockaddr_un out;
+    memset(&out, 0, sizeof(out));
+    out.sun_family = AF_UNIX;
+    memcpy(out.sun_path, host, hl + 1);
+    long scratch = (long)(r->sp - scratch_off);
+    errno = 0;
+    if (ptrace(PTRACE_PEEKDATA, pid, (void *)scratch, NULL) == -1 && errno) return 0;
+    if (poke_str(pid, scratch, (const char *)&out, off + hl + 1) != 0) return 0;
+    r->regs[sa_argi] = (unsigned long long)scratch;
+    r->regs[len_argi] = (unsigned long long)(off + hl + 1);
+    if (g_debug) SP_TRACE("[%d] %s sockaddr_un %s -> %s\n", pid, name, guest, host);
+    return 1;
+}
+
+typedef struct { long sysno; int sa_argi; int len_argi; const char *name; } sp_sock_rule;
+static const sp_sock_rule SP_SOCK_RULES[] = {
+    { 200 /*SYS_bind*/,    1, 2, "bind"    },
+    { 203 /*SYS_connect*/, 1, 2, "connect" },
+    { 206 /*SYS_sendto*/,  4, 5, "sendto"  },
+    /* sendmsg(211): msg_name lives through a user struct — needs deeper
+     * peek; covered by the interposer for dynamic tracees; documented
+     * supervisor gap for v1 (datagram X11 is rare). */
+};
+
 static void apply_policy_entry(tracee_t *t, pid_t pid,
                                 long sysno, unsigned long long x0, unsigned long long x1) {
     (void)x0; (void)x1;
@@ -905,6 +970,21 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
         int changed = translate_reg_path(t, pid, &rex, path_argi, "execve");
         if (changed)
             ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovex);
+        return;
+    }
+
+    /* AF_UNIX sockaddr arguments (forward) for supervisor-governed tracees */
+    for (size_t i = 0; i < sizeof(SP_SOCK_RULES)/sizeof(*SP_SOCK_RULES); i++) {
+        const sp_sock_rule *rule = &SP_SOCK_RULES[i];
+        if (rule->sysno != sysno) continue;
+        struct user_pt_regs rchk;
+        struct iovec iovchk = { &rchk, sizeof(rchk) };
+        if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovchk) != 0) return;
+        /* place sock struct below the string arena (path poke lives in the
+         * last-3KiB zone; sockets get a separate 256B corner) */
+        if (translate_reg_sockaddr(pid, &rchk, rule->sa_argi, rule->len_argi,
+                                   rule->name, SP_SCRATCH_BELOW_SP - 256))
+            ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovchk);
         return;
     }
 

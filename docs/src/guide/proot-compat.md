@@ -57,3 +57,17 @@ Known deltas vs `proot-distro login`: sprout does not (yet) -b system
 paths by default (pass `-b /dev -b /proc -b /sys` if a tool needs them)
 and does not fake `/proc/...` contents (loadavg/stat/uptime files that
 proot-distro bind-mounts from its own `sysdata/`).
+
+## CLI parity table
+
+| proot / proot-distro flag | sprout flag | notes |
+|---------------------------|-------------|-------|
+| `-r rootfs` | `-r rootfs` | identical |
+| `-b host[:guest]` | `-b host[:guest]` | identical semantics |
+| `-w dir` | `-w dir` | guest cwd |
+| `-0` (fake root id) | `-0` | exit-code passthrough only |
+| `--link2symlink` | `--link2symlink` | |
+| `proot-distro login --shared-tmp` | `--shared-tmp` | binds `$PREFIX/tmp` → guest `/tmp`; carries X11/Wayland/VirGL sockets |
+| proot bind of host `/dev/*` | `-b /dev/...` | only pseudo files (`/dev/null`, `/dev/urandom`); **real device nodes (kgsl/mali) are SELinux-blocked for ALL unprivileged apps, proot included** |
+| proot's fake `/proc` files | — (not implemented) | sprout passes the host `/proc` variant through; doc'd divergence |
+
