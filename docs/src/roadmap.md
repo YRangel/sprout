@@ -4,7 +4,7 @@
 |---|---|---|
 | **v0.1** | Core: workspace, ELF classify → preload strategy, loader-launch, CLI surface | **done** (`-b/-w/-0/--link2symlink/-0` accepted; `--fallback` reserved for ptrace path) |
 | **v0.2** | execve chaining + shebang scripts + `system()`/`posix_spawn()` wrappers so guests spawn guests inside sprout | **done** |
-| **v0.3** | ptrace fallback: static binaries (SIGSYS swallow, dirfd-family translation, execve rewrite incl. static→dynamic/script via loader chain) | **done** (Go untested) |
+| **v0.3** | ptrace fallback: static binaries (SIGSYS swallow, dirfd + cwd-relative translation, execve rewrite incl. static→dynamic/script) | **done** (nolibc-static class verified: same syscall profile as Go) |
 | **v0.4** | musl/Alpine guests (own loader name, no `--library-path`) | planned |
 | **v0.5** | embeddable `.so` + Android Library (AAR) for other apps | planned |
 | **v0.6** | reproducible benchmark suite published, regression alerts in CI | planned |
