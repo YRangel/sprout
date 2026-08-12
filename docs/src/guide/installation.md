@@ -8,10 +8,10 @@ that must stay side-by-side:
 ```
 sprout              # launcher CLI (Rust)
 libsprout-core.so   # LD_PRELOAD interposer (glibc-linked)
-sprout-ptrace       # supervisor (static binary fallback)
+sprout-super        # supervisor (v0.5.1 rename; legacy sprout-ptrace symlink included) (static binary fallback)
 ```
 
-sprout discovers `libsprout-core.so` and `sprout-ptrace` *next to the
+sprout discovers `libsprout-core.so` and `sprout-super` *next to the
 `sprout` binary* (sibling-of-argv[0] rule). Install with:
 
 ```sh

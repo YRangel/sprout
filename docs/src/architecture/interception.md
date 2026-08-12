@@ -9,7 +9,7 @@ Two interception layers cover the full binary spectrum:
 | layer | covers | mechanism |
 |-------|--------|-----------|
 | `LD_PRELOAD` fast path | dynamic glibc images (the 99%) | symbol interposition, loader-chain launch, sanitized runtime libs |
-| `sprout-ptrace` supervisor | static + Go binaries (the 1%) | ptrace argument rewriting at syscall-entry stops |
+| `sprout-super` supervisor (v0.5.1; was `sprout-ptrace`) | static + Go binaries (the 1%) | ptrace argument rewriting at syscall-entry stops |
 
 The launcher picks the layer per exec: dynamic binaries never see ptrace.
 
@@ -90,7 +90,7 @@ glibc freezes the POSIX spawn ABI as an internal pair of ops + a
 
 `system()` is a thin wrapper over `sh -c` via the same chain.
 
-## Supervisor layer: `sprout-ptrace` (v0.3, statics)
+## Supervisor layer: `sprout-super` (v0.3 statics; binary renamed from `sprout-ptrace` in v0.5.1)
 
 Static and raw-`svc` (Go-class) binaries have no PLT for the preload to
 net. They are the only images that run under the ptrace supervisor —

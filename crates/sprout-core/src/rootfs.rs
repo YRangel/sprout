@@ -57,6 +57,12 @@ pub struct Rootfs {
     pub cwd: Option<String>,
     pub fakeroot: bool,
     pub link2symlink: bool,
+    /// pass the host $HOME through to the guest (default: HOME=/root,
+    /// proot parity)
+    pub host_home: bool,
+    /// append the host $PREFIX/bin to the guest PATH (default: clean
+    /// guest-only view)
+    pub host_path: bool,
 }
 
 impl Rootfs {
@@ -79,6 +85,8 @@ impl Rootfs {
             cwd: None,
             fakeroot: false,
             link2symlink: false,
+            host_home: false,
+            host_path: false,
         })
     }
 

@@ -87,7 +87,7 @@ Handoff (user action required — needs network + GitHub account):
 - `git remote add origin <url> && git push -u origin main`
 - `gh run watch` (or Actions tab) for first green checkmarks
 - `git tag v0.4.0 && git push --tags` exercises release.yml end-to-end
-  (collects sprout + libsprout-core.so + sprout-ptrace + optional musl .so,
+  (collects sprout + libsprout-core.so + sprout-super + optional musl .so,
   strips, SHA256SUMS, GitHub Release, gh-pages docs deploy)
 
 ## Stable invariants for future refactors (ADR-0010 §"Refactor invariants")

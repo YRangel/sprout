@@ -41,6 +41,41 @@ pub struct LaunchPlan {
     pub display: String,
 }
 
+/// Resolve the guest PATH: `SPROUT_GUEST_PATH` override wins, else the
+/// clean guest-only default; `--host-path` appends the host $PREFIX/bin
+/// (proot-distro's opt-in shape).
+fn guest_path_for(rootfs: &Rootfs) -> String {
+    let mut p = std::env::var("SPROUT_GUEST_PATH").unwrap_or_else(|_| {
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+    });
+    if rootfs.host_path {
+        let prefix = std::env::var("PREFIX")
+            .unwrap_or_else(|_| "/data/data/com.termux/files/usr".into());
+        p.push_str(&format!(":{prefix}/bin"));
+    }
+    p
+}
+
+/// Push HOME/TERM policy defaults onto a plan env:
+/// - HOME: /root by default (proot parity); `--host-home` passes the host
+///   $HOME through.
+/// - TERM: inherited from the host; falls back to xterm-256color so guests
+///   always see a sane terminal type.
+fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
+    if !env.iter().any(|(k, _)| k == "HOME") {
+        let home = if rootfs.host_home {
+            std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+        } else {
+            "/root".into()
+        };
+        env.push(("HOME".into(), home));
+    }
+    if !env.iter().any(|(k, _)| k == "TERM") {
+        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
+        env.push(("TERM".into(), term));
+    }
+}
+
 impl LaunchPlan {
     /// Build the preload launch plan for an already-classified dynamic ELF.
     ///
@@ -84,11 +119,8 @@ impl LaunchPlan {
             ];
             argv.extend(args.iter().skip(1).cloned());
 
-            let guest_path = std::env::var("SPROUT_GUEST_PATH").unwrap_or_else(|_| {
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
-            });
             let mut env = vec![
-                ("PATH".into(), guest_path),
+                ("PATH".into(), guest_path_for(rootfs)),
                 ("SPROUT_ROOTFS".into(), rootfs.root.display().to_string()),
                 ("LD_PRELOAD".into(), preload_so.display().to_string()),
                 ("LD_LIBRARY_PATH".into(), library_path.clone()),
@@ -108,6 +140,7 @@ impl LaunchPlan {
             if debug {
                 env.push(("SPROUT_DEBUG".into(), "1".into()));
             }
+            push_home_term(&mut env, rootfs);
             return Ok(Self {
                 strategy: Strategy::Preload,
                 loader,
@@ -156,11 +189,8 @@ impl LaunchPlan {
         // Inheriting the host PATH leaks host dirs into the guest PATH
         // search (python's shutil.which, env, shells). proot-distro sets a
         // guest-sane PATH for the same reason. SPROUT_GUEST_PATH overrides.
-        let guest_path = std::env::var("SPROUT_GUEST_PATH").unwrap_or_else(|_| {
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
-        });
         let mut env = vec![
-            ("PATH".into(), guest_path),
+            ("PATH".into(), guest_path_for(rootfs)),
             ("SPROUT_ROOTFS".into(), rootfs.root.display().to_string()),
             ("LD_PRELOAD".into(), ld_preload),
             ("LD_LIBRARY_PATH".into(), library_path.clone()),
@@ -179,6 +209,7 @@ impl LaunchPlan {
         if debug {
             env.push(("SPROUT_DEBUG".into(), "1".into()));
         }
+        push_home_term(&mut env, rootfs);
 
         /* same default: no host-cwd inheritance outside the rootfs. */
         let cwd = Some(rootfs.to_host(std::path::Path::new(
@@ -257,11 +288,10 @@ impl LaunchPlan {
             ("SPROUT_ROOTFS".into(), rootfs.root.display().to_string()),
             (
                 "PATH".into(),
-                std::env::var("SPROUT_GUEST_PATH").unwrap_or_else(|_| {
-                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
-                }),
+                guest_path_for(rootfs),
             ),
         ];
+        push_home_term(&mut env, rootfs);
         if flavor == LibcFlavor::Musl {
             /* musl under the supervisor: same chain mechanics but pointing
              * at the musl ld.so and the musl-built artifact; no sanitized

@@ -3,7 +3,7 @@
 use std::env;
 use std::path::PathBuf;
 
-/// Absolute path to the `sprout-ptrace` helper.
+/// Absolute path to the `sprout-super` helper (compat: `sprout-ptrace`).
 ///
 /// Order: `$SPROOT_PTRACE_PATH` → sibling of argv[0] → the path baked in
 /// at build time (cargo OUT_DIR). None when nothing was built (never on
@@ -17,9 +17,11 @@ pub fn supervisor_path() -> Option<PathBuf> {
     }
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("sprout-ptrace");
-            if p.is_file() {
-                return Some(p);
+            for name in ["sprout-super", "sprout-ptrace"] {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
             }
         }
     }

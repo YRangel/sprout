@@ -11,6 +11,8 @@ is a no-op. The table is sorted by how `proot-distro login` uses flags.
 | `-w <dir>` | `-w <dir>` / `--cwd` | ✅ v0.1 |
 | `--link2symlink` | `--link2symlink` | ✅ v0.4.3+; **DEFAULT since v0.5** (opt out with `--no-link2symlink`). EPERM hardlinks degrade like proot's `.l2s` (content relocated to `$ROOT/.l2s/.l2s.<name>.<nonce>` + symlinks at both src and dst — survives `link-then-write-through-fd` like glibc's locale-archive builder), then content-copy, symlink as last resort |
 | `-q <qemu>` | — | intentionally unsupported (host is native aarch64) |
+| (HOME passthrough) | `--host-home` | v0.5.1+: default is proot's `HOME=/root`; flag carries the host `$HOME` in |
+| (host PATH append) | `--host-path` | v0.5.1+: default is the clean guest-only PATH; flag appends `$PREFIX/bin` (proot-distro's opt-in shape) |
 | `-i <id>` | implicit (always the launcher uid) | ✅ equivalent |
 | `--kernel-release` | -- | untracked; guests see host kernel |
 | `--mixed-mode` | `--fallback=auto` | ✅ v0.3 (semantics satisfied) |
@@ -55,7 +57,7 @@ plugin needed.
 
 ### Environment hygiene
 
-sprout, like proot-distro, substitutes a guest-sane `PATH` (`/usr/local/sbin:.../sbin:/bin`) unless `SPROUT_GUEST_PATH` overrides it; learning host PATH habits (`which`-less slim guests notwithstanding).
+sprout, like proot-distro, substitutes a guest-sane `PATH` (`/usr/local/sbin:.../sbin:/bin`) unless `SPROUT_GUEST_PATH` overrides it; `--host-path` appends `$PREFIX/bin`. `HOME=/root` by default (proot parity) — `--host-home` carries the host `$HOME` in. `TERM` is inherited from the host (with an `xterm-256color` fallback when the host didn't set any). The supervisor binary is `sprout-super` since v0.5.1 (`sprout-ptrace` stays as a legacy symlink): the name tools like fastfetch report comes straight from the process tree.
 
 
 ## Using with proot-distro rootfses

@@ -57,6 +57,16 @@ struct Cli {
     #[arg(long = "no-link2symlink", default_value_t = false)]
     no_link2symlink: bool,
 
+    /// Pass the host $HOME through to the guest instead of the proot-parity
+    /// HOME=/root default.
+    #[arg(long = "host-home")]
+    host_home: bool,
+
+    /// Append the host $PREFIX/bin to the guest PATH (default: the clean
+    /// guest-only PATH).
+    #[arg(long = "host-path")]
+    host_path: bool,
+
     /// Force interception strategy (auto detects from guest ELF).
     #[arg(
         long = "fallback",
@@ -90,6 +100,8 @@ fn run() -> Result<u8, Error> {
     rootfs.cwd = cli.cwd;
     rootfs.fakeroot = cli.root_id && !cli.no_fakeroot;
     rootfs.link2symlink = cli.link2symlink && !cli.no_link2symlink;
+    rootfs.host_home = cli.host_home;
+    rootfs.host_path = cli.host_path;
     for spec in &cli.binds {
         rootfs.bindings.push(Binding::parse(spec)?);
     }

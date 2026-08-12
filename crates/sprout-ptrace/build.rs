@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
-    let exe = out_dir.join("sprout-ptrace");
+    let exe = out_dir.join("sprout-super");
 
     println!("cargo:rerun-if-changed=csrc/sprout_ptrace.c");
     println!("cargo:rerun-if-changed=csrc/sprout_preload.h");
@@ -34,7 +34,7 @@ fn main() {
         .status()
         .unwrap_or_else(|e| panic!("failed to spawn compiler: {e}"));
     if !status.success() {
-        panic!("compiler failed building sprout-ptrace: {status}");
+        panic!("compiler failed building sprout-super: {status}");
     }
 
     println!("cargo:rustc-env=SPROOT_PTRACE_EXE={}", exe.display());
