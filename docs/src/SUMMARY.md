@@ -33,6 +33,7 @@
 - [0013: seccomp user-notify fast path](./adr/0013-user-notify-fast-path.md)
 - [0014: vfork-safe exec chain](./adr/0014-vfork-safe-exec-chain.md)
 - [0015: relative path semantics (cwd + dirfd)](./adr/0015-relative-path-semantics.md)
+- [0016: pure-notify statics lane (sprout-stub)](./adr/0016-pure-notify-statics-lane.md)
 
 # Operations
 

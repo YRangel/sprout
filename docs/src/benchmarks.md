@@ -177,6 +177,28 @@ path fast-CONT.
   load). Direct A/B same-minute: proot 8.44 s vs sprout 0.49 s = **~17×**, consistent with the 16.6× first measurement.
 - glibc notify lane A/B: 0.81–0.96× (was 0.56–0.82×) — remaining delta is the seccomp filter evaluation cost itself (17-JEQ BPF run on every guest syscall), unavoidable while sockets need the listener; musl lane 0.90–1.21× (parity).
 
+## Statics lane A/B (v0.6, 2026-08-12, same host, median-of-20 × 3 rounds)
+
+ADR-0016 pure-notify statics lane (`sprout-stub`) vs the legacy TRACEME
+ptrace lane, debian rootfs, freestanding static test binaries
+(`-nostdlib` ET_EXEC):
+
+| workload                                   | ptrace lane | notify-statics lane | ratio |
+|--------------------------------------------|-------------|---------------------|-------|
+| spawn `/tmp/sp_asm` (static, open+exit)    | 57 ms min   | 55 ms min           | ~1.04× |
+| exec-chain static→dynamic (`basename`)     | 63 ms min   | 57 ms min           | ~1.10× |
+| **syscall-dense loop: 20k×(open+read+close)** | **6.44–6.54 s** | **1.62–1.65 s** | **~4.0×** |
+
+The spawn costs are supervisor+fork dominated (identical in both lanes),
+so they hide the win; the 20k-iteration syscall loop exposes it: ptrace
+pays a stop per syscall (~10.7µs each on this device), notify pays one
+user-space serve round-trip per trapped syscall and zero for everything
+else. Long-lived, syscall-heavy static guests (Go daemons like
+cloudflared) live on the right-hand column.
+
+`SPROUT_NOTIFY_STATICS=0` selects the ptrace lane; default is the notify
+lane for kind=1/2 (static / Go-static) top-level guests.
+
 ## Historical (v0.3 toolchain sweep, 2026-08-11, same host)
 
 First published release pass: python3 239→41 (5.8×), exec-chain 285→49

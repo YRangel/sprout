@@ -9,7 +9,7 @@ Two interception layers cover the full binary spectrum:
 | layer | covers | mechanism |
 |-------|--------|-----------|
 | `LD_PRELOAD` fast path | dynamic glibc images (the 99%) | symbol interposition, loader-chain launch, sanitized runtime libs |
-| `sprout-super` supervisor (v0.5.1; was `sprout-ptrace`) | static + Go binaries (the 1%) | ptrace argument rewriting at syscall-entry stops |
+| `sprout-super` supervisor + `sprout-stub` in-guest companion (v0.6 notify lane; supervisor renamed from `sprout-ptrace` in v0.5.1) | static + Go binaries (the 1%) | seccomp user-notify serve from a stub-owned filter; ptrace only as the execve rewrite vehicle (ADR-0016) |
 
 The launcher picks the layer per exec: dynamic binaries never see ptrace.
 
@@ -93,8 +93,29 @@ glibc freezes the POSIX spawn ABI as an internal pair of ops + a
 ## Supervisor layer: `sprout-super` (v0.3 statics; binary renamed from `sprout-ptrace` in v0.5.1)
 
 Static and raw-`svc` (Go-class) binaries have no PLT for the preload to
-net. They are the only images that run under the ptrace supervisor —
-the last resort of ADR-0002. The supervisor:
+net. Since v0.6 (ADR-0016) their default lane is **ptrace-free**:
+`sprout-super` execs the freestanding **`sprout-stub`** companion, which
+hand-maps the guest image, installs an in-guest SIGSYS emulation handler
+(Android TRAP set: set_robust_list/rseq/set*id/setgroups), then installs
+a seccomp user-notify filter *itself* and hands its listener fd to the
+supervisor over a socketpair (`pidfd_getfd` steal, same M3 wire
+protocol). The filter survives the guest's own execve, so every image
+the guest replaces itself with keeps reporting into the same listener.
+The supervisor's steady state is a `poll + serve + waitpid` loop — no
+TRACEME, no ptrace attachments, no per-syscall stops.
+
+ptrace survives as a vehicle of last resort at exactly one point:
+**execve notifications** (register-level `x0..x2` rewrites+
+static→dynamic loader-chain surgery) via a lazy
+`PTRACE_ATTACH/INTERRUPT → GETREGSET → rewrite → SETREGSET → DETACH`
+cycle that runs while the task is already seccomp-parked. `SPROUT_
+NOTIFY_STATICS=0` selects the legacy all-ptrace lane below for A/B and
+fallback; both lanes share every supervisor-side translation and serve
+helper.
+
+### Legacy: the TRACEME supervisor (pre-v0.6 default, ADR-0002 last resort)
+
+The supervisor:
 
 1. **`SECCOMP_RET_TRAP` swallow** — Android ≥15 delivers SIGSYS (not
    KILL) for the blocked init syscalls; on `SIGSYS` stops with
