@@ -18,6 +18,21 @@ Guest: **Debian 13 (trixie, glibc 2.41)** (`proot-distro/containers/debian`).
 
 Debug build for reference: 2.6–3.0× on the same workloads.
 
+### re-measurement after the user-notify fast path (ADR-0013), same device, median-of-5
+
+| workload                        | proot-distro | sprout | speedup |
+|---------------------------------|--------------|--------|---------|
+| `python3 -c pass`               | 299 ms       | 68 ms  | **4.4×** |
+| `bash -c true`                  | 255 ms       | 49 ms  | **5.2×** |
+| exec-chain (20× `/bin/true`)    | 376 ms       | 106 ms | **3.6×** |
+| `find /etc -maxdepth 2 -type f` | 154 ms       | 50 ms  | **3.1×** |
+
+Both tables are real medians from this device; the spread between them is
+thermal-state drift (see note below), not a code regression — the
+notify-served build beats the LD_PRELOAD-only build in statics and musl
+workloads by ~25–40% (tracked below) while adding no measurable overhead
+to dynamic guests.
+
 Why sprout wins: proot pays ptrace round-trips for **every** path-bearing
 syscall in the guest; sprout's dynamic path pays one loader launch for the
 first exec and then a PLT interposition per child (`posix_spawn`/`execve`/
