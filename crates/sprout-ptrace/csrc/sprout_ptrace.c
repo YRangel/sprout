@@ -1311,15 +1311,13 @@ static int sp_notify_install(void) {
         53 /*fchmodat*/, 54 /*fchownat*/, 88 /*utimensat*/,
         36 /*symlinkat*/, 37 /*linkat*/, 38 /*renameat*/,
         276 /*renameat2*/,
-        /* ADR-0016 hosts (notify-statics): execve is the lazy-attach
-         * trigger; the stat family has no interposer on statics, so the
-         * supervisor must serve it through the listener too. These four
-         * CONT immediately under every TRACEME-lane shadow guest (the
-         * interposer already covers them). */
-        /*221 execve — removed: seccomp-notifying the parent's own exec of
-         * the stub reproduced a child-side ENOENT-mislabel in this lane
-         * (debugging: restored once the stub-exec flow is verified). */
-        79 /*newfstatat*/, 291 /*statx*/, 78 /*readlinkat*/,
+        /* stat-family (79/291/78) DELIBERATELY ABSENT here: this filter is
+         * the SHARED one put on TRACEME-lane statics + shadow dynamic
+         * guests — dynamic guests' stats are already interposer-
+         * translated and statics' stats are ptrace-served; trapping them
+         * into the notify listener cost musl `find /usr` ~4x (measured
+         * 328ms vs 81ms). The notify-statics lane (ADR-0016) needs them
+         * and has them — in the stub's OWN filter, not this one. */
         200 /*bind*/, 203 /*connect*/, 206 /*sendto*/, 211 /*sendmsg*/,
     };
     const int ntr = (int)(sizeof(traps)/sizeof(traps[0]));
