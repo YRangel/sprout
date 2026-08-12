@@ -832,6 +832,58 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
     SP_TRACE("fchmodat", path, p);
     return SP_REAL(fchmodat)(dirfd, p, mode, flags);
 }
+
+/* ---- fakeroot identity family (ADR-0011/M3.1 parity with proot -0) ----
+ * apt's privilege-drop chain (setgroups/setresgid/setresuid/seteuid...)
+ * must BELIEVE it succeeded under -0. Android TRAPs the set*id syscalls
+ * for untrusted apps (supervisor swallows SIGSYS: 143-152,159 -> 0), and
+ * the non-trapped remainder (seteuid=148 & friends) are answered here at
+ * the PLT so the guest never sees a real kernel EPERM. Without -0 every
+ * call passes through untouched. */
+static int sp_fakeroot_on(void) {
+    static int fr = -1;
+    if (fr < 0) fr = getenv("SPROUT_FAKEROOT") != NULL;
+    return fr;
+}
+/* state backing the fake answers; the get* wrappers below report
+ * whatever the most recent fake set*id call promised. */
+uid_t  g_fake_uid = 0;
+gid_t  g_fake_gid = 0;
+gid_t  g_fake_groups[64];
+int    g_fake_ngroups = 0;
+int setuid(uid_t uid) { static int (*SP_REAL(setuid))(uid_t)=NULL; SP_RESOLVE(setuid); if (sp_fakeroot_on()) { g_fake_uid = uid; return 0; } return SP_REAL(setuid)(uid); }
+int seteuid(uid_t uid) { static int (*SP_REAL(seteuid))(uid_t)=NULL; SP_RESOLVE(seteuid); if (sp_fakeroot_on()) { g_fake_uid = uid; return 0; } return SP_REAL(seteuid)(uid); }
+int setgid(gid_t gid) { static int (*SP_REAL(setgid))(gid_t)=NULL; SP_RESOLVE(setgid); if (sp_fakeroot_on()) { g_fake_gid = gid; g_fake_groups[0] = gid; g_fake_ngroups = 1; return 0; } return SP_REAL(setgid)(gid); }
+int setegid(gid_t gid) { static int (*SP_REAL(setegid))(gid_t)=NULL; SP_RESOLVE(setegid); if (sp_fakeroot_on()) { g_fake_gid = gid; return 0; } return SP_REAL(setegid)(gid); }
+int setreuid(uid_t ruid, uid_t euid) { static int (*SP_REAL(setreuid))(uid_t,uid_t)=NULL; SP_RESOLVE(setreuid); if (sp_fakeroot_on()) { if (euid != (uid_t)-1) g_fake_uid = euid; return 0; } return SP_REAL(setreuid)(ruid,euid); }
+int setregid(gid_t rgid, gid_t egid) { static int (*SP_REAL(setregid))(gid_t,gid_t)=NULL; SP_RESOLVE(setregid); if (sp_fakeroot_on()) { if (egid != (gid_t)-1) g_fake_gid = egid; return 0; } return SP_REAL(setregid)(rgid,egid); }
+int setresuid(uid_t ruid, uid_t euid, uid_t suid) { static int (*SP_REAL(setresuid))(uid_t,uid_t,uid_t)=NULL; SP_RESOLVE(setresuid); if (sp_fakeroot_on()) { if (euid != (uid_t)-1) g_fake_uid = euid; return 0; } return SP_REAL(setresuid)(ruid,euid,suid); }
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid) { static int (*SP_REAL(setresgid))(gid_t,gid_t,gid_t)=NULL; SP_RESOLVE(setresgid); if (sp_fakeroot_on()) { if (egid != (gid_t)-1) g_fake_gid = egid; return 0; } return SP_REAL(setresgid)(rgid,egid,sgid); }
+int setgroups(size_t n, const gid_t *g) { static int (*SP_REAL(setgroups))(size_t,const gid_t*)=NULL; SP_RESOLVE(setgroups); if (sp_fakeroot_on()) { unsigned c = (n > 64) ? 64 : n; for (unsigned k = 0; k < c; k++) g_fake_groups[k] = g[k]; g_fake_ngroups = (int)c; return 0; } return SP_REAL(setgroups)(n,g); }
+int initgroups(const char *u, gid_t g) { static int (*SP_REAL(initgroups))(const char*,gid_t)=NULL; SP_RESOLVE(initgroups); if (sp_fakeroot_on()) { (void)u; g_fake_groups[0] = g; g_fake_ngroups = 1; return 0; } return SP_REAL(initgroups)(u,g); }
+/* apt DropPrivsOrDie verifies with getgroups() that no foreign
+ * supplementary groups remain after the drop; under -0 the truthful
+ * fake is the root profile: zero supplementary groups. */
+int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid) {
+    static int (*SP_REAL(getresuid))(uid_t*,uid_t*,uid_t*)=NULL; SP_RESOLVE(getresuid);
+    if (sp_fakeroot_on()) { *ruid = g_fake_uid; *euid = g_fake_uid; *suid = g_fake_uid; return 0; }
+    return SP_REAL(getresuid)(ruid,euid,suid);
+}
+int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid) {
+    static int (*SP_REAL(getresgid))(gid_t*,gid_t*,gid_t*)=NULL; SP_RESOLVE(getresgid);
+    if (sp_fakeroot_on()) { *rgid = g_fake_gid; *egid = g_fake_gid; *sgid = g_fake_gid; return 0; }
+    return SP_REAL(getresgid)(rgid,egid,sgid);
+}
+int getgroups(int n, gid_t *list) {
+    static int (*SP_REAL(getgroups))(int,gid_t*)=NULL; SP_RESOLVE(getgroups);
+    if (sp_fakeroot_on()) {
+        if (n <= 0) return g_fake_ngroups;
+        int c = (g_fake_ngroups < n) ? g_fake_ngroups : n;
+        for (int k = 0; k < c; k++) list[k] = g_fake_groups[k];
+        return c;
+    }
+    return SP_REAL(getgroups)(n,list);
+}
 int chown(const char *path, uid_t uid, gid_t gid) {
     static int (*SP_REAL(chown))(const char *, uid_t, gid_t) = NULL;
     static int fake_root = -1;
@@ -2033,18 +2085,22 @@ int posix_spawnp(pid_t *restrict pid, const char *restrict file,
     return sp_spawn_impl(pid, file, fa, attrp, argv, envp, 1);
 }
 
-/* uid/gid spoofing for -0 / --root-id */
-uid_t getuid(void)  { return g_cfg.fakeroot ? 0 : geteuid(); }
+/* uid/gid spoofing for -0 / --root-id.
+ * Stateful model (apt DropPrivsOrDie verifies its own drop):
+ * the id a fake-set*id call PROMISED is what the get* calls then
+ * report (per-process; fresh execs start at the root profile).
+ * The state itself is defined next to the set* wrappers above. */
+uid_t getuid(void)  { return g_cfg.fakeroot ? g_fake_uid : geteuid(); }
 uid_t geteuid(void) {
     static uid_t (*SP_REAL(geteuid))(void) = NULL;
     SP_RESOLVE(geteuid);
-    return g_cfg.fakeroot ? 0 : SP_REAL(geteuid)();
+    return g_cfg.fakeroot ? g_fake_uid : SP_REAL(geteuid)();
 }
-gid_t getgid(void)  { return g_cfg.fakeroot ? 0 : getegid(); }
+gid_t getgid(void)  { return g_cfg.fakeroot ? g_fake_gid : getegid(); }
 gid_t getegid(void) {
     static gid_t (*SP_REAL(getegid))(void) = NULL;
     SP_RESOLVE(getegid);
-    return g_cfg.fakeroot ? 0 : SP_REAL(getegid)();
+    return g_cfg.fakeroot ? g_fake_gid : SP_REAL(getegid)();
 }
 
 /* dlopen entry interception. glibc's ld.so opens libraries via ITS OWN

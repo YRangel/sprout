@@ -104,6 +104,15 @@ static const sp_emul_rule SP_EMULATE_BASE[] = {
     { 426, -38 },  /* io_uring_enter    -> -ENOSYS */
     { 427, -38 },  /* io_uring_register -> -ENOSYS */
     { 439, -38 },  /* faccessat2 raw callers -> -ENOSYS (libc falls back) */
+    { 159, -1 },   /* setgroups — Android TRAPs; EPERM truth, fakeroot 0 */
+    { 143, -1 },   /* setuid  */
+    { 144, -1 },   /* setreuid */
+    { 145, -1 },   /* setfsuid */
+    { 146, -1 },   /* setgid */
+    { 147, -1 },   /* setregid */
+    { 149, -1 },   /* setresuid */
+    { 151, -1 },   /* setresgid */
+    { 152, -1 },   /* setfsgid */
 };
 /* Musl extra: faccessat init-poll + Android-blocked set*id family — the
  * "already at minimal privilege" truth of a rootless sandbox. Applied at
@@ -1476,7 +1485,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (dirfd != -100 /*AT_FDCWD*/) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
-        sp_notify_reply_open(id, resp, host, flags, 0);
+        sp_notify_reply_open(id, resp, host, flags, (mode_t)args[3]);
         return; }
     case 437: { /* openat2(dirfd,path,how*,size) */
         int dirfd = (int)args[0];
@@ -2067,12 +2076,18 @@ int main(int argc, char **argv) {
                         if ((long)r.regs[8] == SP_EMULATE_MUSL_EXTRA[i]) { emulated = 1; emul_ret = 0; break; }
                     }
                 }
+                /* fakeroot parity with proot: under -0 an identity or
+                 * group-set procedure is a no-op success. */
+                if (emulated && (long)r.regs[8] >= 143 && (long)r.regs[8] <= 152 && getenv("SPROUT_FAKEROOT"))
+                    emul_ret = 0;
+                if (emulated && (long)r.regs[8] == 159 && getenv("SPROUT_FAKEROOT"))
+                    emul_ret = 0;
                 if (emulated) {
                     r.regs[0] = (unsigned long long)(long long)emul_ret;
                     ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
                     if (g_debug)
-                        fprintf(stderr, "[ptrace] %d SIGSYS swallowed: sysno=%llu emulated ok\n",
-                                w, r.regs[8]);
+                        fprintf(stderr, "[ptrace] %d SIGSYS swallowed: sysno=%llu emulated -> %ld (fakeroot=%s)\n",
+                                w, r.regs[8], emul_ret, getenv("SPROUT_FAKEROOT") ? getenv("SPROUT_FAKEROOT") : "-");
                 }
             }
             /* swallow or deliver */
