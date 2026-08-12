@@ -1257,6 +1257,7 @@ static int sp_notify_install(void) {
         53 /*fchmodat*/, 54 /*fchownat*/, 88 /*utimensat*/,
         36 /*symlinkat*/, 37 /*linkat*/, 38 /*renameat*/,
         276 /*renameat2*/,
+        200 /*bind*/, 203 /*connect*/, 206 /*sendto*/, 211 /*sendmsg*/,
     };
     const int ntr = (int)(sizeof(traps)/sizeof(traps[0]));
     /* layout:
@@ -1390,6 +1391,78 @@ static int sp_notify_hostpath(pid_t pid, const char *guest, char *host, size_t c
     return (n > 0 && (size_t)n < cap) ? 1 : 0;
 }
 
+/* ---- AF_UNIX notify-serve via pidfd_getfd (ADR-0013 M3) ----------------
+ * bind/connect/sendto/sendmsg carry a sockaddr_un the kernel must see in
+ * HOST form, but the operations must affect the TRACEE's socket, not a
+ * supervisor one. pidfd_getfd duplicates the tracee's socket fd into the
+ * supervisor's table *referring to the same struct file*, so operating on
+ * the duplicate is semantically identical to the tracee doing it itself.
+ * Requires kernel >=5.6 (pidfd_getfd); probed lazily once, falling back
+ * to CONTINUE (ptrace scratch path covers governed tracees; dynamic
+ * guests already translated in the interposer). */
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
+#define SP_PIDFD_CACHE 16
+#define SP_SOCK_IO_CAP 32768
+static pid_t g_pidfd_pid[SP_PIDFD_CACHE];
+static int   g_pidfd_fd[SP_PIDFD_CACHE];
+static int   g_pidfd_avail = -1; /* -1 unprobed, 0 unavailable, 1 ok */
+
+static int sp_pidfd_for(pid_t pid) {
+    if (g_pidfd_avail == 0) return -1;
+    for (int i = 0; i < SP_PIDFD_CACHE; i++)
+        if (g_pidfd_pid[i] == pid && g_pidfd_fd[i] >= 0) return g_pidfd_fd[i];
+    int pf = (int)syscall(SYS_pidfd_open, pid, 0u);
+    if (pf < 0) { g_pidfd_avail = 0; return -1; }
+    g_pidfd_avail = 1;
+    for (int i = 0; i < SP_PIDFD_CACHE; i++) {
+        if (g_pidfd_pid[i] == 0 || g_pidfd_fd[i] < 0) {
+            g_pidfd_pid[i] = pid; g_pidfd_fd[i] = pf; return pf;
+        }
+    }
+    /* full: evict slot 0 (cheap LRU) */
+    close(g_pidfd_fd[0]);
+    g_pidfd_pid[0] = pid; g_pidfd_fd[0] = pf;
+    return pf;
+}
+
+static int sp_notify_sock_dup(pid_t pid, int childfd) {
+    int pf = sp_pidfd_for(pid);
+    if (pf < 0) return -1;
+    return (int)syscall(SYS_pidfd_getfd, pf, childfd, 0u);
+}
+
+/* Read the tracee's sockaddr at (addr,alen); if it is a translatable
+ * AF_UNIX *pathname* (absolute, non-abstract), produce the host form in
+ * `out` and return its length; else 0. */
+static socklen_t sp_notify_unix_to_host(pid_t pid, unsigned long long addr,
+                                        unsigned long long alen,
+                                        struct sockaddr_un *out) {
+    if (alen > sizeof(struct sockaddr_un) || alen < 3) return 0;
+    unsigned char buf[sizeof(struct sockaddr_un)];
+    memset(buf, 0, sizeof(buf));
+    if (sp_vm_read(pid, buf, alen, addr) != (ssize_t)alen) return 0;
+    struct sockaddr_un *su = (struct sockaddr_un *)buf;
+    if (su->sun_family != AF_UNIX) return 0;
+    if (su->sun_path[0] != '/') return 0; /* abstract or unnamed: host is fine */
+    char guest[SP_PATH_MAX], host[SP_PATH_MAX];
+    size_t gl = strnlen(su->sun_path, sizeof(su->sun_path));
+    if (gl == 0 || gl >= sizeof(guest)) return 0;
+    memcpy(guest, su->sun_path, gl + 1);
+    if (!sp_notify_hostpath(pid, guest, host, sizeof host)) return 0;
+    size_t hl = strlen(host);
+    if (hl >= sizeof(out->sun_path)) return 0;
+    memset(out, 0, sizeof(*out));
+    out->sun_family = AF_UNIX;
+    memcpy(out->sun_path, host, hl + 1);
+    return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + hl + 1);
+}
+
+/* ---- iovec gather for sendto/sendmsg notify-serve ---- */
 static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
                                 unsigned long long *args,
                                 unsigned long long id,
@@ -1578,6 +1651,91 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         resp->error = 0; resp->val = 0; return; }
     /* remaining: non-AT_FDCWD variants fall through (CONTINUE) */
 
+    case 200: /* bind(fd,addr,alen) */
+    case 203: { /* connect(fd,addr,alen) */
+        struct sockaddr_un hsa;
+        socklen_t hlen = sp_notify_unix_to_host(pid, args[1], args[2], &hsa);
+        if (hlen == 0) { sp_notify_continue(resp); return; }
+        int d = sp_notify_sock_dup(pid, (int)args[0]);
+        if (d < 0) { sp_notify_continue(resp); return; }
+        int rc = (nr == 200)
+               ? bind(d, (struct sockaddr *)&hsa, hlen)
+               : connect(d, (struct sockaddr *)&hsa, hlen);
+        int e = errno;
+        close(d);
+        if (rc < 0) { resp->error = -e; return; }
+        resp->error = 0; resp->val = 0;
+        return; }
+    case 206: { /* sendto(fd,buf,len,flags,addr,alen) */
+        if (args[4] == 0) { sp_notify_continue(resp); return; }
+        struct sockaddr_un hsa;
+        socklen_t hlen = sp_notify_unix_to_host(pid, args[4], args[5], &hsa);
+        if (hlen == 0) { sp_notify_continue(resp); return; }
+        unsigned long long len = args[2];
+        if (len > SP_SOCK_IO_CAP) { sp_notify_continue(resp); return; }
+        char *buf = malloc(len ? len : 1);
+        if (!buf) { sp_notify_continue(resp); return; }
+        if (len && sp_vm_read(pid, buf, len, args[1]) != (ssize_t)len) {
+            free(buf); sp_notify_continue(resp); return;
+        }
+        int d = sp_notify_sock_dup(pid, (int)args[0]);
+        if (d < 0) { free(buf); sp_notify_continue(resp); return; }
+        ssize_t rc = sendto(d, buf, len, (int)args[3],
+                            (struct sockaddr *)&hsa, hlen);
+        int e = errno;
+        close(d); free(buf);
+        if (rc < 0) { resp->error = -e; return; }
+        resp->error = 0; resp->val = (long long)rc;
+        return; }
+    case 211: { /* sendmsg(fd,msg,flags) */
+        struct sp_umsg { unsigned long long name, pad0; unsigned long long iov, iovlen, ctrl, ctrllen, flags; } mh;
+        if (sp_vm_read(pid, &mh, sizeof(mh), args[1]) != sizeof(mh)) { sp_notify_continue(resp); return; }
+        if (!mh.name) { sp_notify_continue(resp); return; }
+        if (mh.ctrl && mh.ctrllen) { sp_notify_continue(resp); return; } /* SCM creds: leave to kernel path */
+        struct sockaddr_un hsa;
+        socklen_t hlen;
+        {
+            /* msg_namelen sits in the low 32 bits of the second u64 slot */
+            unsigned long long namelen = mh.pad0 & 0xffffffffull;
+            hlen = sp_notify_unix_to_host(pid, mh.name, namelen, &hsa);
+        }
+        if (hlen == 0) { sp_notify_continue(resp); return; }
+        if (mh.iovlen > 16) { sp_notify_continue(resp); return; }
+        struct iovec iov[16];
+        unsigned long long total = 0;
+        char *pool = NULL, *p = NULL;
+        if (mh.iovlen) {
+            struct { unsigned long long base, len; } iv[16];
+            if (sp_vm_read(pid, iv, mh.iovlen * sizeof(iv[0]), mh.iov) != (ssize_t)(mh.iovlen * sizeof(iv[0]))) { sp_notify_continue(resp); return; }
+            for (unsigned long long k = 0; k < mh.iovlen; k++) {
+                total += iv[k].len;
+                if (total > SP_SOCK_IO_CAP) { sp_notify_continue(resp); return; }
+            }
+        }
+        pool = malloc(total ? total : 1);
+        if (!pool) { sp_notify_continue(resp); return; }
+        p = pool;
+        if (mh.iovlen) {
+            struct { unsigned long long base, len; } iv[16];
+            if (sp_vm_read(pid, iv, mh.iovlen * sizeof(iv[0]), mh.iov) != (ssize_t)(mh.iovlen * sizeof(iv[0]))) { free(pool); sp_notify_continue(resp); return; }
+            for (unsigned long long k = 0; k < mh.iovlen; k++) {
+                if (iv[k].len && sp_vm_read(pid, p, iv[k].len, iv[k].base) != (ssize_t)iv[k].len) { free(pool); sp_notify_continue(resp); return; }
+                iov[k].iov_base = p; iov[k].iov_len = iv[k].len;
+                p += iv[k].len;
+            }
+        }
+        int d = sp_notify_sock_dup(pid, (int)args[0]);
+        if (d < 0) { free(pool); sp_notify_continue(resp); return; }
+        struct msghdr sm;
+        memset(&sm, 0, sizeof(sm));
+        sm.msg_name = &hsa; sm.msg_namelen = hlen;
+        sm.msg_iov = iov; sm.msg_iovlen = mh.iovlen;
+        ssize_t rc = sendmsg(d, &sm, (int)args[2]);
+        int e = errno;
+        close(d); free(pool);
+        if (rc < 0) { resp->error = -e; return; }
+        resp->error = 0; resp->val = (long long)rc;
+        return; }
     default:
         sp_notify_continue(resp);
         return;
@@ -1625,35 +1783,42 @@ void sp_notify_child_install_and_send(int sockfd) {
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) { SP_OFT("child: NNP errno=%d\n", errno); close(sockfd); return; }
     int fd = sp_notify_install();
     if (fd < 0) { SP_OFT("child: install errno=%d (%s)\n", errno, strerror(errno)); close(sockfd); return; }
-    /* pass fd to supervisor: one byte of marker data */
-    char b = 'N';
-    struct iovec io = { &b, 1 };
-    char cms[CMSG_SPACE(sizeof(int))];
-    struct msghdr mh = { 0 };
-    mh.msg_iov = &io; mh.msg_iovlen = 1;
-    mh.msg_control = cms; mh.msg_controllen = sizeof(cms);
-    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
-    c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS;
-    c->cmsg_len = CMSG_LEN(sizeof(int));
-    *(int *)CMSG_DATA(c) = fd;
-    sendmsg(sockfd, &mh, 0);
+    /* pass the listener's fd NUMBER to the supervisor over a plain
+     * write(2) — sendmsg(2) would be caught by our own freshly-installed
+     * filter (ADR-0013 M3 traps bind/connect/sendto/sendmsg), deadlocking
+     * child (trapped, awaiting response) against parent (awaiting the
+     * SCM message that never comes). The parent reconstructs a usable
+     * descriptor with pidfd_getfd() (we are its ptracer; permitted).
+     * The fd stays non-CLOEXEC so it survives the upcoming execve(): the
+     * notify queue must outlive the installing task. */
+    unsigned char nb[4] = {
+        (unsigned char)(fd & 0xff), (unsigned char)((fd >> 8) & 0xff),
+        (unsigned char)((fd >> 16) & 0xff), (unsigned char)((fd >> 24) & 0xff) };
+    if (write(sockfd, nb, 4) != 4) { SP_OFT("child: fdnum write failed\n"); close(sockfd); return; }
+    /* rendezvous: block until the supervisor finished pidfd_getfd (or
+     * gave up). Without this a short-lived tracee can execve+exit before
+     * the parent steals the listener, racing notify into a fallback-or-
+     * broken mixed mode. */
+    unsigned char ack;
+    (void)read(sockfd, &ack, 1);
     close(sockfd);
-    close(fd); /* child keeps filter; supervisor received its own ref */
 }
 
-int sp_notify_parent_recv(int sockfd) {
-    char b;
-    struct iovec io = { &b, 1 };
-    char cms[CMSG_SPACE(sizeof(int))];
-    struct msghdr mh = { 0 };
-    mh.msg_iov = &io; mh.msg_iovlen = 1;
-    mh.msg_control = cms; mh.msg_controllen = sizeof(cms);
-    ssize_t rc = recvmsg(sockfd, &mh, 0);
+int sp_notify_parent_recv(int sockfd, pid_t child) {
+    unsigned char nb[4];
+    ssize_t rc = read(sockfd, nb, 4);
+    if (rc != 4) { close(sockfd); return -1; }
+    int cfd = (int)(nb[0] | (nb[1] << 8) | (nb[2] << 16) | ((unsigned)nb[3] << 24));
+    int pf = (int)syscall(SYS_pidfd_open, child, 0u);
+    if (pf < 0) return -1;
+    int fd = (int)syscall(SYS_pidfd_getfd, pf, cfd, 0u);
+    close(pf);
+    /* ACK the child either way: it drops to ptrace-only on fd<0 and the
+     * child must be released even in the failure case. */
+    { unsigned char ack = 0x41; (void)!write(sockfd, &ack, 1); }
     close(sockfd);
-    if (rc <= 0) return -1;
-    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
-    if (!c || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) return -1;
-    return *(int *)CMSG_DATA(c);
+    if (fd < 0) return -1;
+    return fd;
 }
 
 int sp_notify_probe(void) {
@@ -1732,7 +1897,7 @@ int main(int argc, char **argv) {
     }
     if (g_notify) {
         close(notify_pair[1]);
-        g_notify_fd = sp_notify_parent_recv(notify_pair[0]);
+        g_notify_fd = sp_notify_parent_recv(notify_pair[0], child);
         if (g_notify_fd < 0) {
             g_notify = 0;
             if (g_debug) fprintf(stderr, "[notify] listener handshake failed -> ptrace-only\n");
