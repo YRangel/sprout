@@ -405,7 +405,13 @@ static int install_notify_filter(void)
 {
     static const int traps[] = {
         56, 437, 48, 34, 35, 33, 53, 54, 88, 36, 37, 38, 276,
-        79, 291, 78, 221,
+        79, 291, 78,
+        221 /*execve: lazy-attach rewrite by the supervisor (ADR-0016 T3):
+             * trapping execve HERE is safe — the supervisor child exec'd
+             * the stub BEFORE any filter existed, so no guest-side exec
+             * of the stub itself can deadlock on an unserved notify. The
+             * filter survives the guest's exec, so the new image keeps
+             * reporting to this same listener.*/,
         200, 203, 206, 211,
     };
     const int ntr = (int)(sizeof(traps) / sizeof(traps[0]));
@@ -544,23 +550,6 @@ void stub_main(void *sp0)
 
     stub_environ = (char **)&sp[1 + (unsigned long)argc0 + 1];
 
-    /* DBG-PROBE: emit our launch context BEFORE anything can fail */
-    {
-        char pb[SP_PATH_MAX];
-        int w = 0;
-        const char *hd = "stub: argc=";
-        while (hd[w]) { pb[w] = hd[w]; w++; }
-        long ac = argc0; char rd[8]; int m = 0;
-        do { rd[m++] = (char)('0' + ac % 10); ac /= 10; } while (ac);
-        while (m > 0) pb[w++] = rd[--m];
-        pb[w++] = ':';
-        for (int i = 0; i < argc0 && i < 4; i++) {
-            const char *a = argv[i];
-            while (*a && w < (int)sizeof(pb) - 4) pb[w++] = *a++;
-            pb[w++] = (i == argc0 - 1 || i == 3) ? '\n' : '|';
-        }
-        (void)sc3(SYS_write, 2, (long)pb, (long)w);
-    }
     if (argc0 < 2) die("argv[1] must be target host path", 127);
     const char *target_path = argv[1];
 

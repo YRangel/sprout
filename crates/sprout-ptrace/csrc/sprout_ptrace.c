@@ -1586,6 +1586,56 @@ static int sp_link_fallback_copy(const char *src, const char *dst) {
     return 0;
 }
 
+/* (ADR-0016 T3) execve notifications are the ONLY register-level work
+ * the pure-notify lane cannot do: rewriting x0 (pathptr) — and for a
+ * PT_INTERP target the full argv/envp surgery — needs ptrace. So we
+ * borrow it for one syscall's lifetime: ATTACH -> wait stop -> GETREGSET
+ * -> rewrite (regs + memory) -> SETREGSET -> DETACH. The tracee stays
+ * seccomp-parked the whole time; the caller's CONTINUE response is what
+ * actually resumes the (now-rewritten) execve. Attach on a parked-
+ * notify task is legal; the request outlives the attach/detach pair.
+ * Return 1 on successful rewrite, 0 otherwise. */
+static int sp_notify_lazy_exec_rewrite(pid_t pid, const char *guest,
+                                       const char *host, int cls) {
+    if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) != 0) {
+        if (g_debug) SP_TRACE("[notify] lazy-attach %d failed errno=%d\n", pid, errno);
+        return 0;
+    }
+    int stt = 0;
+    if (waitpid(pid, &stt, __WALL) < 0 || !WIFSTOPPED(stt)) {
+        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+        return 0;
+    }
+    struct user_pt_regs r;
+    struct iovec iov = { &r, sizeof(r) };
+    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) != 0) {
+        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+        return 0;
+    }
+    int ok = 0;
+    if (cls == 0) {
+        /* static→dynamic: full loader-chain surgery (peek/poke work now
+         * that we're attached). rewrite writes regs; SETREGSET pushes. */
+        ok = sp_rewrite_exec_to_loader(NULL, pid, &r, host, guest, /*path_argi=*/0, /*depth=*/0);
+    } else {
+        /* static→static with a longer host path: park the host string in
+         * the below-SP scratch arena and point x0 there. */
+        unsigned long long base = (unsigned long long)r.sp - SP_EXEC_SCRATCH_BELOW_SP;
+        errno = 0;
+        if (ptrace(PTRACE_PEEKDATA, pid, (void *)base, NULL) != -1 || errno == 0) {
+            if (poke_str(pid, base, host, strlen(host)) == 0) {
+                r.regs[0] = base;
+                ok = 1;
+            }
+        }
+    }
+    if (ok) ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov);
+    ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    if (g_debug) SP_TRACE("[notify] lazy-attach %d cls=%d rewrite=%s host=%s\n",
+                          pid, cls, ok ? "OK" : "fail", host);
+    return ok;
+}
+
 static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
                                 unsigned long long *args,
                                 unsigned long long id,
@@ -1593,12 +1643,37 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
     char guest[SP_PATH_MAX], host[SP_PATH_MAX];
     resp->flags = 0;
     switch (nr) {
-    case 221: /* execve — lazy-attach rewrite lands here in T3; for now,
-               * native CONTINUE is behavior-identical to the pending
-               * ptrace-stop rewrite (guest paths under statics keep the
-               * pre-existing supervisor-translate path when traced). */
+    case 221: { /* execve(path,argv,envp) — lazy-attach rewrite (ADR-0016 T3) */
+        if (sp_notify_read_str(pid, args[0], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (guest[0] != '/') { sp_notify_continue(resp); return; } /* relative: tracee cwd is host-real */
+        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        char interp[SP_PATH_MAX]; interp[0] = '\0';
+        char opt[SP_PATH_MAX]; opt[0] = '\0';
+        int cls = classify_host_file(host, interp, opt);
+        if (cls == 1 || cls == 0) {
+            /* static→static: in-place string edit when it fits; otherwise
+             * and for static→dynamic (cls==0, the PT_INTERP chain) the
+             * pointer structure needs registers → lazy ATTACH vehicle. */
+            size_t gl = strlen(guest), hl = strlen(host);
+            if (cls == 1 && strcmp(host, guest) == 0) { sp_notify_continue(resp); return; }
+            if (cls == 1 && hl <= gl) {
+                if (sp_vm_write(pid, host, hl + 1, args[0]) == (ssize_t)(hl + 1)) {
+                    sp_notify_continue(resp); return;
+                }
+            }
+            if (sp_notify_lazy_exec_rewrite(pid, guest, host, cls) == 1) {
+                sp_notify_continue(resp); return;
+            }
+            /* rewrite failed: ENOSYS beats a half-translated native exec
+             * that would start an ungoverned loader. */
+            resp->error = -ENOSYS; resp->flags = 0; resp->val = 0; return;
+        }
+        /* cls==2 (script) / -1 (unknown): native CONT — the pre-existing
+         * supervisor-side exec rewrite in the ptrace lane covers scripts;
+         * notify-statics assets stay ELF-only for now. */
         sp_notify_continue(resp);
         return;
+    }
     case 56: { /* openat(dirfd,path,flags,mode) */
         int dirfd = (int)args[0];
         int flags = (int)args[2];
