@@ -1621,20 +1621,24 @@ static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
 /* Build the loader-chain argv for a dynamic guest program:
  *   loader --argv0 <orig> --inhibit-cache --library-path <lp> <hostprog> [args...]
  * into into allocated memory; caller frees with sp_free_argv. */
-static char **sp_build_loader_argv(const char *host_prog, char *const argv[],
-                                   int extra, int *outc) {
+/* vfork-safety (ADR-0014): posix_spawn()'d executors (debian dash and
+ * friends) reach us as clone(CLONE_VM|CLONE_VFORK) — the chain-building
+ * code runs in a shared address space, so malloc() from here would
+ * scribble the RUNNING PARENT's glibc arena (observed on-device as the
+ * parent's next spawn tripping glibc's sysmalloc assertion). All chain
+ * structures are therefore built in CALLER STACK memory, never the heap. */
+#define SP_CHAIN_MAX_ARGS 256
+static int sp_build_loader_argv(char **v, size_t vmax,
+                                const char *host_prog, char *const argv[],
+                                int extra, int *outc) {
     int argc = 0;
     while (argv[argc]) argc++;
     const char *loader = getenv("SPROUT_LOADER");
     const char *lp = getenv("SPROUT_LIBRARY_PATH");
     const char *libc_kind = getenv("SPROUT_LIBC"); /* "musl" or "glibc" (default) */
-    if (!loader) return NULL;
+    if (!loader && vmax < 8) return -1;
+    if (!loader) return -1;
     int musl = libc_kind && strcmp(libc_kind, "musl") == 0;
-    /* musl ldso has no cache: --inhibit-cache is a glibc-only flag and
-     * unknown options would make it bail out. */
-    int fixed = (6 + extra) - (musl ? 1 : 0);
-    char **v = malloc((size_t)(fixed + argc) * sizeof(char *));
-    if (!v) return NULL;
     int i = 0;
     v[i++] = (char *)loader;
     v[i++] = "--argv0";
@@ -1643,10 +1647,11 @@ static char **sp_build_loader_argv(const char *host_prog, char *const argv[],
     v[i++] = "--library-path";
     v[i++] = (char *)(lp ? lp : "");
     v[i++] = (char *)host_prog;
+    if (vmax < (size_t)(i + argc)) return -1;
     for (int k = 1; k < argc; k++) v[i++] = argv[k];
     v[i] = NULL;
     if (outc) *outc = i;
-    return v;
+    return 0;
 }
 
 /* Execute path/argv/envp under the guest loader when dynamic; script
@@ -1680,11 +1685,11 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
         fprintf(stderr, "[sprout] execve('%s') host='%s' class=%d\n", path, host, cls);
     switch (cls) {
     case SP_ELF_DYNAMIC: {
-        char **v = sp_build_loader_argv(host, argv, 0, NULL);
-        if (!v) { errno = EIO; return -1; }
-        int rc = sp_real_execve(getenv("SPROUT_LOADER"), v, envp);
-        free(v);
-        return rc;
+        char *vstack[SP_CHAIN_MAX_ARGS + 8];
+        if (sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL) != 0) {
+            errno = EIO; return -1;
+        }
+        return sp_real_execve(getenv("SPROUT_LOADER"), vstack, envp);
     }
     case SP_SCRIPT: {
         /* script: interpret the shebang's interpreter via recursion, then
@@ -1694,15 +1699,13 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
         /* build argv: [interp, script, argv+1...] */
         int argc = 0;
         while (argv[argc]) argc++;
-        char **v = malloc((size_t)(argc + 2) * sizeof(char *));
-        if (!v) { errno = ENOMEM; return -1; }
-        v[0] = ires;
-        v[1] = (char *)path;
-        for (int k = 1; k < argc; k++) v[1 + k] = argv[k];
-        v[1 + argc] = NULL;
-        int rc = sp_execve_chain(ires, v, envp, depth + 1);
-        free(v);
-        return rc;
+        if (argc + 2 > SP_CHAIN_MAX_ARGS + 8) { errno = ENOMEM; return -1; }
+        char *vchain[SP_CHAIN_MAX_ARGS + 8];
+        vchain[0] = ires;
+        vchain[1] = (char *)path;
+        for (int k = 1; k < argc; k++) vchain[1 + k] = argv[k];
+        vchain[1 + argc] = NULL;
+        return sp_execve_chain(ires, vchain, envp, depth + 1);
     }
     case SP_ELF_STATIC: {
         /* Already under a ptrace supervisor (shadow mode): just exec the
@@ -1822,11 +1825,11 @@ int fexecve(int fd, char *const argv[], char *const envp[]) {
     char interp[SP_PATH_MAX];
     switch (sp_classify_host(host, interp)) {
     case SP_ELF_DYNAMIC: {
-        char **v = sp_build_loader_argv(host, argv, 0, NULL);
-        if (!v) { errno = EIO; return -1; }
-        int rc = sp_real_execve(getenv("SPROUT_LOADER"), v, envp);
-        free(v);
-        return rc;
+        char *vstack[SP_CHAIN_MAX_ARGS + 8];
+        if (sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL) != 0) {
+            errno = EIO; return -1;
+        }
+        return sp_real_execve(getenv("SPROUT_LOADER"), vstack, envp);
     }
     default:
         errno = ENOEXEC;
