@@ -9,7 +9,7 @@ is a no-op. The table is sorted by how `proot-distro login` uses flags.
 | `-b <host>[:<guest>]` | `-b <host>[:<guest>]` | ✅ v0.1 (repeatable) |
 | `-0` | `-0` / `--root-id` | ✅ v0.1; **DEFAULT since v0.5** (opt out with `--no-fakeroot`) |
 | `-w <dir>` | `-w <dir>` / `--cwd` | ✅ v0.1 |
-| `--link2symlink` | `--link2symlink` | ✅ v0.4.3+; **DEFAULT since v0.5** (opt out with `--no-link2symlink`). EPERM hardlinks degrade journal-safely: content-copy first (git `link(tmp→obj)+unlink(tmp)` survives), symlink as last resort |
+| `--link2symlink` | `--link2symlink` | ✅ v0.4.3+; **DEFAULT since v0.5** (opt out with `--no-link2symlink`). EPERM hardlinks degrade like proot's `.l2s` (content relocated to `$ROOT/.l2s/.l2s.<name>.<nonce>` + symlinks at both src and dst — survives `link-then-write-through-fd` like glibc's locale-archive builder), then content-copy, symlink as last resort |
 | `-q <qemu>` | — | intentionally unsupported (host is native aarch64) |
 | `-i <id>` | implicit (always the launcher uid) | ✅ equivalent |
 | `--kernel-release` | -- | untracked; guests see host kernel |

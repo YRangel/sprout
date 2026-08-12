@@ -460,8 +460,17 @@ static tracee_t *find_or_add(pid_t pid) {
             g_tracees[i].pid = pid;
             g_tracees[i].static_kind = -1;
             return &g_tracees[i];
-        }
+    }
     return NULL;
+}
+
+/* pipeline churn spawned past SP_MAX_TRACEES used to soft-fail silently:
+ * find_or_add returned NULL and every later event was blindly CONT'd —
+ * untranslated execs then died at rc 127/1 with zero messages. Reap the
+ * slot the instant a tracee exits. */
+static void sp_tracee_free(pid_t pid) {
+    for (int i = 0; i < SP_MAX_TRACEES; i++)
+        if (g_tracees[i].pid == pid) { g_tracees[i].pid = 0; return; }
 }
 
 /* helpers */
@@ -1485,6 +1494,38 @@ static socklen_t sp_notify_unix_to_host(pid_t pid, unsigned long long addr,
  * fatal for the link(tmp -> target)+unlink(tmp) journal pattern (observed:
  * git "not a valid object"); materialize the link target as a byte-for-byte
  * copy instead — unlink on the source then harms nothing. */
+/* proot-shape .l2s fallback: rename content to a hidden rootfs/.l2s file,
+ * src+dst become symlinks. Required for link-then-write patterns (glibc
+ * locale-archive: tmp is LINKED before its records are written via fd). */
+static int sp_link_fallback_l2s(const char *src, const char *dst) {
+    if (!g_rootfs) return -1;
+    static unsigned long l2s_n = 0;
+    char hid[SP_PATH_MAX], tmp[SP_PATH_MAX];
+    const char *base = strrchr(src, '/');
+    base = base ? base + 1 : src;
+    struct stat lst;
+    if (lstat(src, &lst) != 0) return -1;
+    if (S_ISLNK(lst.st_mode)) {
+        ssize_t rn = readlink(src, tmp, sizeof(tmp) - 1);
+        if (rn <= 0) return -1;
+        tmp[rn] = 0;
+        if (strstr(tmp, "/.l2s/.l2s.")) {
+            snprintf(hid, sizeof hid, "%s", tmp);
+            goto have_hidden;
+        }
+    }
+    snprintf(hid, sizeof hid, "%s/.l2s/.l2s.%s.%lx%lx", g_rootfs, base,
+             (unsigned long)getpid(), (unsigned long)++l2s_n);
+    if (mkdir((snprintf(tmp, sizeof tmp, "%s/.l2s", g_rootfs), tmp), 0700) != 0 && errno != EEXIST)
+        return -1;
+    if (rename(src, hid) != 0) return -1;
+    if (symlink(hid, src) != 0) { rename(hid, src); return -1; }
+have_hidden:
+    unlink(dst);
+    if (symlink(hid, dst) != 0) return -1;
+    return 0;
+}
+
 static int sp_link_fallback_copy(const char *src, const char *dst) {
     int si = open(src, O_RDONLY);
     if (si < 0) return -1;
@@ -1675,7 +1716,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
          * (journal pattern safety), symlink as last resort (proot-shaped
          * --link2symlink surface-answer). */
         if (rc < 0 && (errno == EPERM || errno == EACCES) && getenv("SPROUT_LINK2SYMLINK")) {
-            if (sp_link_fallback_copy(oh, nh) == 0) rc = 0;
+            if (sp_link_fallback_l2s(oh, nh) == 0 || sp_link_fallback_copy(oh, nh) == 0) rc = 0;
             else rc = symlinkat(oh, -100, nh);
         }
         if (rc < 0) { resp->error = -errno; return; }
@@ -1943,9 +1984,14 @@ int main(int argc, char **argv) {
             close(notify_pair[0]);
             sp_notify_child_install_and_send(notify_pair[1]);
         }
-        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) _exit(127);
+        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
+            const char mom[] = "[ptrace] TRACEME failed\n"; (void)!write(2, mom, sizeof mom - 1);
+            _exit(127);
+        }
         if (guest_preload) setenv("LD_PRELOAD", guest_preload, /*override=*/1);
+        if (g_debug) { char mb[160]; int ml = snprintf(mb, sizeof mb, "[ptrace] child pre-exec target='%s'\n", argv[2]); (void)!write(2, mb, (size_t)ml); }
         execve(argv[2], &argv[2], environ);
+        { char eb[128]; int el = snprintf(eb, sizeof eb, "[ptrace] child execve('%s') failed: errno=%d (%s)\n", argv[2], errno, strerror(errno)); (void)!write(2, eb, (size_t)el); }
         _exit(127);
     }
     if (g_notify) {
@@ -1966,19 +2012,39 @@ int main(int argc, char **argv) {
      * on the return-to-userland path). waitpid-blocking would deadlock:
      * pump and wait together until the initial exec stop shows. The raw
      * waitpid SWALLOWS the first stop (never policy-dispatched). */
+    int st0 = -1;
     if (g_notify && g_notify_fd >= 0) {
-        for (int iter = 0; iter < 4000; iter++) {
+        for (int iter = 0; iter < 4000 && st0 < 0; iter++) {
             struct pollfd pfd = { g_notify_fd, POLLIN, 0 };
             (void)poll(&pfd, 1, 2);
             if (pfd.revents & POLLIN) sp_notify_pump();
-            pid_t w0 = waitpid(child, NULL, WNOHANG);
+            pid_t w0 = waitpid(child, &st0, WNOHANG);
             if (w0 == child) break;
             if (w0 < 0) { perror("waitpid"); return 1; }
         }
-    } else if (waitpid(child, NULL, 0) < 0) { perror("waitpid"); return 1; }
+    } else if (waitpid(child, &st0, 0) < 0) { perror("waitpid"); return 1; }
+    /* Fast-exit race: the main child may already be gone (short-lived
+     * first exec failing under timing distortion, or instant-exit paths);
+     * waitpid then reports an EXIT instead of a stop. Never call
+     * SETOPTIONS on a dead tracee — propagate its status. */
+    if (st0 >= 0 && WIFEXITED(st0)) {
+        if (g_debug) fprintf(stderr, "[ptrace] main child exited before attach: rc=%d\n", WEXITSTATUS(st0));
+        return WEXITSTATUS(st0);
+    }
+    if (st0 >= 0 && WIFSIGNALED(st0))
+        return 128 + WTERMSIG(st0);
     if (ptrace(PTRACE_SETOPTIONS, child, 0,
                PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
                PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL) < 0) {
+        if (errno == ESRCH) {
+            /* lost the race after all: reap whatever status is left */
+            int st1 = 0;
+            if (waitpid(child, &st1, WNOHANG) == child) {
+                if (WIFEXITED(st1)) return WEXITSTATUS(st1);
+                if (WIFSIGNALED(st1)) return 128 + WTERMSIG(st1);
+            }
+            return 0;
+        }
         perror("PTRACE_SETOPTIONS"); return 1;
     }
     { tracee_t *rt = find_or_add(child); if (rt && g_shadow) rt->shadow = 1; }
@@ -2020,14 +2086,21 @@ int main(int argc, char **argv) {
             SP_OFT("wait4 pid=%d status=%x\n", w, status);
         if (WIFEXITED(status)) {
             if (w == child) {
+                if (g_debug) fprintf(stderr, "[ptrace] MAIN-CHILD %d EXITED rc=%d (status=0x%x)\n", w, WEXITSTATUS(status), status);
                 if (g_notify_n || g_notify_poller)
                     SP_OFT("notify stats: recv=%llu served=%llu cont=%llu recverr=%llu poller=%llu\n",
                            g_notify_n, g_notify_serv, g_notify_cont, g_notify_err, g_notify_poller);
                 return WEXITSTATUS(status);
             }
+            sp_tracee_free(w);
             goto cont;
         }
+        if (WIFSIGNALED(status) && w == child) {
+            if (g_debug) fprintf(stderr, "[ptrace] MAIN-CHILD %d SIGNALED sig=%d (status=0x%x)\n", w, WTERMSIG(status), status);
+            return 128 + WTERMSIG(status);
+        }
         if (WIFSIGNALED(status)) {
+            if (w != child) sp_tracee_free(w);
             if (w == child) {
                 if (g_debug) {
                     struct user_pt_regs r;
@@ -2154,7 +2227,7 @@ int main(int argc, char **argv) {
                     char oh[SP_PATH_MAX], nh[SP_PATH_MAX];
                     if (peek_str(w, r.regs[1], oh, sizeof(oh)) > 0 &&
                         peek_str(w, r.regs[3], nh, sizeof(nh)) > 0 &&
-                        sp_link_fallback_copy(oh, nh) == 0) {
+                        (sp_link_fallback_l2s(oh, nh) == 0 || sp_link_fallback_copy(oh, nh) == 0)) {
                         r.regs[0] = 0;
                         ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
                     }

@@ -1054,6 +1054,44 @@ int fchown(int fd, uid_t uid, gid_t gid) {
  * persistent-backup case anyway. Robust fallback: MATERIALIZE the target
  * as a COPY of the source (content + mode), then the unlink-journal is
  * harmless. Only when copying genuinely fails do we degrade to symlink. */
+/* proot-shape .l2s fallback (preferred over copy): content is RENAMED to
+ * a hidden $ROOT/.l2s file and both src+dst become symlinks to it. Wins
+ * where copy loses: apps that keep writing archive content through the
+ * tmp's fd AFTER link() (glibc locale-archive builder), and the classic
+ * unlink-journal (git objects) — unlink(tmp) then only kills a symlink,
+ * the dst symlink still reads the moved content. */
+static int sp_link_fallback_l2s(const char *p1, const char *p2) {
+    if (!g_cfg.rootfs_len) return -1;
+    static unsigned long l2s_n = 0;
+    char hid[SP_PATH_MAX], tmp[SP_PATH_MAX];
+    const char *base = strrchr(p1, '/');
+    base = base ? base + 1 : p1;
+    struct stat lst;
+    if (lstat(p1, &lst) != 0) return -1;
+    if (S_ISLNK(lst.st_mode)) {
+        ssize_t rn = readlink(p1, tmp, sizeof(tmp) - 1);
+        if (rn <= 0) return -1;
+        tmp[rn] = 0;
+        if (strstr(tmp, "/.l2s/.l2s.")) {
+            snprintf(hid, sizeof hid, "%s", tmp);
+            goto have_hidden;
+        }
+    }
+    snprintf(hid, sizeof hid, "%s/.l2s/.l2s.%s.%lx%lx", g_cfg.rootfs, base,
+             (unsigned long)getpid(), (unsigned long)++l2s_n);
+    if (mkdir((snprintf(tmp, sizeof tmp, "%s/.l2s", g_cfg.rootfs), tmp), 0700) != 0 && errno != EEXIST)
+        return -1;
+    if (rename(p1, hid) != 0) return -1;
+    if (symlink(hid, p1) != 0) {
+        rename(hid, p1);
+        return -1;
+    }
+have_hidden:
+    unlink(p2);
+    if (symlink(hid, p2) != 0) return -1;
+    return 0;
+}
+
 static int sp_link_fallback_copy(const char *p1, const char *p2) {
     int si = open(p1, O_RDONLY);
     if (si < 0) return -1;
@@ -1091,11 +1129,14 @@ int link(const char *oldpath, const char *newpath) {
     /* SELinux denies hardlinks on /data/data/.../files: fallback = copy
      * (journal-safe, see helper), symlink only as last resort. */
     if (rc != 0 && (errno == EPERM || errno == EACCES) && getenv("SPROUT_LINK2SYMLINK")) {
-        int rc2 = sp_link_fallback_copy(p1, p2);
-        if (rc2 == 0) rc = 0;
+        if (sp_link_fallback_l2s(p1, p2) == 0) rc = 0;
         else {
-            if (!SP_REAL(symlink)) SP_REAL(symlink) = dlsym(RTLD_NEXT, "symlink");
-            if (SP_REAL(symlink)) rc = SP_REAL(symlink)(p1, p2);
+            int rc2 = sp_link_fallback_copy(p1, p2);
+            if (rc2 == 0) rc = 0;
+            else {
+                if (!SP_REAL(symlink)) SP_REAL(symlink) = dlsym(RTLD_NEXT, "symlink");
+                if (SP_REAL(symlink)) rc = SP_REAL(symlink)(p1, p2);
+            }
         }
     }
     return rc;
@@ -1124,7 +1165,8 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
                 ssize_t n = readlink(l2, nb, sizeof(nb) - 1);
                 if (n > 0) { nb[n] = 0; strncat(nb, "/", sizeof(nb) - strlen(nb) - 1); strncat(nb, newpath, sizeof(nb) - strlen(nb) - 1); }
             } else snprintf(nb, sizeof nb, "%s", newpath);
-            if (ab[0] && nb[0] && sp_link_fallback_copy(ab, nb) == 0)
+            if (ab[0] && nb[0] &&
+                (sp_link_fallback_l2s(ab, nb) == 0 || sp_link_fallback_copy(ab, nb) == 0))
                 rc = 0;
         }
         return rc;
@@ -1136,11 +1178,14 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
     SP_TRACE("linkat->", newpath, p2);
     int rc = SP_REAL(linkat)(olddirfd, p1, newdirfd, p2, flags);
     if (rc != 0 && (errno == EPERM || errno == EACCES) && getenv("SPROUT_LINK2SYMLINK")) {
-        int rc2 = sp_link_fallback_copy(p1, p2);
-        if (rc2 == 0) rc = 0;
+        if (sp_link_fallback_l2s(p1, p2) == 0) rc = 0;
         else {
-            if (!SP_REAL(symlinkat)) SP_REAL(symlinkat) = dlsym(RTLD_NEXT, "symlinkat");
-            if (SP_REAL(symlinkat)) rc = SP_REAL(symlinkat)(p1, AT_FDCWD, p2);
+            int rc2 = sp_link_fallback_copy(p1, p2);
+            if (rc2 == 0) rc = 0;
+            else {
+                if (!SP_REAL(symlinkat)) SP_REAL(symlinkat) = dlsym(RTLD_NEXT, "symlinkat");
+                if (SP_REAL(symlinkat)) rc = SP_REAL(symlinkat)(p1, AT_FDCWD, p2);
+            }
         }
     }
     return rc;
@@ -1959,8 +2004,19 @@ static int sp_real_execve(const char *path, char *const argv[], char *const envp
     return f(path, argv, envp);
 }
 
+static int sp_chain_fail(const char *path, int depth, int err, const char *why) {
+    char eb[192];
+    int el = snprintf(eb, sizeof eb,
+                      "[sprout] chain-fail depth=%d path='%s' why=%s errno=%d (%s) loader=%s\n",
+                      depth, path ? path : "?", why, err, strerror(err),
+                      getenv("SPROUT_LOADER") ? getenv("SPROUT_LOADER") : "(null)");
+    (void)!write(2, eb, (size_t)el);
+    errno = err;
+    return -1;
+}
+
 static int sp_execve_chain(const char *path, char *const argv[], char *const envp[], int depth) {
-    if (depth > 4) { errno = ELOOP; return -1; }
+    if (depth > 4) return sp_chain_fail(path, depth, ELOOP, "depth");
     char x[SP_PATH_MAX];
     const char *host_raw = sp_translate_x(path, x);
     char hx[SP_PATH_MAX];
@@ -1976,9 +2032,11 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
     case SP_ELF_DYNAMIC: {
         char *vstack[SP_CHAIN_MAX_ARGS + 8];
         if (sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL) != 0) {
-            errno = EIO; return -1;
+            return sp_chain_fail(path, depth, EIO, "argv-build");
         }
-        return sp_real_execve(getenv("SPROUT_LOADER"), vstack, envp);
+        int rc = sp_real_execve(getenv("SPROUT_LOADER"), vstack, envp);
+        if (rc < 0) return sp_chain_fail(path, depth, errno, "loader-execve");
+        return rc;
     }
     case SP_SCRIPT: {
         /* script: interpret the shebang's interpreter via recursion, then
@@ -2144,6 +2202,7 @@ int system(const char *command) {
     if (pid == 0) {
         char *const argv[] = {"sh", "-c", (char *)command, NULL};
         sp_execve_chain("/bin/sh", argv, environ, 0);
+        { char eb[160]; int el = snprintf(eb, sizeof eb, "[sprout] system() chain exec failed errno=%d (%s)\n", errno, strerror(errno)); (void)!write(2, eb, (size_t)el); }
         _exit(127);
     }
     int st;
@@ -2302,6 +2361,7 @@ static int sp_spawn_impl(pid_t *restrict pid, const char *path,
         if (err) { errno = err; _exit(127); }
         if (use_path) execvp(path, argv);
         else execve(path, argv, envp);
+        { char eb[160]; int el = snprintf(eb, sizeof eb, "[sprout] spawn-child exec('%s') failed errno=%d (%s)\n", path ? path : "?", errno, strerror(errno)); (void)!write(2, eb, (size_t)el); }
         _exit(127);
     }
     if (pid) *pid = child;
