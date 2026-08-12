@@ -518,6 +518,7 @@ static int poke_str(pid_t pid, unsigned long long addr, const char *s, size_t le
 /* Detect a Go runtime binary by its PT_NOTE "Go" buildid note. Present in
  * all Go binaries (CGO or not, stripped or not): namesz=4, name="Go". */
 #define SP_PT_NOTE 4
+static int classify_tracee_image_uncached(pid_t pid);
 static int is_go_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
@@ -610,6 +611,32 @@ static int chain_app_path(pid_t pid, char out[SP_PATH_MAX]) {
  * so a dynamic Go binary surfaces as kind 2 (translate + exec-rewrite,
  * same posture as static) because Go's runtime syscalls bypass libc. */
 static int classify_tracee_image(pid_t pid) {
+    /* Cache keyed on the exec'd file's (dev,ino): spawn-heavy guests
+     * (busybox pipelines) classify the SAME binary hundreds of times;
+     * each miss is ~6-10 syscalls of /proc reads + ELF poking. */
+    static struct { dev_t dev; ino_t ino; int kind; } cache[32];
+    char exe[64];
+    snprintf(exe, sizeof(exe), "/proc/%d/exe", pid);
+    struct stat est;
+    if (stat(exe, &est) == 0) {
+        size_t oldest = 0; long oldest_n = 0;
+        static long tick = 0;
+        tick++;
+        for (size_t i = 0; i < sizeof(cache)/sizeof(cache[0]); i++) {
+            if (cache[i].ino == est.st_ino && cache[i].dev == est.st_dev)
+                return cache[i].kind;
+        }
+        (void)oldest; (void)oldest_n;
+        int kind = classify_tracee_image_uncached(pid);
+        cache[tick % 32].dev = est.st_dev;
+        cache[tick % 32].ino = est.st_ino;
+        cache[tick % 32].kind = kind;
+        return kind;
+    }
+    return classify_tracee_image_uncached(pid);
+}
+
+static int classify_tracee_image_uncached(pid_t pid) {
     char app[SP_PATH_MAX];
     if (chain_app_path(pid, app))
         return is_go_file(app) ? 2 : (g_libc_kind == SP_LIBC_MUSL ? 3 : 0);
@@ -1562,6 +1589,10 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         int flags = (int)args[2];
         if (dirfd != -100 /*AT_FDCWD*/) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        /* RELATIVE fast path: the tracee's cwd is already host-real, so a
+         * native retry (CONT) lands on exactly the file we'd serve via
+         * readlink+ADDFD — without the supervisor round-trip. */
+        if (guest[0] != '/') { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
         sp_notify_reply_open(id, resp, host, flags, (mode_t)args[3]);
         return; }
@@ -1574,6 +1605,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (sp_vm_read(pid, &how, sizeof(how), args[2]) != sizeof(how)) { sp_notify_continue(resp); return; }
         if (how.resolve) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (guest[0] != '/') { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
         int lf = open(host, (int)how.flags, (mode_t)how.mode);
         if (lf < 0) { resp->error = -errno; return; }
@@ -1603,6 +1635,9 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         int dirfd = (int)args[0];
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        /* relative: native retry sees the same cwd; "" hits bionic SIGSYS
+         * and the musl EMULATE table swallows it the same way either way */
+        if (guest[0] != '/') { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
         int rc = access(host, (int)args[2]);
         if (rc < 0) { resp->error = -errno; return; }
@@ -1637,6 +1672,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         int dirfd = (int)args[0];
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (guest[0] != '/') { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
         int rc = mkdir(host, (mode_t)args[2]);
         if (rc < 0) { resp->error = -errno; return; }
@@ -1646,6 +1682,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         int dirfd = (int)args[0];
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (guest[0] != '/') { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
         int rc = (args[2] & 0x200 /*AT_REMOVEDIR*/) ? rmdir(host) : unlink(host);
         if (rc < 0) { resp->error = -errno; return; }
@@ -1688,6 +1725,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         int dirfd = (int)args[0];
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (guest[0] != '/') { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
         int rc = mknod(host, (mode_t)args[2], (dev_t)args[3]);
         if (rc < 0) { resp->error = -errno; return; }
@@ -1698,6 +1736,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         char target[SP_PATH_MAX], linkp[SP_PATH_MAX];
         if (sp_notify_read_str(pid, args[0], target, sizeof(target)) <= 0) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[2], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (guest[0] != '/') { sp_notify_continue(resp); return; }
         char lhost[SP_PATH_MAX];
         if (!sp_notify_hostpath(pid, guest, lhost, sizeof lhost)) { sp_notify_continue(resp); return; }
         int rc = symlink(target, lhost);
@@ -1726,8 +1765,10 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (od != -100 || nd != -100) { sp_notify_continue(resp); return; }
         char rp[SP_PATH_MAX], oh[SP_PATH_MAX], nh[SP_PATH_MAX];
         if (sp_notify_read_str(pid, args[1], rp, sizeof(rp)) <= 0) { sp_notify_continue(resp); return; }
+        if (rp[0] != '/') { sp_notify_continue(resp); return; }   /* relative: native cwd is host-real */
         if (!sp_notify_hostpath(pid, rp, oh, sizeof oh)) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[3], rp, sizeof(rp)) <= 0) { sp_notify_continue(resp); return; }
+        if (rp[0] != '/') { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, rp, nh, sizeof nh)) { sp_notify_continue(resp); return; }
         int rc = rename(oh, nh);
         if (rc < 0) { resp->error = -errno; return; }
@@ -1737,8 +1778,10 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (od != -100 || nd != -100) { sp_notify_continue(resp); return; }
         char rp[SP_PATH_MAX], oh[SP_PATH_MAX], nh[SP_PATH_MAX];
         if (sp_notify_read_str(pid, args[1], rp, sizeof(rp)) <= 0) { sp_notify_continue(resp); return; }
+        if (rp[0] != '/') { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, rp, oh, sizeof oh)) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[3], rp, sizeof(rp)) <= 0) { sp_notify_continue(resp); return; }
+        if (rp[0] != '/') { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, rp, nh, sizeof nh)) { sp_notify_continue(resp); return; }
         int rc = (int)syscall(276, -100, oh, -100, nh, (unsigned)args[4]);
         if (rc < 0) { resp->error = -errno; return; }
@@ -1940,7 +1983,12 @@ int main(int argc, char **argv) {
     g_guestpreload = getenv("SPROUT_GUEST_PRELOAD");
     { const char *k = getenv("SPROUT_LIBC"); g_libc_kind = (k && strcmp(k, "musl") == 0) ? SP_LIBC_MUSL : 0; }
     g_rootfs = getenv("SPROUT_ROOTFS");
-    g_shadow = getenv("SPROUT_SHADOW") != NULL && g_libc_kind != SP_LIBC_MUSL;
+    /* musl-dynamic (kind 3) gets the shadow treatment too: its ldso-chain
+     * interposer covers the PLT set exactly like glibc's, so per-syscall
+     * PTRACE_SYSCALL is pure waste in pipe-flood profiles (bench: musl
+     * cmdsubst-pipe 0.76x -> target >=1x). SPROUT_MUSL_NOSHADOW reverts. */
+    g_shadow = getenv("SPROUT_SHADOW") != NULL &&
+               (g_libc_kind != SP_LIBC_MUSL || !getenv("SPROUT_MUSL_NOSHADOW"));
     /* Interposed grandchildren of this supervisor (preload chain) learn
      * from SPROUT_SUPERVISED that static execs need NO fresh sprout-ptrace
      * chain — exec them directly and the ptrace estate reclassifies on
@@ -2265,10 +2313,10 @@ int main(int argc, char **argv) {
                      * dynamic-interposed (kind 0) stays shadowed; statics
                      * and Go need full syscall translation again. Musl
                      * never shadows (ADR-0009: supervisor-only). */
-                    t->shadow = g_shadow && kind == 0 && g_libc_kind != SP_LIBC_MUSL;
+                    t->shadow = g_shadow && (kind == 0 || (kind == 3 && g_libc_kind == SP_LIBC_MUSL));
                     if (g_debug)
-                        SP_TRACE("[%d] exec event: image is %s\n", w,
-                                 sp_kind_name(kind));
+                        SP_TRACE("[%d] exec event: image is %s shadow=%d\n", w,
+                                 sp_kind_name(kind), t->shadow);
                 }
             } else if (ev == (unsigned int)PTRACE_EVENT_FORK ||
                        ev == (unsigned int)PTRACE_EVENT_VFORK ||

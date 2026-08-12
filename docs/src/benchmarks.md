@@ -139,6 +139,44 @@ it buys the AF_UNIX/serve-side machinery used by X11 + sockets + the
 disk-write rotation families. Kept ON as the default because sockets
 mathematically cannot be served through a caller-only interposer.
 
+## Optimization pass (v0.5.2, 2026-08-12, 3 rounds × median-of-5 on a device in active use)
+
+Changes measured here: musl shadow supervision (kind 3 no longer pays
+per-syscall PTRACE_SYSCALL — syscall-stops per 30-loop churn fell
+15,922 → 1,484), classification cache (dev:ino keyed), notify relative-
+path fast-CONT.
+
+### Alpine (musl) — the former honest-loss profile, now all wins
+
+| workload                        | proot-distro | sprout (r1/r2/r3 med) | speedup |
+|---------------------------------|--------------|-----------------------|---------|
+| `sh -c true` (busybox ash)      | ~200 ms      | 33–37 ms         | **5.4–6.7×** |
+| exec-chain 20× true             | ~238 ms      | 63–79 ms         | **3.0–3.8×** |
+| **cmdsubst-pipe 100×**          | ~560 ms      | 300–320 ms       | **1.76/2.05/1.87×** (was 0.76× LOSS) |
+| `python3 -c pass` (musl)        | ~227 ms      | 52–57 ms         | **4.0–4.4×** (was 2.6–2.8×) |
+| `find /usr/bin -type f`         | ~222 ms      | 29–36 ms         | **6.2–7.8×** |
+| dd write 64MB + sync            | ~210 ms      | 33–40 ms         | **5.3–6.5×** |
+
+### Debian (glibc) — same rounds
+
+| workload                        | speedup (r1/r2/r3 med)    |
+|---------------------------------|---------------------------|
+| `python3 -c pass`               | 4.3 / 4.7 / 4.5×    |
+| `bash -c true`                  | 5.6 / 5.7 / 4.6×    |
+| exec-chain 20× `/bin/true`      | 2.8 / 3.0 / 2.9×    |
+| `find /etc -maxdepth 2`         | 6.9 / 6.6 / 5.7×    |
+| `ls -R` / os.walk `/usr/lib`    | ~4.8 / ~5.3× stable |
+| tar czf /etc                    | 5.1 / 9.5 / 5.1×    |
+| git status / git log            | 6.8–8.9 / 2.9–5.6×  |
+| dd write / read 100MB           | ~2–3.3 / ~2.1×      |
+| cmdsubst-pipe 100× / grep-churn | 1.3–2.2 / 0.7–1.7× (floor profiles) |
+
+- `find /usr -type f (debian)` in-round proot medians collapsed
+  (70 ms / −862 ms / 389 ms — proot-distro launch flake inside the harness,
+  not a real proot speedup; negative medians are clock wraps under device
+  load). Direct A/B same-minute: proot 8.44 s vs sprout 0.49 s = **~17×**, consistent with the 16.6× first measurement.
+- glibc notify lane A/B: 0.81–0.96× (was 0.56–0.82×) — remaining delta is the seccomp filter evaluation cost itself (17-JEQ BPF run on every guest syscall), unavoidable while sockets need the listener; musl lane 0.90–1.21× (parity).
+
 ## Historical (v0.3 toolchain sweep, 2026-08-11, same host)
 
 First published release pass: python3 239→41 (5.8×), exec-chain 285→49

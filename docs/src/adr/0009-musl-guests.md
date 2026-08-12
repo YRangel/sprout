@@ -63,3 +63,15 @@ Verified on Android 16 with proot-distro's alpine (musl 1.2.6):
 Honest gap: stat() on applet symlink paths returns the *real* (busybox)
 entry metadata, which is what the kernel would do on the guest — correct
 semantics, but `/bin/ls` vs `/bin/busybox` identity is lost.
+
+## Update (v0.5.2, 2026-08-12): the shadow knob has been flipped ON
+
+The sequencing laid out above completed: syscall-order sequencing shipped
+first, and the musl shadow gate (`SPROUT_SHADOW=1` now pushed by
+`LaunchPlan::supervise`/`supervisor` for musl plans;
+`SPROUT_MUSL_NOSHADOW=1` reverts) is validated with a 10.7× collapse in
+per-spawn ptrace stops (15,922 → 1,484 debug events per 30-loop churn)
+and a 2.45× med-of-20 speedup on exactly the pipe-flood profile that used
+to lose to proot (0.76× → 1.8–2.1×). musl stat-family is now
+interposer/notify-served like glibc; SIGSYS emulation of the set*id
+family still arrives as signal-stops (works identically under CONT).

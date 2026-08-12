@@ -372,6 +372,12 @@ impl LaunchPlan {
         let mut argv: Vec<OsString> = vec!["--".into()];
         argv.push(plan.loader.clone().into_os_string());
         argv.extend(plan.argv);
+        /* musl-dynamic (kind 3) shadows exactly like glibc: its ldso-chain
+         * interposer covers the PLT surface. (static musl / Go stay on
+         * per-syscall stops — they never carry the interposer.) */
+        if plan.env.iter().any(|(k, v)| k == "SPROUT_LIBC" && v == "musl") {
+            plan.env.push(("SPROUT_SHADOW".into(), "1".into()));
+        }
         // The supervisor performs its exec rewrites using
         // SPROUT_GUEST_PRELOAD (interposer:sanitized-libc pair); the
         // preload plan holds exactly that pair in LD_PRELOAD.
