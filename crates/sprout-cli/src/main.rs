@@ -31,9 +31,15 @@ struct Cli {
     #[arg(short = 'b', long = "bind", value_name = "HOST[:GUEST]")]
     binds: Vec<String>,
 
-    /// Fake uid/gid 0 (guest sees itself as root).
-    #[arg(short = '0', long = "root-id", default_value_t = false)]
+    /// Fake uid/gid 0 — DEFAULT, proot parity. Guests believe they run as
+    /// root unless --no-fakeroot is given.
+    #[arg(short = '0', long = "root-id", default_value_t = true, overrides_with = "no_fakeroot")]
     root_id: bool,
+
+    /// Run as the REAL host uid/gid: identity syscalls and get*id answers
+    /// are kernel-truthful (mostly EPERM for anything privileged).
+    #[arg(long = "no-fakeroot", default_value_t = false)]
+    no_fakeroot: bool,
 
     /// proot-distro `--shared-tmp` parity: bind the host $PREFIX/tmp into the
     /// guest at /tmp, preserving X11/Wayland/VirGL/virpipe/ssh-agent sockets
@@ -42,9 +48,14 @@ struct Cli {
     #[arg(long = "shared-tmp", default_value_t = false)]
     shared_tmp: bool,
 
-    /// Convert hardlinks to symlinks on guest writes.
-    #[arg(long = "link2symlink", default_value_t = false)]
+    /// Convert hardlinks to symlinks on guest writes — DEFAULT (proot-distro
+    /// parity: SELinux denies hardlinks under /data/data/.../files).
+    #[arg(long = "link2symlink", default_value_t = true, overrides_with = "no_link2symlink")]
     link2symlink: bool,
+
+    /// Disable the default hardlink→symlink fallback.
+    #[arg(long = "no-link2symlink", default_value_t = false)]
+    no_link2symlink: bool,
 
     /// Force interception strategy (auto detects from guest ELF).
     #[arg(
@@ -77,8 +88,8 @@ fn run() -> Result<u8, Error> {
 
     let mut rootfs = Rootfs::new(cli.rootfs)?;
     rootfs.cwd = cli.cwd;
-    rootfs.fakeroot = cli.root_id;
-    rootfs.link2symlink = cli.link2symlink;
+    rootfs.fakeroot = cli.root_id && !cli.no_fakeroot;
+    rootfs.link2symlink = cli.link2symlink && !cli.no_link2symlink;
     for spec in &cli.binds {
         rootfs.bindings.push(Binding::parse(spec)?);
     }

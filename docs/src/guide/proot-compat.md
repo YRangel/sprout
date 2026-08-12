@@ -7,9 +7,9 @@ is a no-op. The table is sorted by how `proot-distro login` uses flags.
 |---|---|---|
 | `-r <path>` | `-r <path>` | ✅ v0.1 |
 | `-b <host>[:<guest>]` | `-b <host>[:<guest>]` | ✅ v0.1 (repeatable) |
-| `-0` | `-0` / `--root-id` | ✅ v0.1 |
+| `-0` | `-0` / `--root-id` | ✅ v0.1; **DEFAULT since v0.5** (opt out with `--no-fakeroot`) |
 | `-w <dir>` | `-w <dir>` / `--cwd` | ✅ v0.1 |
-| `--link2symlink` | `--link2symlink` | ✅ v0.4.3+ back-of-the-envelope: `link()`/`linkat()`/fake-chown EACCES/EPERM → symlinks; dpkg status-old, /var etc usable without -0 |
+| `--link2symlink` | `--link2symlink` | ✅ v0.4.3+; **DEFAULT since v0.5** (opt out with `--no-link2symlink`). EPERM hardlinks degrade journal-safely: content-copy first (git `link(tmp→obj)+unlink(tmp)` survives), symlink as last resort |
 | `-q <qemu>` | — | intentionally unsupported (host is native aarch64) |
 | `-i <id>` | implicit (always the launcher uid) | ✅ equivalent |
 | `--kernel-release` | -- | untracked; guests see host kernel |

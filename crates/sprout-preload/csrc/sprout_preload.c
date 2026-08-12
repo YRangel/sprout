@@ -815,6 +815,75 @@ int mkostemp(char *tmpl, int flags) {
     return fd;
 }
 
+/* glibc _FILE_OFFSET_BITS=64 program image aliases: the SAME contract
+ * (substitute XXXXXX in caller buffer, tail-6 mirror back after the real
+ * call writes the substituted suffix into the translated `big`). git, gcc
+ * and most of dpkg's toolchain bind to the 64 spellings directly — without
+ * these wrappers the template lands in glibc UNtranslated (observed on
+ * device: `git clone` -> "/tmp/HW/.git/tXXXXXX: No such file or dir"). */
+int mkstemp64(char *tmpl) {
+    static int (*SP_REAL(mkstemp64))(char *) = NULL;
+    SP_RESOLVE(mkstemp64);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(tmpl, x);
+    char big[SP_PATH_MAX];
+    const char *use = tmpl;
+    if (p != tmpl) {
+        strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
+        use = big;
+    }
+    SP_TRACE("mkstemp64", tmpl, use);
+    int fd = SP_REAL(mkstemp64)(use);
+    if (fd >= 0) {
+        size_t tl = strlen(tmpl), ul = strlen(use);
+        if (ul >= 6 && tl >= 6) memcpy(tmpl + tl - 6, use + ul - 6, 6);
+    }
+    return fd;
+}
+int mkostemp64(char *tmpl, int flags) {
+    static int (*SP_REAL(mkostemp64))(char *, int) = NULL;
+    SP_RESOLVE(mkostemp64);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(tmpl, x);
+    char big[SP_PATH_MAX];
+    const char *use = tmpl;
+    if (p != tmpl) {
+        strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
+        use = big;
+    }
+    SP_TRACE("mkostemp64", tmpl, use);
+    int fd = SP_REAL(mkostemp64)(use, flags);
+    if (fd >= 0) {
+        size_t tl = strlen(tmpl), ul = strlen(use);
+        if (ul >= 6 && tl >= 6) memcpy(tmpl + tl - 6, use + ul - 6, 6);
+    }
+    return fd;
+}
+char *mkdtemp64(char *tmpl) {
+    static char *(*SP_REAL(mkdtemp64))(char *) = NULL;
+    static char *(*SP_REAL(mkdtemp))(char *) = NULL;
+    SP_RESOLVE(mkdtemp64);
+    if (!SP_REAL(mkdtemp64)) { SP_RESOLVE(mkdtemp); }
+    char *(*realdt)(char *) = SP_REAL(mkdtemp64) ? SP_REAL(mkdtemp64) : SP_REAL(mkdtemp);
+    if (!realdt) { errno = ENOSYS; return NULL; }
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(tmpl, x);
+    char big[SP_PATH_MAX];
+    const char *use = tmpl;
+    if (p != tmpl) {
+        strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
+        use = big;
+    }
+    SP_TRACE("mkdtemp64", tmpl, use);
+    char *rd = realdt(use);
+    if (rd) {
+        size_t tl = strlen(tmpl), ul = strlen(use);
+        if (ul >= 6 && tl >= 6) memcpy(tmpl + tl - 6, use + ul - 6, 6);
+        return tmpl;
+    }
+    return NULL;
+}
+
 /* mutation paths (apt/dpkg needs): chmod/chown/link/truncate families */
 int chmod(const char *path, mode_t mode) {
     static int (*SP_REAL(chmod))(const char *, mode_t) = NULL;
@@ -845,6 +914,28 @@ static int sp_fakeroot_on(void) {
     if (fr < 0) fr = getenv("SPROUT_FAKEROOT") != NULL;
     return fr;
 }
+
+/* ---- fakeroot ownership spoof (proot --root-id parity) ---------------
+ * Under -0 the guest must see ITSELF-own files as root-owned, otherwise
+ * tools that compare st_uid against getuid() trip over a mismatch
+ * (observed on device: git refuses any repo via 'dubious ownership').
+ * Rule out of proot: files whose REAL owner is the host-application
+ * uid/gid read back as 0:0 under fakeroot; anything else keeps kernel
+ * truth. */
+static void sp_spoof_uid_gid(uid_t *u, gid_t *g) {
+    if (!sp_fakeroot_on()) return;
+    static uid_t he = (uid_t)-1;
+    static gid_t hg = (gid_t)-1;
+    if (he == (uid_t)-1) {
+        if (!sp_real_geteuid) sp_real_geteuid = (uid_t (*)(void))sp_sym("geteuid");
+        if (!sp_real_getegid) sp_real_getegid = (gid_t (*)(void))sp_sym("getegid");
+        he = sp_real_geteuid ? sp_real_geteuid() : 0;
+        hg = sp_real_getegid ? sp_real_getegid() : 0;
+    }
+    if (u && *u == he) *u = 0;
+    if (g && *g == hg) *g = 0;
+}
+
 /* state backing the fake answers; the get* wrappers below report
  * whatever the most recent fake set*id call promised. */
 uid_t  g_fake_uid = 0;
@@ -927,6 +1018,38 @@ int fchown(int fd, uid_t uid, gid_t gid) {
     if (fake_root4) return 0;
     return SP_REAL(fchown)(fd, uid, gid);
 }
+
+/* Ephemeral-journal hardlink hazard (SELinux EPERM on hardlinks under
+ * /data/data/.../files): callers like git do link(tmp -> target)+unlink(tmp);
+ * a SYMLINK fallback dangles the moment tmp is unlinked (observed: git
+ * "not a valid object"). proot's --link2symlink story only covers the
+ * persistent-backup case anyway. Robust fallback: MATERIALIZE the target
+ * as a COPY of the source (content + mode), then the unlink-journal is
+ * harmless. Only when copying genuinely fails do we degrade to symlink. */
+static int sp_link_fallback_copy(const char *p1, const char *p2) {
+    int si = open(p1, O_RDONLY);
+    if (si < 0) return -1;
+    struct stat sst;
+    if (fstat(si, &sst) != 0) { close(si); errno = EIO; return -1; }
+    int di = open(p2, O_WRONLY | O_CREAT | O_EXCL, sst.st_mode & 07777);
+    if (di < 0) { close(si); return -1; }
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(si, buf, sizeof buf)) > 0) {
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(di, buf + off, (size_t)(n - off));
+            if (w < 0) { close(si); close(di); unlink(p2); return -1; }
+            off += w;
+        }
+    }
+    fsync(di);
+    close(si);
+    int rc = close(di);
+    if (n < 0 || rc != 0) { errno = EIO; unlink(p2); return -1; }
+    return 0;
+}
+
 int link(const char *oldpath, const char *newpath) {
     static int (*SP_REAL(link))(const char *, const char *) = NULL;
     static ssize_t (*SP_REAL(symlink))(const char *, const char *) = NULL;
@@ -937,13 +1060,15 @@ int link(const char *oldpath, const char *newpath) {
     SP_TRACE("link", oldpath, p1);
     SP_TRACE("link->", newpath, p2);
     int rc = SP_REAL(link)(p1, p2);
-    /* Android SELinux blocks hardlinks on /data/data/`.../files: proot's
-     * answer is --link2symlink; mimic: fall back to a symlink pointing at
-     * the translated (already host-absolute) target — its spelling flows
-     * back through our own reverse-translations as guest-stable. */
+    /* SELinux denies hardlinks on /data/data/.../files: fallback = copy
+     * (journal-safe, see helper), symlink only as last resort. */
     if (rc != 0 && (errno == EPERM || errno == EACCES) && getenv("SPROUT_LINK2SYMLINK")) {
-        if (!SP_REAL(symlink)) SP_REAL(symlink) = dlsym(RTLD_NEXT, "symlink");
-        if (SP_REAL(symlink)) rc = SP_REAL(symlink)(p1, p2);
+        int rc2 = sp_link_fallback_copy(p1, p2);
+        if (rc2 == 0) rc = 0;
+        else {
+            if (!SP_REAL(symlink)) SP_REAL(symlink) = dlsym(RTLD_NEXT, "symlink");
+            if (SP_REAL(symlink)) rc = SP_REAL(symlink)(p1, p2);
+        }
     }
     return rc;
 }
@@ -958,8 +1083,12 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
     SP_TRACE("linkat->", newpath, p2);
     int rc = SP_REAL(linkat)(olddirfd, p1, newdirfd, p2, flags);
     if (rc != 0 && (errno == EPERM || errno == EACCES) && getenv("SPROUT_LINK2SYMLINK")) {
-        if (!SP_REAL(symlinkat)) SP_REAL(symlinkat) = dlsym(RTLD_NEXT, "symlinkat");
-        if (SP_REAL(symlinkat)) rc = SP_REAL(symlinkat)(p1, AT_FDCWD, p2);
+        int rc2 = sp_link_fallback_copy(p1, p2);
+        if (rc2 == 0) rc = 0;
+        else {
+            if (!SP_REAL(symlinkat)) SP_REAL(symlinkat) = dlsym(RTLD_NEXT, "symlinkat");
+            if (SP_REAL(symlinkat)) rc = SP_REAL(symlinkat)(p1, AT_FDCWD, p2);
+        }
     }
     return rc;
 }
@@ -1028,7 +1157,9 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("fstatat", path, p);
-    return SP_REAL(fstatat)(dirfd, p, st, flags);
+    int rc = SP_REAL(fstatat)(dirfd, p, st, flags);
+    if (rc == 0) sp_spoof_uid_gid(&st->st_uid, &st->st_gid);
+    return rc;
 }
 int newfstatat(int dirfd, const char *path, struct stat *st, int flags) {
     static int (*SP_REAL(newfstatat))(int, const char *, struct stat *, int) = NULL;
@@ -1036,7 +1167,9 @@ int newfstatat(int dirfd, const char *path, struct stat *st, int flags) {
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("newfstatat", path, p);
-    return SP_REAL(newfstatat)(dirfd, p, st, flags);
+    int rc = SP_REAL(newfstatat)(dirfd, p, st, flags);
+    if (rc == 0) sp_spoof_uid_gid(&st->st_uid, &st->st_gid);
+    return rc;
 }
 
 char *mkdtemp(char *tmpl) {
@@ -1146,7 +1279,9 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_FOLLOW) ? sp_translate_x(path, x) : sp_translate_l(path, x);
     SP_TRACE("statx", path, p);
-    return SP_REAL(statx)(dirfd, p, flags, mask, buf);
+    int rc = SP_REAL(statx)(dirfd, p, flags, mask, buf);
+    if (rc == 0) sp_spoof_uid_gid(&buf->stx_uid, &buf->stx_gid);
+    return rc;
 }
 
 int mkdirat(int dirfd, const char *path, mode_t mode) {
@@ -1417,7 +1552,28 @@ int stat(const char *path, struct stat *st) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("stat", path, p);
-    return SP_REAL(stat)(p, st);
+    int rc = SP_REAL(stat)(p, st);
+    if (rc == 0) sp_spoof_uid_gid(&st->st_uid, &st->st_gid);
+    return rc;
+}
+
+/* fstat64: no path to translate, only the ownership spoof contract. */
+int fstat64(int fd, struct stat64 *st) {
+    static int (*SP_REAL(fstat64))(int, struct stat64 *) = NULL;
+    SP_RESOLVE(fstat64);
+    int rc = SP_REAL(fstat64)(fd, st);
+    if (rc == 0) sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid);
+    return rc;
+}
+int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
+    static int (*SP_REAL(fstatat64))(int, const char *, struct stat64 *, int) = NULL;
+    SP_RESOLVE(fstatat64);
+    char x[SP_PATH_MAX];
+    const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
+    SP_TRACE("fstatat64", path, p);
+    int rc = SP_REAL(fstatat64)(dirfd, p, st, flags);
+    if (rc == 0) sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid);
+    return rc;
 }
 
 int stat64(const char *path, struct stat64 *st) {
@@ -1426,7 +1582,9 @@ int stat64(const char *path, struct stat64 *st) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("stat64", path, p);
-    return SP_REAL(stat64)(p, st);
+    int rc = SP_REAL(stat64)(p, st);
+    if (rc == 0) sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid);
+    return rc;
 }
 
 int lstat(const char *path, struct stat *st) {
@@ -1435,7 +1593,9 @@ int lstat(const char *path, struct stat *st) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_l(path, x);
     SP_TRACE("lstat", path, p);
-    return SP_REAL(lstat)(p, st);
+    int rc = SP_REAL(lstat)(p, st);
+    if (rc == 0) sp_spoof_uid_gid(&st->st_uid, &st->st_gid);
+    return rc;
 }
 
 int lstat64(const char *path, struct stat64 *st) {
@@ -1444,7 +1604,9 @@ int lstat64(const char *path, struct stat64 *st) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_l(path, x);
     SP_TRACE("lstat64", path, p);
-    return SP_REAL(lstat64)(p, st);
+    int rc = SP_REAL(lstat64)(p, st);
+    if (rc == 0) sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid);
+    return rc;
 }
 
 

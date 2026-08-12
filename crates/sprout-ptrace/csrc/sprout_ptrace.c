@@ -1472,6 +1472,34 @@ static socklen_t sp_notify_unix_to_host(pid_t pid, unsigned long long addr,
 }
 
 /* ---- iovec gather for sendto/sendmsg notify-serve ---- */
+/* SELinux denies hardlinks on /data/data/.../files. A SYMLINK fallback is
+ * fatal for the link(tmp -> target)+unlink(tmp) journal pattern (observed:
+ * git "not a valid object"); materialize the link target as a byte-for-byte
+ * copy instead — unlink on the source then harms nothing. */
+static int sp_link_fallback_copy(const char *src, const char *dst) {
+    int si = open(src, O_RDONLY);
+    if (si < 0) return -1;
+    struct stat sst;
+    if (fstat(si, &sst) != 0) { close(si); errno = EIO; return -1; }
+    int di = open(dst, O_WRONLY | O_CREAT | O_EXCL, sst.st_mode & 07777);
+    if (di < 0) { close(si); return -1; }
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(si, buf, sizeof buf)) > 0) {
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(di, buf + off, (size_t)(n - off));
+            if (w < 0) { close(si); close(di); unlink(dst); return -1; }
+            off += w;
+        }
+    }
+    fsync(di);
+    close(si);
+    int rc = close(di);
+    if (n < 0 || rc != 0) { unlink(dst); errno = EIO; return -1; }
+    return 0;
+}
+
 static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
                                 unsigned long long *args,
                                 unsigned long long id,
@@ -1634,6 +1662,13 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (sp_notify_read_str(pid, args[3], oldp, sizeof(oldp)) <= 0) { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, oldp, nh, sizeof nh)) { sp_notify_continue(resp); return; }
         int rc = linkat(-100, oh, -100, nh, (int)args[4]);
+        /* SELinux denies hardlinks under /data/data/.../files: copy first
+         * (journal pattern safety), symlink as last resort (proot-shaped
+         * --link2symlink surface-answer). */
+        if (rc < 0 && (errno == EPERM || errno == EACCES) && getenv("SPROUT_LINK2SYMLINK")) {
+            if (sp_link_fallback_copy(oh, nh) == 0) rc = 0;
+            else rc = symlinkat(oh, -100, nh);
+        }
         if (rc < 0) { resp->error = -errno; return; }
         resp->error = 0; resp->val = 0; return; }
     case 38: { /* renameat(olddirfd, oldpath, newdirfd, newpath) */
