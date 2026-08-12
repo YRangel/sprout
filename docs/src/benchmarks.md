@@ -177,11 +177,55 @@ path fast-CONT.
   load). Direct A/B same-minute: proot 8.44 s vs sprout 0.49 s = **~17×**, consistent with the 16.6× first measurement.
 - glibc notify lane A/B: 0.81–0.96× (was 0.56–0.82×) — remaining delta is the seccomp filter evaluation cost itself (17-JEQ BPF run on every guest syscall), unavoidable while sockets need the listener; musl lane 0.90–1.21× (parity).
 
-## Statics lane A/B (v0.6, 2026-08-12, same host, median-of-20 × 3 rounds)
+## Statics 3-lane battery (v0.6.1, 2026-08-12, same host, median-of-5 × 3 rounds)
+
+ADR-0016 notify-statics vs legacy ptrace lane vs proot-distro v5 on
+freestanding static binaries (`-nostdlib` ET_EXEC; `bench/run-statics.sh`,
+debian rootfs). Medians of the 3 rounds shown; ratios computed on medians.
+One outlier noted inline (ptrace self-exec r3 = 555 ms, ambient stall;
+kept out of that row's median by taking the middle round value).
+
+| workload                          | proot-distro | notify-statics | ptrace lane | proot→notify | ptrace→notify |
+|-----------------------------------|--------------|----------------|-------------|--------------|---------------|
+| spawn ×50 (fork+exec static)      | 322 ms       | 61 ms          | 92 ms       | **5.28×**    | **1.51×**     |
+| open+read+close ×20k              | 3579 ms      | 1624 ms        | 6982 ms     | **2.20×**    | **4.30×**     |
+| newfstatat ×20k                   | 2666 ms      | 902 ms         | 2908 ms     | **2.96×**    | **3.22×**     |
+| self-exec chain depth 8           | 269 ms       | 42 ms          | 58 ms       | **6.40×**    | **1.38×**     |
+| static→dynamic `basename`         | 252 ms       | 41 ms          | 64 ms       | **6.15×**    | **1.56×**     |
+| static→dynamic `python3 -c pass`  | 348 ms       | 65 ms          | 109 ms      | **5.35×**    | **1.68×**     |
+
+The notify lane beats **both** predecessors on every workload. Note the
+proot column beating the OLD ptrace lane on syscall-dense loops (proot
+translates without ADD-FD injection while the ptrace lane was tuned for
+correctness) — the notify lane still clears both decisively.
+
+`SPROUT_NOTIFY_STATICS=0` selects the ptrace lane; default is notify for
+kind=1/2 (static / Go-static) top-level guests. Static-PIE (ET_DYN,
+no `PT_INTERP`) guests work in the lane as well (stub maps them at the
+fixed ET_DYN base); covered by the spawn cases' PIE variant.
+
+## Dynamics regression check (v0.6.1, same day): all v0.5.3 bands hold
+
+Debian `MODE=full`: python3 4.06×, bash 5.50×, exec-chain 3.28×,
+find /etc 6.06×, cmdsubst-pipe 1.69×, grep-churn 1.63×, sh-loop 5.71×,
+find /usr 7.84×, ls -R 3.37×, os.walk 2.08×, dd write 2.00×, dd read
+2.39×, tar czf /etc 4.02×, awk-sum 2.81×, git status 2.56×, git log 3.56×.
+
+Alpine: sh 6.97×, exec-chain 3.85×, cmdsubst-pipe 1.88×, python3 4.33×,
+find /usr/bin 6.39×, dd 5.50×.
+
+**Caught-and-fixed during this battery**: v0.6 briefly trapped the stat
+family (79/291/78) in the SHARED notify filter for the notify-statics
+lane's needs — but that filter also governs TRACEME-lane statics and
+shadow dynamics, whose stats are ptrace-/interposer-covered, so each stat
+became a pure round-trip: musl `find /usr` 328ms vs 81ms (0.25×). Stat
+nrs now live only in the stub's own filter (commit `dea8d7c`); musl find
+back to parity (82ms vs 71ms).
+
+## Statics lane A/B (v0.6 first cut, 2026-08-12, median-of-20 × 3 rounds)
 
 ADR-0016 pure-notify statics lane (`sprout-stub`) vs the legacy TRACEME
-ptrace lane, debian rootfs, freestanding static test binaries
-(`-nostdlib` ET_EXEC):
+ptrace lane; first measurement with spawn-only binaries:
 
 | workload                                   | ptrace lane | notify-statics lane | ratio |
 |--------------------------------------------|-------------|---------------------|-------|
@@ -194,10 +238,8 @@ so they hide the win; the 20k-iteration syscall loop exposes it: ptrace
 pays a stop per syscall (~10.7µs each on this device), notify pays one
 user-space serve round-trip per trapped syscall and zero for everything
 else. Long-lived, syscall-heavy static guests (Go daemons like
-cloudflared) live on the right-hand column.
-
-`SPROUT_NOTIFY_STATICS=0` selects the ptrace lane; default is the notify
-lane for kind=1/2 (static / Go-static) top-level guests.
+cloudflared) live on the right-hand column. Superseded by the fuller
+6-workload 3-lane table above.
 
 ## Historical (v0.3 toolchain sweep, 2026-08-11, same host)
 
