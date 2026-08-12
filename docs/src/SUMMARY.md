@@ -30,6 +30,8 @@
 - [0010: perf cache + AF_UNIX + shared-tmp](./adr/0010-perf-cache-and-afunix-sharedtmp.md)
 - [0011: emulate blocked syscalls at PLT](./adr/0011-emulate-blocked-syscalls-at-plt.md)
 - [0012: apt/dpkg compatibility layer](./adr/0012-apt-dpkg-compat-layer.md)
+- [0013: seccomp user-notify fast path](./adr/0013-user-notify-fast-path.md)
+- [0014: vfork-safe exec chain](./adr/0014-vfork-safe-exec-chain.md)
 
 # Operations
 
