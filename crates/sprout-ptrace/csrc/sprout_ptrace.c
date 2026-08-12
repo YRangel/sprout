@@ -104,6 +104,12 @@ static const sp_emul_rule SP_EMULATE_BASE[] = {
     { 426, -38 },  /* io_uring_enter    -> -ENOSYS */
     { 427, -38 },  /* io_uring_register -> -ENOSYS */
     { 439, -38 },  /* faccessat2 raw callers -> -ENOSYS (libc falls back) */
+    /* accept(202) deliberately NOT here: Android policy layers trigger
+     * SIGSYS on it under our supervisor chain (tmux server accept is the
+     * case). It must be PIVOTED to accept4(242) at the SIGSYS stop
+     * (x8 rewrite, no ENOSYS): glibc accept(fd,addr,len) == accept4(fd,addr,len,0);
+     * serving via the listener NEVER fires because the ANDROID policy TRAP
+     * for nr 202 has precedence over our USER_NOTIF. */
     { 159, -1 },   /* setgroups — Android TRAPs; EPERM truth, fakeroot 0 */
     { 143, -1 },   /* setuid  */
     { 144, -1 },   /* setreuid */
@@ -1311,6 +1317,11 @@ static int sp_notify_install(void) {
         53 /*fchmodat*/, 54 /*fchownat*/, 88 /*utimensat*/,
         36 /*symlinkat*/, 37 /*linkat*/, 38 /*renameat*/,
         276 /*renameat2*/,
+        /* accept(202)/accept4(242) deliberately NOT trapped: Android TRAPs
+         * the legacy accept(2) nr for the whole process (Xiaomi-HyperOS
+         * device observed); accept4 is allowed. We therefore PIVOT the
+         * x8 register 202->242 at the SIGSYS stop/sigaction instead of
+         * serving via the listener. */
         /* stat-family (79/291/78) DELIBERATELY ABSENT here: this filter is
          * the SHARED one put on TRACEME-lane statics + shadow dynamic
          * guests — dynamic guests' stats are already interposer-
@@ -1634,6 +1645,75 @@ static int sp_notify_lazy_exec_rewrite(pid_t pid, const char *guest,
     return ok;
 }
 
+/* ------------------------------------------------------------------ */
+/* proot-parity fakes for /proc entries Android locks for untrusted apps */
+/* ------------------------------------------------------------------ */
+/* /proc/stat and /proc/loadavg are EACCES for any uid on new Android
+ * even though htop-like tools expect them. Serve a synthetic file the
+ * way proot does: small parseable content, served via a temporary fd. */
+static int sp_fake_proc_cpu_count(void) {
+    char b[64];
+    int f = open("/sys/devices/system/cpu/possible", O_RDONLY);
+    if (f < 0) f = open("/sys/devices/system/cpu/present", O_RDONLY);
+    if (f < 0) return 1;
+    ssize_t n = read(f, b, sizeof(b) - 1);
+    close(f);
+    if (n <= 0) return 1;
+    b[n] = 0;
+    /* format: "0-7" or "0,2,4-5" — count by ranges */
+    int total = 0;
+    char *p = b;
+    while (*p) {
+        int lo = -1, hi = -1;
+        while (*p && (*p < '0' || *p > '9')) p++;
+        if (!*p) break;
+        lo = (int)strtol(p, &p, 10);
+        hi = lo;
+        if (*p == '-') { p++; hi = (int)strtol(p, &p, 10); }
+        if (hi >= lo) total += hi - lo + 1;
+    }
+    return total > 0 ? total : 1;
+}
+
+static int sp_fake_proc_serve(unsigned long long id, const char *which,
+                              struct seccomp_notif_resp *resp) {
+    int is_stat = strcmp(which, "/proc/stat") == 0;
+    char tmp_t[SP_PATH_MAX];
+    /* NB: TMPDIR in this process is the GUEST's (/tmp policy from the
+     * launch plan) — for supervisor-side temp files it must stay a
+     * HOST-writable dir; try TMPDIR first, fall back. */
+    const char *cands[2] = { getenv("TMPDIR"), "/data/data/com.termux/files/usr/tmp" };
+    int f = -1;
+    for (int i = 0; i < 2 && f < 0; i++) {
+        if (!cands[i]) continue;
+        snprintf(tmp_t, sizeof(tmp_t), "%s/sprout-fakeproc-XXXXXX", cands[i]);
+        f = mkstemp(tmp_t);
+    }
+    if (f < 0) { SP_OFT("[notify] fakeproc mkstemp errno=%d\n", errno); return 0; }
+    unlink(tmp_t);
+    char buf[4096];
+    int n = 0;
+    if (is_stat) {
+        int ncpu = sp_fake_proc_cpu_count();
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "cpu 0 0 0 0 0 0 0 0 0 0\n");
+        for (int i = 0; i < ncpu && n < (int)sizeof(buf) - 96; i++)
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n, "cpu%d 0 0 0 0 0 0 0 0 0 0\n", i);
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+            "intr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 0\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0\n");
+    } else { /* /proc/loadavg */
+        n = snprintf(buf, sizeof(buf), "0.00 0.00 0.00 1/512 12345\n");
+    }
+    if (write(f, buf, (size_t)n) != n || lseek(f, 0, SEEK_SET) < 0) { close(f); return 0; }
+    struct seccomp_notif_addfd af; memset(&af, 0, sizeof(af));
+    af.id = id; af.flags = 0; af.srcfd = f;
+    long nfd = ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &af);
+    close(f);
+    if (nfd < 0) { SP_OFT("[notify] fakeproc ADDFD errno=%d\n", errno); return 0; }
+    SP_OFT("[notify] fakeproc %s -> fd=%ld\n", which, nfd);
+    resp->error = 0; resp->val = (uint64_t)nfd; resp->flags = 0;
+    return 1;
+}
+
 static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
                                 unsigned long long *args,
                                 unsigned long long id,
@@ -1681,6 +1761,11 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
          * native retry (CONT) lands on exactly the file we'd serve via
          * readlink+ADDFD — without the supervisor round-trip. */
         if (guest[0] != '/') { sp_notify_continue(resp); return; }
+        /* proot-parity fakes: Android locks /proc/stat + /proc/loadavg
+         * for untrusted apps even when guests expect them — synthesize. */
+        if (g_debug && guest[0] == '/' && guest[1] == 'p') SP_TRACE("[notify] openat56 guest='%s'\n", guest);
+        if ((strcmp(guest, "/proc/stat") == 0 || strcmp(guest, "/proc/loadavg") == 0)
+            && sp_fake_proc_serve(id, guest, resp) == 1) return;
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
         sp_notify_reply_open(id, resp, host, flags, (mode_t)args[3]);
         return; }
@@ -2457,6 +2542,23 @@ int main(int argc, char **argv) {
                     emul_ret = 0;
                 if (emulated && (long)r.regs[8] == 159 && getenv("SPROUT_FAKEROOT"))
                     emul_ret = 0;
+                if (!emulated && (long)r.regs[8] == 202 /*accept*/) {
+                    /* ANDROID policy TRAPs legacy accept(2) on this class
+                     * of process (Xiaomi HyperOS observed; tmux-server's
+                     * libevent died here as pure SIGSYS), while accept4(242)
+                     * is allowed. Pivot x8 202->242, clear flags x3=0, and
+                     * re-execute the very same svc (pc untouched). glibc's
+                     * accept(fd,addr,len) == accept4(fd,addr,len,0). */
+                    emulated = 1;
+                    r.regs[8] = 242;
+                    r.regs[3] = 0;
+                    ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
+                    if (g_debug)
+                        fprintf(stderr, "[ptrace] %d SIGSYS pivot: accept→accept4 (x8=242) pc=%llx\n",
+                                w, (unsigned long long)r.pc);
+                    ptrace(t->shadow ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, NULL);
+                    continue;
+                }
                 if (emulated) {
                     r.regs[0] = (unsigned long long)(long long)emul_ret;
                     ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);

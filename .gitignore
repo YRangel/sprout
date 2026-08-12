@@ -6,3 +6,7 @@
 /docs/book/
 
 /target/fakeroot
+
+# in-tree interposer build artifacts (built in-guest, deployed to \/data/data/com.termux/files/usr/bin)
+crates/sprout-preload/csrc/libsprout-core.so
+crates/sprout-preload/csrc/libsprout-core-musl.so

@@ -56,23 +56,78 @@ fn guest_path_for(rootfs: &Rootfs) -> String {
     p
 }
 
-/// Push HOME/TERM policy defaults onto a plan env:
+/// Compute the guest HOME: /root by default (proot parity); `--host-home`
+/// passes the host $HOME through (also used for the default guest cwd).
+fn guest_home(rootfs: &Rootfs) -> String {
+    if rootfs.host_home {
+        std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+    } else {
+        "/root".into()
+    }
+}
+
+/// Push HOME/TERM/SHELL/TMPDIR policy defaults onto a plan env:
 /// - HOME: /root by default (proot parity); `--host-home` passes the host
 ///   $HOME through.
-/// - TERM: inherited from the host; falls back to xterm-256color so guests
-///   always see a sane terminal type.
+/// - TERM: inherited from the host; falls back to xterm-256color.
+/// - SHELL: host $SHELL points into bionic world ($PREFIX/bin/...) — every
+///   guest that honors it (tmux's default-shell, env(1), getpass...) then
+///   execs a binary from the WRONG libc world (observed: tmux pane dying
+///   on libdl.so). Rewrite to a same-basename guest shell when it exists,
+///   else /bin/bash, else /bin/sh.
+/// - TMPDIR: host TMPDIR points outside the guest view; pin /tmp.
+/// - OLDPWD: host value confuses guest cd state ($PWD chains); drop it.
 fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
     if !env.iter().any(|(k, _)| k == "HOME") {
-        let home = if rootfs.host_home {
-            std::env::var("HOME").unwrap_or_else(|_| "/root".into())
-        } else {
-            "/root".into()
-        };
-        env.push(("HOME".into(), home));
+        env.push(("HOME".into(), guest_home(rootfs)));
     }
     if !env.iter().any(|(k, _)| k == "TERM") {
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
         env.push(("TERM".into(), term));
+    }
+    if !env.iter().any(|(k, _)| k == "SHELL") {
+        let base = std::env::var("SHELL")
+            .ok()
+            .and_then(|s| s.rsplit('/').next().map(|b| b.to_string()))
+            .filter(|b| !b.is_empty());
+        let mut guest_shell: Option<String> = None;
+        if let Some(base) = base {
+            for c in [format!("/bin/{base}"), format!("/usr/bin/{base}")] {
+                if rootfs.guest_real(std::path::Path::new(&c)).map(|p| p.is_file()).unwrap_or(false) {
+                    guest_shell = Some(c);
+                    break;
+                }
+            }
+        }
+        if guest_shell.is_none() {
+            for c in ["/bin/bash", "/bin/sh"] {
+                if rootfs.guest_real(std::path::Path::new(c)).map(|p| p.is_file()).unwrap_or(false) {
+                    guest_shell = Some(c.to_string());
+                    break;
+                }
+            }
+        }
+        env.push(("SHELL".into(), guest_shell.unwrap_or_else(|| "/bin/sh".into())));
+    }
+    if !env.iter().any(|(k, _)| k == "TMPDIR") {
+        env.push(("TMPDIR".into(), "/tmp".into()));
+    }
+    if !env.iter().any(|(k, _)| k == "OLDPWD") {
+        env.push(("OLDPWD".into(), guest_home(rootfs)));
+    }
+}
+
+/// Ensure the guest has a working POSIX-shm directory: python's
+/// multiprocessing.SemLock (`shm_open(/dev/shm/sem.…)`) and assorted
+/// tools die with ENOENT when /dev/shm is absent (proot-distro keeps a
+/// writable one; mirrors it).
+fn ensure_dev_shm(rootfs: &Rootfs) {
+    let shm = rootfs.root.join("dev/shm");
+    let _ = std::fs::create_dir_all(&shm);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o1777));
     }
 }
 
@@ -141,18 +196,24 @@ impl LaunchPlan {
                 env.push(("SPROUT_DEBUG".into(), "1".into()));
             }
             push_home_term(&mut env, rootfs);
+        ensure_dev_shm(rootfs);
+            ensure_dev_shm(rootfs);
+            let def_cwd = if rootfs.cwd.is_some() {
+                rootfs.cwd.clone().unwrap()
+            } else {
+                guest_home(rootfs)
+            };
             return Ok(Self {
                 strategy: Strategy::Preload,
                 loader,
                 argv,
                 env,
-                /* proot parity: guest cwd defaults to the guest root.
-                 * Inheriting the host cwd drops the child OUTSIDE the
-                 * rootfs, and root-relative guest programs (apk!) then
-                 * create junk like '/home/projeto/triggers.tmp.PID'. */
-                cwd: Some(rootfs.to_host(std::path::Path::new(
-                    rootfs.cwd.as_deref().unwrap_or("/"),
-                ))),
+                /* proot parity: guest cwd defaults to the guest HOME
+                 * (/root; proot-distro behavior). Inheriting the host cwd
+                 * drops the child OUTSIDE the rootfs, and root-relative
+                 * guest programs (apk!) then create junk like
+                 * '/home/projeto/triggers.tmp.PID'. */
+                cwd: Some(rootfs.to_host(std::path::Path::new(&def_cwd))),
                 display: guest_prog.display().to_string(),
             });
         }
@@ -210,11 +271,15 @@ impl LaunchPlan {
             env.push(("SPROUT_DEBUG".into(), "1".into()));
         }
         push_home_term(&mut env, rootfs);
+        ensure_dev_shm(rootfs);
 
         /* same default: no host-cwd inheritance outside the rootfs. */
-        let cwd = Some(rootfs.to_host(std::path::Path::new(
-            rootfs.cwd.as_deref().unwrap_or("/"),
-        )));
+        let def_cwd = if rootfs.cwd.is_some() {
+            rootfs.cwd.clone().unwrap()
+        } else {
+            guest_home(rootfs)
+        };
+        let cwd = Some(rootfs.to_host(std::path::Path::new(&def_cwd)));
 
         Ok(Self {
             strategy: Strategy::Preload,

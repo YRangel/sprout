@@ -329,6 +329,8 @@ static unsigned long load_guest(const char *path, unsigned long *phdr_out)
  *   siginfo._sigsys: signo/errno/code(12)+pad(4) => call_addr@16, syscall@24, arch@28
  */
 #define UC_X0_OFF 176
+#define UC_X3_OFF 200
+#define UC_X8_OFF 240
 #define UC_PC_OFF 432
 #define SI_SYSCALL_OFF 24
 
@@ -336,6 +338,10 @@ static unsigned long load_guest(const char *path, unsigned long *phdr_out)
 static const long g_glibc_ok[] = { 99, 293 };
 /* musl table: faccessat, set*id family, setgroups */
 static const long g_musl_ok[] = { 48, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 159 };
+/* shared -ENOSYS table (fake success would be a LIE here: callers probe
+ * and fall back — io_uring probes; futex_waitv on Android-16 TRAPs and
+ * glibc≥2.41/libevent fall back to futex(2) on ENOSYS). */
+static const long g_enosys[] = { 202, 425, 426, 427 };
 
 static int stub_is_ok(long nr, const long *tbl, int n)
 {
@@ -357,7 +363,20 @@ static void stub_sigsys_handler(int sig __attribute__((unused)),
                                (int)(sizeof(g_musl_ok) / sizeof(g_musl_ok[0])))
                   : stub_is_ok(nr, g_glibc_ok,
                                (int)(sizeof(g_glibc_ok) / sizeof(g_glibc_ok[0])));
+    if (!ok && nr == 202 /*accept*/) {
+        /* ANDROID TRAPs legacy accept(2), accepts accept4: rewrite the
+         * interrupted frame (x8=242, x3=flags=0) and DON'T advance pc —
+         * sigreturn re-executes the same svc, now as accept4(fd,addr,len,0). */
+        uc[UC_X8_OFF / 8] = 242;
+        uc[UC_X3_OFF / 8] = 0;
+        return;
+    }
     if (!ok) {
+        if (stub_is_ok(nr, g_enosys, (int)(sizeof(g_enosys) / sizeof(g_enosys[0])))) {
+            uc[UC_X0_OFF / 8] = (u64)-38; /* -ENOSYS */
+            uc[UC_PC_OFF / 8] += 4;
+            return;
+        }
         char db[48];
         db[0]='s'; db[1]='g'; db[2]='s'; db[3]='y'; db[4]='s'; db[5]='-'; db[6]='n'; db[7]='r'; db[8]='='; int n=9;
         long m2 = nr;

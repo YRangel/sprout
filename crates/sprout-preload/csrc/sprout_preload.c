@@ -66,7 +66,8 @@ void sp_config_load(sp_config_t *cfg) {
     const char *l2s = getenv("SPROUT_LINK2SYMLINK");
     cfg->link2symlink = l2s && l2s[0] == '1';
 
-    /* passthrough: default kernel pseudo-fs; override via env */
+    /* Host pseudo-filesystem mountpoints (never re-prefixed with rootfs;
+     * consulted AFTER SPROUT_BIND entries so binds can override). */
     static const char *default_pt[] = { "/proc", "/sys", "/dev" };
     const char *pt_env = getenv("SPROUT_PASSTHROUGH");
     if (!pt_env || !*pt_env) {
@@ -142,12 +143,9 @@ int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]
     if (cfg->rootfs_len > 0 && path_within(cfg->rootfs, cfg->rootfs_len, path))
         return 0;
 
-    /* Never translate host pseudo-filesystem mountpoints. */
-    for (int i = 0; i < cfg->npassthrough; i++) {
-        if (path_within(cfg->passthrough[i].prefix, cfg->passthrough[i].len, path))
-            return 0;
-    }
-
+    /* User binds are MORE SPECIFIC than the pseudo-fs passthrough
+     * (/proc,/sys,/dev): consult them FIRST so an explicit /dev/shm or
+     * /proc/self/stat bind can override the passthrough. */
     for (int i = 0; i < cfg->nbinds; i++) {
         const sp_bind_t *b = &cfg->binds[i];
         if (!path_within(b->guest, b->guest_len, path)) continue;
@@ -156,6 +154,12 @@ int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]
         memcpy(out, b->host, b->host_len);
         memcpy(out + b->host_len, path + b->guest_len, rest + 1);
         return 1;
+    }
+
+    /* Never translate host pseudo-filesystem mountpoints. */
+    for (int i = 0; i < cfg->npassthrough; i++) {
+        if (path_within(cfg->passthrough[i].prefix, cfg->passthrough[i].len, path))
+            return 0;
     }
 
     if (cfg->rootfs_len == 0) return 0;
@@ -586,7 +590,19 @@ static int sp_dns_servers(struct in_addr out[4]) {
     int n = 0;
     while (n < 4 && fgets(line, sizeof(line), f)) {
         char ip[64];
-        if (sscanf(line, " nameserver%*[ \t]%63s", ip) == 1)
+        /* sscanf/atoi redirect to __isoc23_* on glibc≥2.40 headers,
+         * which then fails at RUNTIME in musl guests (undefined symbols).
+         * Parse by hand (resolv.conf 'nameserver IP[:port]' is simple). */
+        char *nsp = line;
+        while (*nsp == ' ' || *nsp == '\t') nsp++;
+        ip[0] = 0;
+        if (strncmp(nsp, "nameserver", 10) == 0) {
+            nsp += 10;
+            while (*nsp == ' ' || *nsp == '\t') nsp++;
+            size_t ipl = strcspn(nsp, " \t\n");
+            if (ipl && ipl < sizeof ip) { memcpy(ip, nsp, ipl); ip[ipl] = 0; }
+        }
+        if (ip[0])
             if (inet_aton(ip, &out[n]) != 0) n++;
     }
     fclose(f);
@@ -717,7 +733,7 @@ static short sp_dns_port(const char *s) {
         {"imap",143},{"imaps",993},{"pop3s",995},{"submission",587},{NULL,0}
     };
     if (!s || !*s) return 0;
-    if (s[0] >= '0' && s[0] <= '9') return (short)atoi(s);
+    if (s[0] >= '0' && s[0] <= '9') { short v = 0; while (*s >= '0' && *s <= '9') v = (short)(v * 10 + (*s++ - '0')); return v; }
     for (int i = 0; tb[i].n; i++) if (!strcmp(tb[i].n, s)) return tb[i].p;
     return 0;
 }
@@ -1649,6 +1665,37 @@ ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
         socklen_t l = (socklen_t)msg->msg_namelen;
         sp_addr_rev_unix((struct sockaddr *)msg->msg_name, &l);
         msg->msg_namelen = l;
+    }
+    return r;
+}
+
+/* (ADR-0006+) Android's app-policy TRAPs legacy accept(2) — glibc emits
+ * exactly that svc — but accept4(2) is allowed. Pivot the symbol call
+ * site: every glibc accept(fd,addr,len) goes through accept4(fd,addr,len,0)
+ * here so the guest never trips the trap. (Can't fix statics here — the
+ * stub emulates the same pivot in-guest.) */
+int accept(int fd, struct sockaddr *addr, socklen_t *len) {
+    static int (*SP_REAL(accept4))(int, struct sockaddr *, socklen_t *, int) = NULL;
+    SP_RESOLVE(accept4);
+    return SP_REAL(accept4)(fd, addr, len, 0);
+}
+
+/* proot-compat: fake SO_PEERCRED results the way proot does — the guest
+ * believes it is uid=0 (SPROUT_FAKEROOT) but the kernel still reports the
+ * real Android uid in ucred for AF_UNIX peers; servers with peer-AACl checks
+ * (tmux >= 3.5) deny clients whose ucred uid != their own. Zero uid/gid
+ * when fake-root is active; keep the real pid. */
+struct sp_ucred { pid_t pid; uid_t uid; gid_t gid; };
+int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) {
+    static int (*SP_REAL(getsockopt))(int, int, int, void *, socklen_t *) = NULL;
+    SP_RESOLVE(getsockopt);
+    int r = SP_REAL(getsockopt)(fd, level, optname, optval, optlen);
+    if (r == 0 && level == SOL_SOCKET && optname == SO_PEERCRED && optval != NULL
+        && optlen != NULL && *optlen >= (socklen_t)sizeof(struct sp_ucred)
+        && getenv("SPROUT_FAKEROOT") != NULL) {
+        struct sp_ucred *u = (struct sp_ucred *)optval;
+        u->uid = 0;
+        u->gid = 0;
     }
     return r;
 }

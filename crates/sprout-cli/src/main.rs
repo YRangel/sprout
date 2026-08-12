@@ -112,6 +112,12 @@ fn run() -> Result<u8, Error> {
             .unwrap_or_else(|_| std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
         rootfs.bindings.push(Binding::parse(&format!("{}:/tmp", tmp))?);
     }
+    // Implicit bind: guest /dev/shm → $ROOTFS/tmp (proot-distro parity;
+    // proot-distro binds its rootfs's own /tmp as /dev/shm, giving python's
+    // multiprocessing SemLock, postgres, etc. a writable POSIX-shm dir even
+    // though Android hosts have no /dev/shm). Pushed LAST so an explicit
+    // -b …:/dev/shm of equal length still wins (ties = insertion order).
+    rootfs.bindings.push(Binding::parse(&format!("{}:/dev/shm", rootfs.root.join("tmp").display()))?);
 
     let mut program_name = cli.cmd[0].to_string_lossy().into_owned();
     let mut program_host = rootfs.find_program(&program_name)?;
