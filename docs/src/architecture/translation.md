@@ -45,3 +45,19 @@ rules: bindings first, then rootfs-strip.
 | `LD_LIBRARY_PATH` | launcher (host abs dirs) | glibc loader |
 
 No other shared state exists between Rust and C.
+
+## Translation-cache policy (v0.5.2+ correctness rule)
+
+`sp_xcache` (128-entry guest→host map) caches **only follow-0 results**: a
+translation that required zero symlink-chase hops. Chased results are
+re-resolved on every call because guest-side symlink rotation (`ln -sf`,
+rustup/npm link swaps) has no invalidation hook into the interposer; a
+cached chase could silently serve the *previous* target. Pure prefix
+mappings (rootfs prepend / bind / passthrough) are pure functions of the
+path string and are always safe to cache. Every notify-dominated
+correctness review in the future should re-check this rule.
+
+Review log 2026-08-12 (v0.5.3): also fixed a latent -Wreturn-local-addr
+dangling-pointer in the relative-path join branch (guest-relative paths
+under a passthrough-prefixed cwd like guest `/proc` could return a stack
+pointer), and hardened the symlink-chase snprintf writes.

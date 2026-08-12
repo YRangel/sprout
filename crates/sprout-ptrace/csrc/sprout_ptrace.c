@@ -1733,7 +1733,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
     case 36: { if (getenv("SPROT_NOTIFY_NO_LINKSY")) { sp_notify_continue(resp); return; } /* symlinkat(target, newdirfd, linkpath) */
         int newdirfd = (int)args[1];
         if (newdirfd != -100) { sp_notify_continue(resp); return; }
-        char target[SP_PATH_MAX], linkp[SP_PATH_MAX];
+        char target[SP_PATH_MAX];
         if (sp_notify_read_str(pid, args[0], target, sizeof(target)) <= 0) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[2], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
         if (guest[0] != '/') { sp_notify_continue(resp); return; }
@@ -2121,7 +2121,7 @@ int main(int argc, char **argv) {
             }
         }
         if (si >= 0 && (pfds[si].revents & POLLIN)) { char buf[64]; while (read(g_spipe[0], buf, sizeof buf) > 0) ; }
-        int nevents = 0;
+        int nevents = 0; (void)nevents;
         for (;;) {
             pid_t w = waitpid(-1, &status, WNOHANG);
             if (w < 0) {

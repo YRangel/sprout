@@ -280,6 +280,13 @@ static void sp_xcache_put(const char *g, const char *h) {
  * RTLD_NEXT syscalls keep us free of interposer recursion. */
 static int (*sp_real_lstat)(const char *, struct stat *) = NULL;
 static ssize_t (*sp_real_readlink)(const char *, char *, size_t) = NULL;
+/* -Wreturn-local-addr false-positive: every return path carries either
+ * caller storage (path/buf) or `buf`; `joined` only flows into buf via
+ * memcpy. GCC's points-to for the array params can't prove that. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wreturn-local-addr"
+#endif
 static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int follow_final) {
     /* Relative paths: hang onto the real cwd in HOST view, then run the
      * normal absolute translation (apk's db-write mix of absolute charm +
@@ -301,14 +308,29 @@ static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int 
     /* fast path: cache hit (covers the exec-chain hot loop). The cache is
      * chase-dependent, so only follow_final=1 results are cached/serve. */
     if (follow_final && sp_xcache_get(path, buf)) return buf;
-    const char *out = sp_translate(&g_cfg, path, buf) ? buf : path;
+    /* Materialize a joined relative path into the caller-owned buffer: a
+     * translate-decline here (passthrough prefix, e.g. guest /proc) would
+     * otherwise leave `out` pointing at this frame's stack — a dangling
+     * Heisenbug. */
+    const char *out;
+    if (path == joined) {
+        if (!sp_translate(&g_cfg, path, buf)) {
+            size_t jl = strlen(joined);
+            if (jl >= SP_PATH_MAX) { errno = ENAMETOOLONG; return NULL; }
+            memcpy(buf, joined, jl + 1);
+        }
+        out = buf;
+    } else {
+        out = sp_translate(&g_cfg, path, buf) ? buf : path;
+    }
     if (out != buf) return out;
     if (!follow_final) return out;
     static int l2s_off = -1;
     if (l2s_off < 0) l2s_off = getenv("SPROUT_DISABLE_L2S") ? 1 : 0;
     if (l2s_off) return out;
     char dir[SP_PATH_MAX], tmp[SP_PATH_MAX], lnk[SP_PATH_MAX];
-    for (int hop = 0; hop < 8; hop++) {
+    int hop;
+    for (hop = 0; hop < 8; hop++) {
         struct stat st;
         if (!sp_real_lstat) sp_real_lstat = dlsym(RTLD_NEXT, "lstat");
         if (!sp_real_lstat) break;
@@ -327,11 +349,16 @@ static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int 
             char *sl = strrchr(dir, '/');
             if (!sl) break;
             *sl = '\0';
-            snprintf(tmp, sizeof(tmp), "%s/%s", dir, lnk);
-            snprintf(buf, SP_PATH_MAX, "%s", tmp);
+            int w = snprintf(tmp, sizeof(tmp), "%s/%s", dir, lnk);
+            if (w <= 0 || (size_t)w >= sizeof(tmp)) break;
+            w = snprintf(buf, SP_PATH_MAX, "%s", tmp);
+            if (w <= 0 || (size_t)w >= SP_PATH_MAX) break;
         }
     }
-    sp_xcache_put(path, buf);
+    /* Cache only when no chase hop happened: a followed symlink target
+     * may rotate (ln -sf → rustup/npm) and the cache has no invalidation
+     * on guest mutations; pure path-prefix mappings never change. */
+    if (hop == 0) sp_xcache_put(path, buf);
     return buf;
 }
 static const char *sp_translate_x(const char *path, char buf[SP_PATH_MAX]) {
@@ -341,6 +368,10 @@ static const char *sp_translate_x(const char *path, char buf[SP_PATH_MAX]) {
  * lstat/unlink/rename/lutimes/... family: chasing would falsify the object
  * the syscall targets (e.g. utimensat(AT_SYMLINK_NOFOLLOW) hitting the link
  * TARGET instead of the link — breaks dpkg's symlink tar processing). */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 static const char *sp_translate_l(const char *path, char buf[SP_PATH_MAX]) {
     return sp_translate_xf(path, buf, 0);
 }
@@ -799,7 +830,7 @@ int mkstemp(char *tmpl) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(tmpl, x);
     char big[SP_PATH_MAX];
-    const char *use = tmpl;
+    char *use = tmpl;
     if (p != tmpl) {
         strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
         use = big;
@@ -825,7 +856,7 @@ int mkostemp(char *tmpl, int flags) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(tmpl, x);
     char big[SP_PATH_MAX];
-    const char *use = tmpl;
+    char *use = tmpl;
     if (p != tmpl) {
         strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
         use = big;
@@ -851,7 +882,7 @@ int mkstemp64(char *tmpl) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(tmpl, x);
     char big[SP_PATH_MAX];
-    const char *use = tmpl;
+    char *use = tmpl;
     if (p != tmpl) {
         strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
         use = big;
@@ -870,7 +901,7 @@ int mkostemp64(char *tmpl, int flags) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(tmpl, x);
     char big[SP_PATH_MAX];
-    const char *use = tmpl;
+    char *use = tmpl;
     if (p != tmpl) {
         strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
         use = big;
@@ -893,7 +924,7 @@ char *mkdtemp64(char *tmpl) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(tmpl, x);
     char big[SP_PATH_MAX];
-    const char *use = tmpl;
+    char *use = tmpl;
     if (p != tmpl) {
         strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
         use = big;
@@ -1282,7 +1313,7 @@ char *mkdtemp(char *tmpl) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(tmpl, x);
     char big[SP_PATH_MAX];
-    const char *use = tmpl;
+    char *use = tmpl;
     if (p != tmpl) {
         strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
         use = big;
