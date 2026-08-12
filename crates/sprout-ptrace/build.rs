@@ -37,5 +37,28 @@ fn main() {
         panic!("compiler failed building sprout-super: {status}");
     }
 
+    /* ADR-0016: the freestanding notify-statics parasite. No libc; the
+     * high image base keeps it from colliding with ET_EXEC guests. */
+    println!("cargo:rerun-if-changed=csrc/sprout_stub.c");
+    let stub = out_dir.join("sprout-stub");
+    let mut scmd = cc_tool.to_command();
+    scmd.arg("-static")
+        .arg("-nostdlib")
+        .arg("-nostartfiles")
+        .arg("-Os")
+        .arg("-fno-stack-protector")
+        .arg("-Wl,--image-base=0x70000000")
+        .arg("-Wl,--no-dynamic-linker")
+        .arg("-o")
+        .arg(&stub)
+        .arg("csrc/sprout_stub.c");
+    let sstatus = scmd
+        .status()
+        .unwrap_or_else(|e| panic!("failed to spawn stub compiler: {e}"));
+    if !sstatus.success() {
+        panic!("compiler failed building sprout-stub: {sstatus}");
+    }
+
     println!("cargo:rustc-env=SPROOT_PTRACE_EXE={}", exe.display());
+    println!("cargo:rustc-env=SPROUT_STUB_EXE={}", stub.display());
 }

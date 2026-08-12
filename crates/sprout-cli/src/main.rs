@@ -223,16 +223,23 @@ fn run() -> Result<u8, Error> {
         if rootfs.libc_flavor() == LibcFlavor::Musl {
             match class {
                 /* Static musl: direct exec under supervisor (translates) */
-                GuestClass::Static => LaunchPlan::supervisor(
-                    &rootfs,
-                    supervisor,
-                    program_host,
-                    &program_name,
-                    &cli.cmd[1..],
-                    cli.verbose,
-                    preload_so,
-                    &cache_dir,
-                )?,
+                GuestClass::Static => {
+                    let mut plan = LaunchPlan::supervisor(
+                        &rootfs,
+                        supervisor,
+                        program_host,
+                        &program_name,
+                        &cli.cmd[1..],
+                        cli.verbose,
+                        preload_so,
+                        &cache_dir,
+                    )?;
+                    /* ADR-0016: kind=1 lets the supervisor pick the
+                     * notify-statics lane (sprout-stub, no steady-state
+                     * ptrace) when the kernel supports it. */
+                    plan.env.push(("SPROUT_GUEST_KIND".into(), "1".into()));
+                    plan
+                }
                 /* Dynamic musl: loader-chain launch wrapped in supervisor (kind 3) */
                 _ => {
                     let pre = LaunchPlan::preload(
@@ -263,16 +270,27 @@ fn run() -> Result<u8, Error> {
                 )?;
                 LaunchPlan::supervise(pre, supervisor)
             }
-            _ => LaunchPlan::supervisor(
-                &rootfs,
-                supervisor,
-                program_host,
-                &program_name,
-                &cli.cmd[1..],
-                cli.verbose,
-                preload_so,
-                &cache_dir,
-            )?,
+            _ => {
+                let mut plan = LaunchPlan::supervisor(
+                    &rootfs,
+                    supervisor,
+                    program_host,
+                    &program_name,
+                    &cli.cmd[1..],
+                    cli.verbose,
+                    preload_so,
+                    &cache_dir,
+                )?;
+                /* ADR-0016: kind=1 lets the supervisor pick the
+                 * notify-statics lane (sprout-stub, no steady-state
+                 * ptrace) when the kernel supports it. Go statics also
+                 * take the Static class (no PT_INTERP): the supervisor
+                 * distinguishes 1/2 itself if ever needed. */
+                if matches!(class, GuestClass::Static) {
+                    plan.env.push(("SPROUT_GUEST_KIND".into(), "1".into()));
+                }
+                plan
+            }
             }
         }
     } else {

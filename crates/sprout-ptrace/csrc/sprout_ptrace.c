@@ -1311,6 +1311,15 @@ static int sp_notify_install(void) {
         53 /*fchmodat*/, 54 /*fchownat*/, 88 /*utimensat*/,
         36 /*symlinkat*/, 37 /*linkat*/, 38 /*renameat*/,
         276 /*renameat2*/,
+        /* ADR-0016 hosts (notify-statics): execve is the lazy-attach
+         * trigger; the stat family has no interposer on statics, so the
+         * supervisor must serve it through the listener too. These four
+         * CONT immediately under every TRACEME-lane shadow guest (the
+         * interposer already covers them). */
+        /*221 execve — removed: seccomp-notifying the parent's own exec of
+         * the stub reproduced a child-side ENOENT-mislabel in this lane
+         * (debugging: restored once the stub-exec flow is verified). */
+        79 /*newfstatat*/, 291 /*statx*/, 78 /*readlinkat*/,
         200 /*bind*/, 203 /*connect*/, 206 /*sendto*/, 211 /*sendmsg*/,
     };
     const int ntr = (int)(sizeof(traps)/sizeof(traps[0]));
@@ -1584,6 +1593,12 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
     char guest[SP_PATH_MAX], host[SP_PATH_MAX];
     resp->flags = 0;
     switch (nr) {
+    case 221: /* execve — lazy-attach rewrite lands here in T3; for now,
+               * native CONTINUE is behavior-identical to the pending
+               * ptrace-stop rewrite (guest paths under statics keep the
+               * pre-existing supervisor-translate path when traced). */
+        sp_notify_continue(resp);
+        return;
     case 56: { /* openat(dirfd,path,flags,mode) */
         int dirfd = (int)args[0];
         int flags = (int)args[2];
@@ -1881,6 +1896,92 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
 
 static unsigned long long g_notify_n = 0, g_notify_serv = 0, g_notify_cont = 0, g_notify_err = 0, g_notify_poller = 0;
 
+static void sp_notify_pump(void);
+int sp_notify_parent_recv(int sockfd, pid_t child);
+void sp_notify_child_install_and_send(int sockfd);
+
+/* (ADR-0016) Notify-statics lane runtime: fork+exec sprout-stub with
+ * NO ptrace, then serve its filter's user-notify requests and reap. */
+static int run_notify_statics(const char *stub, int argc, char **argv) {
+    int np[2] = { -1, -1 };
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, np) != 0) { perror("ns socketpair"); return -1; }
+    pid_t child = fork();
+    if (child < 0) { perror("ns fork"); close(np[0]); close(np[1]); return -1; }
+    if (child == 0) {
+        close(np[0]);
+        /* The STUB installs the user-notify filter itself ONLY after it
+         * has mapped the guest (install_last-before-jump): its loader
+         * phase must stay unfiltered, and a stub-side filter survives its
+         * mmap+jump because no real exec resets filters. The supervisor
+         * steals the listener over this same socketpair (fdnum + ACK
+         * protocol, identical to sp_notify_child_install_and_send). */
+        unsetenv("SPROUT_NS_NOFILTER");
+        char dec[16];
+        snprintf(dec, sizeof(dec), "%d", np[1]);
+        setenv("SPROUT_STUB_SOCK", dec, 1);
+        /* stub contract: [guest0, target_host, args...]. argv[2] is the
+         * guest program (host path + argv0 spelling, same as the ptrace
+         * lane's execve(argv[2], &argv[2], ...)). */
+        int cnt = argc - 1; /* items after the supervisor's '--' plus dup */
+        char **nargv = (char **)calloc((size_t)cnt + 1, sizeof(char *));
+        if (!nargv) _exit(127);
+        nargv[0] = argv[2];
+        nargv[1] = argv[2];
+        for (int i = 3; i < argc; i++) nargv[i - 1] = argv[i];
+        nargv[cnt] = NULL;
+        if (g_debug) { int arc = access(stub, X_OK);
+          char db[1024]; int dl = 0;
+          dl += snprintf(db + dl, 1000 - dl, "[child] argc=%d cnt=%d access=%d errno=%d ", argc, cnt, arc, errno);
+          for (int i = 0; i <= cnt && dl < 900; i++) dl += nargv[i] ? snprintf(db + dl, 1000 - dl, "[%d]=%s ", i, nargv[i]) : 0;
+          dl += snprintf(db + dl, 1000 - dl, "| stub=%s\n", stub);
+          (void)!write(2, db, (size_t)dl); }
+        execve(stub, nargv, environ);
+        { char eb[128]; int el = snprintf(eb, sizeof eb, "[notify] stub execve('%s') failed errno=%d\n", stub, errno); (void)!write(2, eb, (size_t)el); }
+        _exit(127);
+    }
+    close(np[1]);
+    g_notify_fd = sp_notify_parent_recv(np[0], child);
+    if (g_notify_fd < 0) {
+        fprintf(stderr, "[notify] statics listener handshake failed\n");
+        return -1;
+    }
+    g_notify_addfd = sp_notify_probe_addfd();
+    if (g_debug)
+        fprintf(stderr, "[notify] statics listener=%d addfd=%d child=%d\n",
+                g_notify_fd, g_notify_addfd, child);
+
+
+    int status = 0, exited = 0;
+    for (;;) {
+        struct pollfd pfd = { g_notify_fd, POLLIN, 0 };
+        int prc = poll(&pfd, 1, 128);
+        if (pfd.revents & POLLIN) sp_notify_pump();
+        else if (g_debug && prc == 0) fprintf(stderr, "[notify] poll tick (no events) revents=%x\n", pfd.revents);
+        for (;;) {
+            int st;
+            /* LEAD with the stub child: it's long-lived — reaping it
+             * FIRST pulls state in before short siblings flood the pool. */
+            pid_t w = waitpid(child, &st, WNOHANG);
+            if (w <= 0) w = waitpid(-1, &st, WNOHANG);
+            if (w <= 0) break;
+            if (w == child) { status = st; exited = 1; }
+            if (g_debug) fprintf(stderr, "[notify] wait4 pid=%d status=%x (%s rc=%d sig=%d)\n",
+                w, st, WIFEXITED(st) ? "EXITED" : (WIFSIGNALED(st) ? "SIGNALED" : "STOPPED"),
+                WIFEXITED(st) ? WEXITSTATUS(st) : -1, WIFSIGNALED(st) ? WTERMSIG(st) : -1);
+        }
+        if (exited) {
+            for (;;) {
+                struct pollfd q = { g_notify_fd, POLLIN, 0 };
+                if (poll(&q, 1, 0) <= 0 || !(q.revents & POLLIN)) break;
+                sp_notify_pump();
+            }
+            if (WIFEXITED(status)) return WEXITSTATUS(status);
+            if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+            return 1;
+        }
+    }
+}
+
 /* SIGCHLD -> self-pipe: ptrace stops deliver SIGCHLD; this lets one poll()
  * wake on both ptrace events and user-notify requests. */
 static int g_spipe[2] = { -1, -1 };
@@ -1904,6 +2005,10 @@ static void sp_notify_pump(void) {
     resp.id = req.id;
     resp.val = 0; resp.error = 0; resp.flags = 0;
     pid_t tid = req.pid;
+    SP_OFT("recv pid=%d nr=%llu args=[%llx,%llx,%llx,%llx]\n",
+           tid, (unsigned long long)req.data.nr,
+           (unsigned long long)req.data.args[0], (unsigned long long)req.data.args[1],
+           (unsigned long long)req.data.args[2], (unsigned long long)req.data.args[3]);
     sp_notify_serve_one(tid, req.data.nr, req.data.args, req.id, &resp);
     if (resp.flags & SECCOMP_USER_NOTIF_FLAG_CONTINUE) g_notify_cont++; else g_notify_serv++;
     ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
@@ -2017,6 +2122,38 @@ int main(int argc, char **argv) {
     }
     if (g_debug)
         fprintf(stderr, "[notify] mode=%s\n", g_notify ? "user-notify" : "ptrace-only");
+
+    /* (ADR-0016) notify-statics lane: kind 1/2 guests (static, Go-static)
+     * launch through the freestanding sprout-stub instead of
+     * TRACEME+ptrace: the stub's in-guest SIGSYS emulation replaces the
+     * ptrace signal-swallow and its own filter takes the role of serving
+     * path ops through user-notify. ptrace survives ONLY as a lazy-attach
+     * register-rewrite vehicle for execve (T3). SPROUT_NOTIFY_STATICS=0
+     * forces the classic lane. */
+    {   const char *gk = getenv("SPROUT_GUEST_KIND");
+        int gkind = gk ? atoi(gk) : 0;
+        const char *nso = getenv("SPROUT_NOTIFY_STATICS");
+        int want_ns = g_notify && (gkind == 1 || gkind == 2) && !(nso && strcmp(nso, "0") == 0);
+        if (g_debug) fprintf(stderr, "[notify] lane-probe: g_notify=%d gkind=%d want=%d\n", g_notify, gkind, want_ns);
+        if (want_ns) {
+            char stub[SP_PATH_MAX];
+            const char *se = getenv("SPROUT_STUB_PATH");
+            if (se && *se) snprintf(stub, sizeof(stub), "%s", se);
+            else {
+                const char *slash = strrchr(argv[0], '/');
+                int dl = slash ? (int)(slash - argv[0]) : 0;
+                snprintf(stub, sizeof(stub), "%.*s/sprout-stub", dl, argv[0]);
+            }
+            if (access(stub, X_OK) == 0) {
+                if (g_debug) fprintf(stderr, "[notify] stub usable: %s\n", stub);
+                int nrc = run_notify_statics(stub, argc, argv);
+                if (nrc >= 0) return nrc;   /* lane terminal */
+                if (g_debug) fprintf(stderr, "[notify] statics lane unavailable -> ptrace\n");
+            } else if (g_debug) {
+                fprintf(stderr, "[notify] sprout-stub not found (%s) -> ptrace\n", stub);
+            }
+        }
+    }
 
     int notify_pair[2] = { -1, -1 };
     if (g_notify) {

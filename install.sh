@@ -32,6 +32,7 @@ SP=$(pick sprout bin)
 MS=$(pick libsprout-core-musl.so)
 SO=$(pick libsprout-core.so)
 PX=$(pick sprout-super); [ -n "$PX" ] || PX=$(pick sprout-ptrace)
+PS=$(pick sprout-stub)
 
 missing=""
 [ -n "$SP" ] || missing="$missing sprout"
@@ -49,6 +50,7 @@ cp "$SP" "$DEST/sprout"
 cp "$SO" "$DEST/libsprout-core.so"
 cp "$PX" "$DEST/sprout-super"
 ln -sf sprout-super "$DEST/sprout-ptrace"  # legacy name (fastfetch-style comm reads, scripts)
+[ -n "$PS" ] && { cp "$PS" "$DEST/sprout-stub"; chmod 755 "$DEST/sprout-stub"; }
 if [ -n "$MS" ]; then cp "$MS" "$DEST/libsprout-core-musl.so"; fi
 chmod 755 "$DEST/sprout" "$DEST/sprout-super"
 echo "installed sprout + libsprout-core.so + sprout-super ${MS:++ libsprout-core-musl.so} -> $DEST"
