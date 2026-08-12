@@ -82,7 +82,19 @@
  * Unknown traps are still forwarded to the tracee with the original
  * signal so we don't silently mask real seccomp policy. */
 /* Base table (all guests): glibc tolerates ENOSYS for these two init calls. */
-static const long SP_EMULATE_BASE[] = { 99 /*set_robust_list*/, 293 /*rseq*/ };
+/* SIGSYS emulation table {sysno, fabricated x0}. Success-emulation for
+ * the flag-set family (glibc/startup probes), -ENOSYS for anything that
+ * callers must FALL BACK from honestly (io_uring: libuv probes support by
+ * calling it — success would make the guest take a broken fast path). */
+typedef struct { long sys; long ret; } sp_emul_rule;
+static const sp_emul_rule SP_EMULATE_BASE[] = {
+    { 99,  0 },    /* set_robust_list */
+    { 293, 0 },    /* rseq */
+    { 425, -38 },  /* io_uring_setup    -> -ENOSYS */
+    { 426, -38 },  /* io_uring_enter    -> -ENOSYS */
+    { 427, -38 },  /* io_uring_register -> -ENOSYS */
+    { 439, -38 },  /* faccessat2 raw callers -> -ENOSYS (libc falls back) */
+};
 /* Musl extra: faccessat init-poll + Android-blocked set*id family — the
  * "already at minimal privilege" truth of a rootless sandbox. Applied at
  * signal-stop level for musl-flavored tracees (kind 3, dynamic -of-musl),
@@ -120,10 +132,16 @@ typedef struct {
     /* -1 = not yet classified at exec event, 0 = dynamic (preload governs),
      * 1 = static: no LD_PRELOAD possible, supervisor must translate. */
     int   static_kind;
+    /* 1 = interposed image (guest libc + LD_PRELOAD inside): the interposer
+     * translates paths; the supervisor only emulates SIGSYS victims and
+     * watches exec events. SHADOW tracees free-run via PTRACE_CONT — no
+     * per-syscall stop, so glibc apps keep fast-path perf. */
+    int   shadow;
 } tracee_t;
 
 static tracee_t g_tracees[SP_MAX_TRACEES];
 static sp_config_t g_cfg;
+static int g_shadow = 0;               /* SPROUT_SHADOW: root image starts shadowed */
 
 /* Loader-chain context for rewriting static→dynamic execve (empty-/lib64
  * guest rootfs cannot satisfy PT_INTERP on the host). Provided by the CLI
@@ -667,7 +685,10 @@ static int translate_reg_path(tracee_t *t, pid_t pid, struct user_pt_regs *r, in
     }
     size_t hl = strlen(host);
     if (hl >= SP_SCRATCH_CAP) return 0;
-    unsigned long long scratch = (unsigned long long)r->sp - SP_SCRATCH_BELOW_SP;
+    /* per-argument scratch slot: two-pathname syscalls (linkat/renameat)
+     * translate BOTH paths and the strings must coexist at kernel time. */
+    unsigned long long scratch = (unsigned long long)r->sp - SP_SCRATCH_BELOW_SP
+                                 - ((unsigned long long)argi * SP_SCRATCH_CAP);
     /* probe mapped-ness of the scratch page first */
     errno = 0;
     if (ptrace(PTRACE_PEEKDATA, pid, (void *)scratch, NULL) == -1 && errno) return 0;
@@ -722,32 +743,36 @@ static sp_syscall_view sp_view_syscall(pid_t pid, struct user_pt_regs *regs) {
 /* On aarch64, GET_SYSCALL_INFO arguments: for ENTRY the six args are at
  * indices 0..5 and syscall nr at 6. arg0 is in x0. */
 /* dirfd-at-family syscalls whose pathname argument we translate for
- * STATIC tracees: {sysno, dirfd_argi, path_argi}. dirfd_argi == -1 means
- * there is no dirfd (path arg is standalone, e.g. execve/chdir). A real
- * dirfd (>= 0) skips translation: the fd was opened previously and the
- * kernel resolves relative to it. */
-typedef struct { long sysno; int dirfd_argi; int path_argi; const char *name; } sp_path_rule;
+ * STATIC tracees: {sysno, dirfd_argi, path_argi, dirfd2_argi, path2_argi}.
+ * dirfd_argi == -1 means there is no dirfd (path arg is standalone, e.g.
+ * execve/chdir). A real dirfd (>= 0) skips translation: the fd was opened
+ * previously and the kernel resolves relative to it. Two-pathname syscalls
+ * (linkat/renameat/renameat2) translate BOTH path args, each gated on its
+ * own dirfd. */
+typedef struct { long sysno; int dirfd_argi; int path_argi; int dirfd2_argi; int path2_argi; const char *name; } sp_path_rule;
 static const sp_path_rule SP_PATH_RULES[] = {
-    { SYS_openat,      0, 1, "openat"      },
-    { SYS_openat2,     0, 1, "openat2"     },
-    { SYS_newfstatat,  0, 1, "newfstatat"  },
-    { SYS_faccessat,   0, 1, "faccessat"   },
-    { SYS_faccessat2,  0, 1, "faccessat2"  },
-    { SYS_readlinkat,  0, 1, "readlinkat"  },
-    { SYS_statx,       0, 1, "statx"       },
-    { 34 /*mkdirat*/,  0, 1, "mkdirat"     },
-    { 35 /*unlinkat*/, 0, 1, "unlinkat"    },
-    { 33 /*mknodat*/,  0, 1, "mknodat"     },
-    { 53 /*fchmodat*/, 0, 1, "fchmodat"    },
-    { 54 /*fchownat*/, 0, 1, "fchownat"    },
-    { 88 /*utimensat*/,0, 1, "utimensat"   },
-    { 36 /*symlinkat*/,   -1, 1, "symlinkat.linkpath" }, /* arg1 only: target is written literally */
-    { 37 /*linkat*/,       0, 1, "linkat.oldpath"       },
-    { 38 /*renameat*/,     0, 1, "renameat.oldpath"     },
-    { 276/*renameat2*/,    0, 1, "renameat2.oldpath"    },
-    { 49 /*chdir*/,       -1, 0, "chdir"     },
-    { SYS_execve,     -1, 0, "execve"      },
-    { SYS_execveat,    0, 1, "execveat"    },
+    { SYS_openat,      0, 1, -1, -1, "openat"      },
+    { SYS_openat2,     0, 1, -1, -1, "openat2"     },
+    { SYS_newfstatat,  0, 1, -1, -1, "newfstatat"  },
+    { SYS_faccessat,   0, 1, -1, -1, "faccessat"   },
+    { SYS_faccessat2,  0, 1, -1, -1, "faccessat2"  },
+    { SYS_readlinkat,  0, 1, -1, -1, "readlinkat"  },
+    { SYS_statx,       0, 1, -1, -1, "statx"       },
+    { 34 /*mkdirat*/,  0, 1, -1, -1, "mkdirat"     },
+    { 35 /*unlinkat*/, 0, 1, -1, -1, "unlinkat"    },
+    { 33 /*mknodat*/,  0, 1, -1, -1, "mknodat"     },
+    { 53 /*fchmodat*/, 0, 1, -1, -1, "fchmodat"    },
+    { 54 /*fchownat*/, 0, 1, -1, -1, "fchownat"    },
+    { 88 /*utimensat*/,0, 1, -1, -1, "utimensat"   },
+    /* two-arg semantics: only the linkpath translates (target written
+     * literally); oldpath gating on its own dirfd, same for newpath. */
+    { 36 /*symlinkat*/,   1, 2, -1, -1, "symlinkat.linkpath" },
+    { 37 /*linkat*/,       0, 1, 2, 3, "linkat"            },
+    { 38 /*renameat*/,     0, 1, 2, 3, "renameat"          },
+    { 276/*renameat2*/,    0, 1, 2, 3, "renameat2"         },
+    { 49 /*chdir*/,       -1, 0, -1, -1, "chdir"     },
+    { SYS_execve,     -1, 0, -1, -1, "execve"      },
+    { SYS_execveat,    0, 1, -1, -1, "execveat"    },
 };
 
 /* ---- AF_UNIX pathname translation (ADR-0010) -------------------------- */
@@ -1125,31 +1150,30 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
         t->rev_sysno = t->rev_addr ? sysno : 0;
     }
 
+    struct user_pt_regs rchk;
+    struct iovec iovchk = { &rchk, sizeof(rchk) };
+    int regs_valid = 0, regs_dirty = 0;
     for (size_t i = 0; i < sizeof(SP_PATH_RULES)/sizeof(*SP_PATH_RULES); i++) {
         const sp_path_rule *rule = &SP_PATH_RULES[i];
         if (rule->sysno != sysno) continue;
-        if (rule->dirfd_argi >= 0) {
-            /* dirfd = regs[rule->dirfd_argi]; only AT_FDCWD translates
-             * (real dirfds resolve in kernel space against an fd whose
-             * path we don't mirror). GSI already filed regs; we re-fetch
-             * lazily only when a rule matched. */
-            struct user_pt_regs rchk;
-            struct iovec iovchk = { &rchk, sizeof(rchk) };
+        if (!regs_valid) {
             if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovchk) != 0) return;
-            if ((int)rchk.regs[rule->dirfd_argi] != AT_FDCWD_VAL) return;
-
-            int changed = translate_reg_path(t, pid, &rchk, rule->path_argi, rule->name);
-            if (changed)
-                ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovchk);
-        } else {
-            struct user_pt_regs rchk;
-            struct iovec iovchk = { &rchk, sizeof(rchk) };
-            if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovchk) != 0) return;
-            if (translate_reg_path(t, pid, &rchk, rule->path_argi, rule->name))
-                ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovchk);
+            regs_valid = 1;
         }
-        return; /* one rule per sysno */
+        /* first pathname clause: dirfd-AT_FDCWD gated (a real dirfd
+         * resolves in kernel space against an fd we don't mirror) */
+        if (rule->dirfd_argi < 0 || (int)rchk.regs[rule->dirfd_argi] == AT_FDCWD_VAL) {
+            if (translate_reg_path(t, pid, &rchk, rule->path_argi, rule->name))
+                regs_dirty = 1;
+        }
+        /* optional second pathname (linkat/renameat/renameat2 newpath) */
+        if (rule->path2_argi >= 0 &&
+            (rule->dirfd2_argi < 0 || (int)rchk.regs[rule->dirfd2_argi] == AT_FDCWD_VAL)) {
+            if (translate_reg_path(t, pid, &rchk, rule->path2_argi, rule->name))
+                regs_dirty = 1;
+        }
     }
+    if (regs_dirty) ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovchk);
 }
 
 int main(int argc, char **argv) {
@@ -1170,6 +1194,12 @@ int main(int argc, char **argv) {
     g_guestpreload = getenv("SPROUT_GUEST_PRELOAD");
     { const char *k = getenv("SPROUT_LIBC"); g_libc_kind = (k && strcmp(k, "musl") == 0) ? SP_LIBC_MUSL : 0; }
     g_rootfs = getenv("SPROUT_ROOTFS");
+    g_shadow = getenv("SPROUT_SHADOW") != NULL && g_libc_kind != SP_LIBC_MUSL;
+    /* Interposed grandchildren of this supervisor (preload chain) learn
+     * from SPROUT_SUPERVISED that static execs need NO fresh sprout-ptrace
+     * chain — exec them directly and the ptrace estate reclassifies on
+     * PTRACE_EVENT_EXEC into full translation mode. */
+    setenv("SPROUT_SUPERVISED", "1", 1);
 
     /* Host env first; also empty bionic LD_* so the supervisor itself
      * doesn't get tangled in bionic dynamic-linker state. */
@@ -1198,6 +1228,7 @@ int main(int argc, char **argv) {
                PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL) < 0) {
         perror("PTRACE_SETOPTIONS"); return 1;
     }
+    { tracee_t *rt = find_or_add(child); if (rt && g_shadow) rt->shadow = 1; }
     if (ptrace(PTRACE_SYSCALL, child, 0, 0) < 0) { perror("PTRACE_SYSCALL"); return 1; }
 
     int status = 0;
@@ -1269,16 +1300,17 @@ int main(int argc, char **argv) {
                             w, (long long)r.regs[8], r.regs[8], v.nr,
                             (unsigned long long)r.pc);
                 int use_musl_extra = (t->static_kind == 3) || (g_libc_kind == SP_LIBC_MUSL);
+                long emul_ret = 0;
                 for (size_t i = 0; i < sizeof(SP_EMULATE_BASE)/sizeof(*SP_EMULATE_BASE) && !emulated; i++) {
-                    if ((long)r.regs[8] == SP_EMULATE_BASE[i]) emulated = 1;
+                    if ((long)r.regs[8] == SP_EMULATE_BASE[i].sys) { emulated = 1; emul_ret = SP_EMULATE_BASE[i].ret; }
                 }
                 if (!emulated && use_musl_extra) {
                     for (size_t i = 0; i < sizeof(SP_EMULATE_MUSL_EXTRA)/sizeof(*SP_EMULATE_MUSL_EXTRA); i++) {
-                        if ((long)r.regs[8] == SP_EMULATE_MUSL_EXTRA[i]) { emulated = 1; break; }
+                        if ((long)r.regs[8] == SP_EMULATE_MUSL_EXTRA[i]) { emulated = 1; emul_ret = 0; break; }
                     }
                 }
                 if (emulated) {
-                    r.regs[0] = 0;
+                    r.regs[0] = (unsigned long long)(long long)emul_ret;
                     ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
                     if (g_debug)
                         fprintf(stderr, "[ptrace] %d SIGSYS swallowed: sysno=%llu emulated ok\n",
@@ -1286,11 +1318,12 @@ int main(int argc, char **argv) {
                 }
             }
             /* swallow or deliver */
-            ptrace(PTRACE_SYSCALL, w, 0, emulated ? (void *)0 : (void *)(long)sig);
+            ptrace(t->shadow ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, emulated ? (void *)0 : (void *)(long)sig);
             continue;
         }
 
         if (sig == (SIGTRAP | 0x80)) {  /* syscall-stop */
+            if (t->shadow) goto cont;   /* shadow tracees: no syscall stops; defensive */
             struct user_pt_regs r;
             struct iovec iov = { &r, sizeof(r) };
             if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &iov) != 0) goto cont;
@@ -1325,17 +1358,33 @@ int main(int argc, char **argv) {
                 int kind = classify_tracee_image(w);
                 if (kind >= 0) {
                     t->static_kind = kind;
+                    /* re-evaluate shadow for the new image: only glibc-
+                     * dynamic-interposed (kind 0) stays shadowed; statics
+                     * and Go need full syscall translation again. Musl
+                     * never shadows (ADR-0009: supervisor-only). */
+                    t->shadow = g_shadow && kind == 0 && g_libc_kind != SP_LIBC_MUSL;
                     if (g_debug)
                         SP_TRACE("[%d] exec event: image is %s\n", w,
                                  sp_kind_name(kind));
                 }
+            } else if (ev == (unsigned int)PTRACE_EVENT_FORK ||
+                       ev == (unsigned int)PTRACE_EVENT_VFORK ||
+                       ev == (unsigned int)PTRACE_EVENT_CLONE) {
+                unsigned long long np = 0;
+                if (ptrace(PTRACE_GETEVENTMSG, w, 0, &np) == 0 && np) {
+                    tracee_t *c = find_or_add((pid_t)np);
+                    if (c) c->shadow = t->shadow;   /* inherits; exec-stop re-classifies */
+                }
             }
             goto cont;
         }
-        ptrace(PTRACE_SYSCALL, w, 0, (void *)(long)sig);
+        /* never re-inject SIGSTOP: clone-stops deliver SIGSTOP as the
+         * *initial* stop reason; forwarding it back freezes the child. */
+        ptrace(PTRACE_SYSCALL /* EXP: shadow same-mode */, w, 0,
+               sig == SIGSTOP ? (void *)0 : (void *)(long)sig);
         continue;
     cont:
-        ptrace(PTRACE_SYSCALL, w, 0, 0);
+        ptrace(t->shadow ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, 0);
     }
     return 0;
 }

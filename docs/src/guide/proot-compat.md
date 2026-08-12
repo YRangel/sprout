@@ -9,7 +9,7 @@ is a no-op. The table is sorted by how `proot-distro login` uses flags.
 | `-b <host>[:<guest>]` | `-b <host>[:<guest>]` | ✅ v0.1 (repeatable) |
 | `-0` | `-0` / `--root-id` | ✅ v0.1 |
 | `-w <dir>` | `-w <dir>` / `--cwd` | ✅ v0.1 |
-| `--link2symlink` | `--link2symlink` | env-plumbed; `link()` shim v0.2 |
+| `--link2symlink` | `--link2symlink` | ✅ v0.4.3+ back-of-the-envelope: `link()`/`linkat()`/fake-chown EACCES/EPERM → symlinks; dpkg status-old, /var etc usable without -0 |
 | `-q <qemu>` | — | intentionally unsupported (host is native aarch64) |
 | `-i <id>` | implicit (always the launcher uid) | ✅ equivalent |
 | `--kernel-release` | -- | untracked; guests see host kernel |
@@ -17,6 +17,27 @@ is a no-op. The table is sorted by how `proot-distro login` uses flags.
 | `--root-id` | `-0` | alias |
 | `--verbose <n>` | `-v` / `--verbose` | sprout is less chattery by design |
 | `--help` / `--version` | same | ✅ |
+
+## apt/dpkg runtime compatibility (v0.4.3+)
+
+Full cycle `apt-get update` / `apt-get install <pkg>` is verified working
+inside sprout. Like proot, this needs the special pieces of the stack:
+
+- dpkg-deb's rename/linkat-style staging needs rewrites; the interposer
+  adds renameat / renameat2 / link / linkat / symlinkat
+- `/bin/sh` Post-Invoke scripts use execvp() — our wrapper rewrites them
+- apt's sqv verification stage needs mkstemp(), mkdtemp() and tmpfile()
+  wrapping so its `/tmp/apt.sig.XXXXXX` style staging lands in the shared
+  tmp bind, not the host /tmp
+- `--link2symlink` passes proot semantics: chown() reports success without
+  touching inodes, and hardlink clones of artifacts become symlinks
+- Debian's Alpine trigger side (`busybox r31.trigger`) uses the same
+  `execvp` chain and the DB write uses chmod fake-passing
+
+sqv staging `mkstemp`-backed, chmod fake-passing, execvp() chain covers
+the Post-Invoke shell — users don't need any special flags:
+`sprout -r <debian> apt-get update` works out of the box, no proot-distro
+plugin needed.
 
 ## Differences worth knowing
 

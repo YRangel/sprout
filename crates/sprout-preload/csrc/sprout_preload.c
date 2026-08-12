@@ -280,11 +280,13 @@ static void sp_xcache_put(const char *g, const char *h) {
  * RTLD_NEXT syscalls keep us free of interposer recursion. */
 static int (*sp_real_lstat)(const char *, struct stat *) = NULL;
 static ssize_t (*sp_real_readlink)(const char *, char *, size_t) = NULL;
-static const char *sp_translate_x(const char *path, char buf[SP_PATH_MAX]) {
-    /* fast path: cache hit (covers the exec-chain hot loop) */
-    if (sp_xcache_get(path, buf)) return buf;
+static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int follow_final) {
+    /* fast path: cache hit (covers the exec-chain hot loop). The cache is
+     * chase-dependent, so only follow_final=1 results are cached/serve. */
+    if (follow_final && sp_xcache_get(path, buf)) return buf;
     const char *out = sp_translate(&g_cfg, path, buf) ? buf : path;
     if (out != buf) return out;
+    if (!follow_final) return out;
     static int l2s_off = -1;
     if (l2s_off < 0) l2s_off = getenv("SPROUT_DISABLE_L2S") ? 1 : 0;
     if (l2s_off) return out;
@@ -314,6 +316,16 @@ static const char *sp_translate_x(const char *path, char buf[SP_PATH_MAX]) {
     }
     sp_xcache_put(path, buf);
     return buf;
+}
+static const char *sp_translate_x(const char *path, char buf[SP_PATH_MAX]) {
+    return sp_translate_xf(path, buf, 1);
+}
+/* l-variant: translate but NEVER chase the final component. Required by the
+ * lstat/unlink/rename/lutimes/... family: chasing would falsify the object
+ * the syscall targets (e.g. utimensat(AT_SYMLINK_NOFOLLOW) hitting the link
+ * TARGET instead of the link — breaks dpkg's symlink tar processing). */
+static const char *sp_translate_l(const char *path, char buf[SP_PATH_MAX]) {
+    return sp_translate_xf(path, buf, 0);
 }
 
 /* open-family: const char* path */
@@ -447,6 +459,601 @@ int faccessat(int dirfd, const char *path, int mode, int flags) {
     return sp_emulate_access_impl(dirfd, p, mode, flags, flags & AT_EACCESS);
 }
 
+/* glibc also exports its internal nocancel-style open symbols; libc modules
+ * that bypass the public PLT (notably libnss_dns reading /etc/resolv.conf,
+ * and the nsswitch engine reading /etc/nsswitch.conf) call THOSE. Without
+ * interception the DNS resolver falls back to nameserver 127.0.0.1 — i.e.,
+ * Android-loopback stays silent and every apt getter EAI_AGAINs. */
+int __open64_nocancel(const char *path, int flags, ...) {
+    static int (*SP_REAL(__open64_nocancel))(const char *, int, ...) = NULL;
+    SP_RESOLVE(__open64_nocancel);
+    if (!SP_REAL(__open64_nocancel)) SP_REAL(__open64_nocancel) = dlsym(RTLD_NEXT, "open64"); /* musl fallback */
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("__open64_nocancel", path, p);
+    return SP_REAL(__open64_nocancel)(p, flags, mode);
+}
+
+int __openat64_nocancel(int dirfd, const char *path, int flags, ...) {
+    static int (*SP_REAL(__openat64_nocancel))(int, const char *, int, ...) = NULL;
+    SP_RESOLVE(__openat64_nocancel);
+    if (!SP_REAL(__openat64_nocancel)) SP_REAL(__openat64_nocancel) = dlsym(RTLD_NEXT, "openat64");
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("__openat64_nocancel", path, p);
+    return SP_REAL(__openat64_nocancel)(dirfd, p, flags, mode);
+}
+
+/* glibc's actual filepath reach-in for resolver configs uses the public-ish
+ * __open64 / __openat64 channels in most builds. */
+/* ---------------- stub DNS client + getaddrinfo family ----------------
+ * glibc's resolver (nss_dns) reads /etc/resolv.conf through *libc-internal*
+ * opens we cannot interpose (verified: LD_DEBUG=bindings shows NO symbol
+ * involvement); guest apt/python/curl then falls back to nameserver
+ * 127.0.0.1 (host loopback, silent) => EAI_AGAIN everywhere.
+ * musl's resolver reads through *exported* fopen — already works.
+ * This section intercepts the public resolution entry points for glibc,
+ * parses the guest resolv.conf through OUR translated paths, and performs
+ * a real stub DNS exchange — answers are live, no fabrication.
+ */
+#undef AF_INET
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+static char *sp_dns_strdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+#define SP_AI_BRAND 0x7370726f  /* 'spro' — marks addrinfo chains we own */
+
+/* read up to 4 nameserver IPs from the guest's resolv.conf */
+static int sp_dns_servers(struct in_addr out[4]) {
+    char pb[SP_PATH_MAX];
+    const char *path = sp_translate_x("/etc/resolv.conf", pb);
+    FILE *f = fopen(path, "r");   /* wrapper -> translated */
+    if (!f) return 0;
+    char line[256];
+    int n = 0;
+    while (n < 4 && fgets(line, sizeof(line), f)) {
+        char ip[64];
+        if (sscanf(line, " nameserver%*[ \t]%63s", ip) == 1)
+            if (inet_aton(ip, &out[n]) != 0) n++;
+    }
+    fclose(f);
+    if (n == 0) {
+        inet_aton("8.8.8.8", &out[0]);
+        inet_aton("8.8.4.4", &out[1]);
+        n = 2;
+    }
+    return n;
+}
+
+struct sp_dns_hdr { uint16_t id, flags, qd, an, ns, ar; };
+#define SP_DNS_TXT_LEN 512
+
+static int sp_dns_encode(char *dst, const char *host, uint16_t qtype, uint16_t id) {
+    struct sp_dns_hdr *h = (struct sp_dns_hdr *)dst;
+    memset(dst, 0, SP_DNS_TXT_LEN);
+    h->id = htons(id);
+    h->flags = htons(0x0100); /* RD */
+    h->qd = htons(1);
+    char *w = dst + 12;
+    const char *p = host, *lv = p;
+    for (;;) {
+        if (*p == '.' || *p == 0) {
+            size_t l = (size_t)(p - lv);
+            if (l == 0) break;
+            if (l > 63) return -1;
+            *w++ = (char)l; memcpy(w, lv, l); w += l;
+            lv = p + 1;
+        }
+        if (*p == 0) break;
+        p++;
+    }
+    *w++ = 0;
+    uint16_t *qt = (uint16_t *)w;
+    *qt++ = htons(qtype);
+    *qt++ = htons(1); /* IN */
+    return (int)((char *)qt - dst);
+}
+
+/* crude answer walker: skip CNAME chains, return first A or AAAA rdata */
+static int sp_dns_extract(const char *bufv, ssize_t nread, int want_v6,
+                          struct in_addr a4[8], int *na4,
+                          struct in6_addr a6[8], int *na6) {
+    const unsigned char *buf = (const unsigned char *)bufv;
+    if (nread < 12) return -1;
+    struct sp_dns_hdr *h = (struct sp_dns_hdr *)bufv;
+    if (ntohs(h->flags) & 3) return -2; /* RCODE */
+    int qd = ntohs(h->qd), an = ntohs(h->an);
+    size_t off = 12;
+    /* skip question section */
+    for (int i = 0; i < qd; i++) {
+        while (off < (size_t)nread) {
+            uint8_t l = buf[off];
+            if (l == 0) { off++; break; }
+            if ((l & 0xC0) == 0xC0) { off += 2; break; }
+            off += 1 + l;
+        }
+        off += 4;
+    }
+    int got = 0;
+    for (int i = 0; i < an && off + 12 <= (size_t)nread; i++) {
+        while (off < (size_t)nread) {
+            uint8_t l = buf[off];
+            if (l == 0) { off++; break; }
+            if ((l & 0xC0) == 0xC0) { off += 2; break; }
+            off += 1 + l;
+        }
+        if (off + 10 > (size_t)nread) break;
+        uint16_t type = (buf[off] << 8) | buf[off+1];
+        uint16_t cls  = (buf[off+2] << 8) | buf[off+3];
+        uint16_t rdlen= (buf[off+8] << 8) | buf[off+9];
+        off += 10;
+        if (cls != 1 || off + rdlen > (size_t)nread) { off += rdlen; continue; }
+        if (type == 1 && rdlen == 4 && !want_v6) {
+            if (*na4 < 8) a4[(*na4)++] = *(struct in_addr *)&buf[off];
+            got++;
+        } else if (type == 28 && rdlen == 16) {
+            if (*na6 < 8) a6[(*na6)++] = *(struct in6_addr *)&buf[off];
+            got++;
+        }
+        off += rdlen;
+    }
+    return got;
+}
+
+/* one stubborn question to the servers, alternating A/AAAA */
+static int sp_dns_lookup(const char *host, int want_v6,
+                         struct in_addr a4[8], int *na4,
+                         struct in6_addr a6[8], int *na6) {
+    *na4 = 0; *na6 = 0;
+    struct in_addr srv[4];
+    int nsc = sp_dns_servers(srv);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    struct timeval tv = { 2, 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    static uint16_t qid = 4242;
+    qid = (uint16_t)(qid * 31 + 7);
+    int rc = -1;
+    for (int ai = 0; ai < nsc && rc < 0; ai++) {
+        char q[SP_DNS_TXT_LEN], ans[4096];
+        int qlen = sp_dns_encode(q, host, want_v6 ? 28 : 1, qid);
+        if (qlen < 0) continue;
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET; sa.sin_port = htons(53); sa.sin_addr = srv[ai];
+        if (sendto(s, q, (size_t)qlen, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) continue;
+        ssize_t r = recvfrom(s, ans, sizeof(ans), 0, NULL, NULL);
+        if (r < 12) continue;
+        rc = sp_dns_extract(ans, r, want_v6, a4, na4, a6, na6);
+        if (rc == -2) break;      /* NXDOMAIN/name error: no use asking others */
+        if (rc == 0) continue;    /* empty answer: try the next server anyway */
+    }
+    close(s);
+    return (rc < 0) ? -1 : (*na4 + *na6 > 0 ? 0 : -1);
+}
+
+static int sp_dns_host_ok(const char *s) {
+    return s && *s && strspn(s, ".-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") == strlen(s);
+}
+
+static short sp_dns_port(const char *s) {
+    static const struct { const char *n; short p; } tb[] = {
+        {"http",80},{"http-alt",8080},{"https",443},{"ftp",21},{"ssh",22},
+        {"smtp",25},{"domain",53},{"dns",53},{"ntp",123},{"pop3",110},
+        {"imap",143},{"imaps",993},{"pop3s",995},{"submission",587},{NULL,0}
+    };
+    if (!s || !*s) return 0;
+    if (s[0] >= '0' && s[0] <= '9') return (short)atoi(s);
+    for (int i = 0; tb[i].n; i++) if (!strcmp(tb[i].n, s)) return tb[i].p;
+    return 0;
+}
+
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints,
+                struct addrinfo **res);
+#undef getaddrinfo
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints,
+                struct addrinfo **res) {
+    static int (*SP_REAL(getaddrinfo))(const char *, const char *, const struct addrinfo *, struct addrinfo **) = NULL;
+    SP_RESOLVE(getaddrinfo);
+    if (!node || !sp_dns_host_ok(node)) return SP_REAL(getaddrinfo)(node, service, hints, res);
+    if (node[0] >= '0' && node[0] <= '9') return SP_REAL(getaddrinfo)(node, service, hints, res); /* numeric */
+    if (hints && hints->ai_family == AF_UNIX) return SP_REAL(getaddrinfo)(node, service, hints, res);
+    struct in_addr a4[8]; struct in6_addr a6[8]; int na4 = 0, na6 = 0;
+    int fam = hints ? hints->ai_family : AF_UNSPEC;
+    if (fam == AF_INET) {
+        if (sp_dns_lookup(node, 0, a4, &na4, a6, &na6) != 0) return EAI_AGAIN;
+    } else if (fam == AF_INET6) {
+        struct in_addr tmp4[8]; int tn4;
+        if (sp_dns_lookup(node, 1, tmp4, &tn4, a6, &na6) != 0) return EAI_AGAIN;
+    } else {
+        /* AF_UNSPEC: A records ONLY. Emitting AAAA makes apt/curl attempt
+         * v6 on Android networks that lack any v6 route (RST=113): apt's
+         * http method then FAILS that URL mid-transaction instead of
+         * falling back across families reliably. Android v6-usable LANs
+         * were never achieved by proot's resolver either — parity. */
+        if (sp_dns_lookup(node, 0, a4, &na4, a6, &na6) != 0) return EAI_AGAIN;
+        if (na4 == 0) return EAI_AGAIN;
+    }
+    short port = sp_dns_port(service);
+    struct addrinfo *head = NULL, **tail = &head;
+    int count = 0;
+    /* RFC 3484-bleed: emit A records BEFORE AAAA for AF_UNSPEC — many
+     * Android networks have broken IPv6 (no route/113), python/curl/apt all
+     * stop at the first connection failure without family alternatives. */
+    for (int i = 0; i < na4 && count < 8; i++) {
+        struct addrinfo *ai = calloc(1, sizeof(*ai));
+        struct sockaddr_in *sin = calloc(1, sizeof(*sin));
+        sin->sin_family = AF_INET; sin->sin_port = htons(port); sin->sin_addr = a4[i];
+        ai->ai_flags = SP_AI_BRAND;
+        ai->ai_family = AF_INET;
+        ai->ai_socktype = hints ? hints->ai_socktype : 0;
+        ai->ai_protocol = hints ? hints->ai_protocol : 0;
+        ai->ai_addrlen = sizeof(*sin);
+        ai->ai_addr = (struct sockaddr *)sin;
+        ai->ai_canonname = sp_dns_strdup(node);
+        *tail = ai; tail = &ai->ai_next; count++;
+    }
+    for (int i = 0; i < na6 && count < 16; i++) {
+        struct addrinfo *ai = calloc(1, sizeof(*ai));
+        struct sockaddr_in6 *sin6 = calloc(1, sizeof(*sin6));
+        sin6->sin6_family = AF_INET6; sin6->sin6_port = htons(port); sin6->sin6_addr = a6[i];
+        ai->ai_flags = SP_AI_BRAND;
+        ai->ai_family = AF_INET6;
+        ai->ai_socktype = hints ? hints->ai_socktype : 0;
+        ai->ai_protocol = hints ? hints->ai_protocol : 0;
+        ai->ai_addrlen = sizeof(*sin6);
+        ai->ai_addr = (struct sockaddr *)sin6;
+        ai->ai_canonname = sp_dns_strdup(node);
+        *tail = ai; tail = &ai->ai_next; count++;
+    }
+    *res = head;
+    return head ? 0 : EAI_AGAIN;
+}
+
+#define SP_AI_BRAND 0x7370726f  /* 'spro' */
+void freeaddrinfo(struct addrinfo *res);
+#undef freeaddrinfo
+void freeaddrinfo(struct addrinfo *res) {
+    static void (*SP_REAL(freeaddrinfo))(struct addrinfo *) = NULL;
+    SP_RESOLVE(freeaddrinfo);
+    /* libc chains may be contiguous slabs — NEVER free per-node. Ours carry
+     * the brand flag; free branded nodes only, delegate tails to glibc. */
+    struct addrinfo *own = res;
+    while (own && (int)own->ai_flags == SP_AI_BRAND) {
+        struct addrinfo *n = own->ai_next;
+        if (own->ai_addr) free(own->ai_addr);
+        if (own->ai_canonname) free(own->ai_canonname);
+        free(own);
+        own = n;
+    }
+    if (own && SP_REAL(freeaddrinfo)) SP_REAL(freeaddrinfo)(own);
+}
+
+struct hostent *gethostbyname(const char *name);
+#undef gethostbyname
+struct hostent *gethostbyname(const char *name) {
+    static struct hostent he;
+    static char *aliases[1] = { NULL };
+    static char *addrs[10];
+    static struct in_addr buf4[8];
+    struct in_addr a4[8]; struct in6_addr a6[8]; int na4, na6;
+    if (sp_dns_lookup(name, 0, a4, &na4, a6, &na6) != 0) return NULL;
+    for (int i = 0; i < na4 && i < 8; i++) { buf4[i] = a4[i]; addrs[i] = (char *)&buf4[i]; }
+    addrs[na4 < 8 ? na4 : 8] = NULL;
+    he.h_name = (char *)name; he.h_aliases = aliases;
+    he.h_addrtype = AF_INET; he.h_length = 4; he.h_addr_list = addrs;
+    return &he;
+}
+
+/* tempfile family: glibc's mkstemp uses internal __open calls — wraps the
+ * public template entry points and creates the file under the translated
+ * path. The caller's template string is left untouched (contains the guest
+ * spelling); callers unlink/rename through the wrappers anyway, so all
+ * model-visible semantics stay consistent. */
+int mkstemp(char *tmpl) {
+    static int (*SP_REAL(mkstemp))(char *) = NULL;
+    SP_RESOLVE(mkstemp);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(tmpl, x);
+    char big[SP_PATH_MAX];
+    const char *use = tmpl;
+    if (p != tmpl) {
+        strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
+        use = big;
+    }
+    SP_TRACE("mkstemp", tmpl, use);
+    int fd = SP_REAL(mkstemp)(use);
+    /* glibc contract: substitute trailing XXXXXX IN THE CALLER'S BUFFER.
+     * `use` is the (possibly longer, translated) stack template the real
+     * library substituted its suffix into; its tail 6 chars are the shared
+     * semantic — mirror them back into the caller's guest-spelled buffer.
+     * All later opens/unlinks through any wrapper on the guest spelling
+     * reach the same real file. */
+    if (fd >= 0) {
+        size_t tl = strlen(tmpl), ul = strlen(use);
+        if (ul >= 6 && tl >= 6) memcpy(tmpl + tl - 6, use + ul - 6, 6);
+    }
+    return fd;
+}
+
+int mkostemp(char *tmpl, int flags) {
+    static int (*SP_REAL(mkostemp))(char *, int) = NULL;
+    SP_RESOLVE(mkostemp);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(tmpl, x);
+    char big[SP_PATH_MAX];
+    const char *use = tmpl;
+    if (p != tmpl) {
+        strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
+        use = big;
+    }
+    SP_TRACE("mkostemp", tmpl, use);
+    int fd = SP_REAL(mkostemp)(use, flags);
+    if (fd >= 0) {
+        size_t tl = strlen(tmpl), ul = strlen(use);
+        if (ul >= 6 && tl >= 6) memcpy(tmpl + tl - 6, use + ul - 6, 6);
+    }
+    return fd;
+}
+
+/* mutation paths (apt/dpkg needs): chmod/chown/link/truncate families */
+int chmod(const char *path, mode_t mode) {
+    static int (*SP_REAL(chmod))(const char *, mode_t) = NULL;
+    SP_RESOLVE(chmod);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("chmod", path, p);
+    return SP_REAL(chmod)(p, mode);
+}
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
+    static int (*SP_REAL(fchmodat))(int, const char *, mode_t, int) = NULL;
+    SP_RESOLVE(fchmodat);
+    char x[SP_PATH_MAX];
+    const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
+    SP_TRACE("fchmodat", path, p);
+    return SP_REAL(fchmodat)(dirfd, p, mode, flags);
+}
+int chown(const char *path, uid_t uid, gid_t gid) {
+    static int (*SP_REAL(chown))(const char *, uid_t, gid_t) = NULL;
+    static int fake_root = -1;
+    if (fake_root < 0) fake_root = getenv("SPROUT_FAKEROOT") != NULL;
+    SP_RESOLVE(chown);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("chown", path, p);
+    /* proot -0 parity: under fake-root the guest happily chown()s anything
+     * to root; the host keeps ownership (uid of the Android app) */
+    if (fake_root) return 0;
+    return SP_REAL(chown)(p, uid, gid);
+}
+int lchown(const char *path, uid_t uid, gid_t gid) {
+    static int (*SP_REAL(lchown))(const char *, uid_t, gid_t) = NULL;
+    static int fake_root2 = -1;
+    if (fake_root2 < 0) fake_root2 = getenv("SPROUT_FAKEROOT") != NULL;
+    SP_RESOLVE(lchown);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_l(path, x);
+    SP_TRACE("lchown", path, p);
+    if (fake_root2) return 0;
+    return SP_REAL(lchown)(p, uid, gid);
+}
+int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
+    static int (*SP_REAL(fchownat))(int, const char *, uid_t, gid_t, int) = NULL;
+    static int fake_root3 = -1;
+    if (fake_root3 < 0) fake_root3 = getenv("SPROUT_FAKEROOT") != NULL;
+    SP_RESOLVE(fchownat);
+    char x[SP_PATH_MAX];
+    const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
+    SP_TRACE("fchownat", path, p);
+    if (fake_root3) return 0;
+    return SP_REAL(fchownat)(dirfd, p, uid, gid, flags);
+}
+int fchown(int fd, uid_t uid, gid_t gid) {
+    static int (*SP_REAL(fchown))(int, uid_t, gid_t) = NULL;
+    static int fake_root4 = -1;
+    if (fake_root4 < 0) fake_root4 = getenv("SPROUT_FAKEROOT") != NULL;
+    SP_RESOLVE(fchown);
+    if (fake_root4) return 0;
+    return SP_REAL(fchown)(fd, uid, gid);
+}
+int link(const char *oldpath, const char *newpath) {
+    static int (*SP_REAL(link))(const char *, const char *) = NULL;
+    static ssize_t (*SP_REAL(symlink))(const char *, const char *) = NULL;
+    SP_RESOLVE(link);
+    char x1[SP_PATH_MAX], x2[SP_PATH_MAX];
+    const char *p1 = sp_translate_x(oldpath, x1);
+    const char *p2 = sp_translate_l(newpath, x2);
+    SP_TRACE("link", oldpath, p1);
+    SP_TRACE("link->", newpath, p2);
+    int rc = SP_REAL(link)(p1, p2);
+    /* Android SELinux blocks hardlinks on /data/data/`.../files: proot's
+     * answer is --link2symlink; mimic: fall back to a symlink pointing at
+     * the translated (already host-absolute) target — its spelling flows
+     * back through our own reverse-translations as guest-stable. */
+    if (rc != 0 && (errno == EPERM || errno == EACCES) && getenv("SPROUT_LINK2SYMLINK")) {
+        if (!SP_REAL(symlink)) SP_REAL(symlink) = dlsym(RTLD_NEXT, "symlink");
+        if (SP_REAL(symlink)) rc = SP_REAL(symlink)(p1, p2);
+    }
+    return rc;
+}
+int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags) {
+    static int (*SP_REAL(linkat))(int, const char *, int, const char *, int) = NULL;
+    static int (*SP_REAL(symlinkat))(const char *, int, const char *) = NULL;
+    SP_RESOLVE(linkat);
+    char x1[SP_PATH_MAX], x2[SP_PATH_MAX];
+    const char *p1 = sp_translate_x(oldpath, x1);
+    const char *p2 = sp_translate_l(newpath, x2);
+    SP_TRACE("linkat", oldpath, p1);
+    SP_TRACE("linkat->", newpath, p2);
+    int rc = SP_REAL(linkat)(olddirfd, p1, newdirfd, p2, flags);
+    if (rc != 0 && (errno == EPERM || errno == EACCES) && getenv("SPROUT_LINK2SYMLINK")) {
+        if (!SP_REAL(symlinkat)) SP_REAL(symlinkat) = dlsym(RTLD_NEXT, "symlinkat");
+        if (SP_REAL(symlinkat)) rc = SP_REAL(symlinkat)(p1, AT_FDCWD, p2);
+    }
+    return rc;
+}
+int truncate(const char *path, off_t length) {
+    static int (*SP_REAL(truncate))(const char *, off_t) = NULL;
+    SP_RESOLVE(truncate);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("truncate", path, p);
+    return SP_REAL(truncate)(p, length);
+}
+int utimes(const char *path, const struct timeval times[2]) {
+    static int (*SP_REAL(utimes))(const char *, const struct timeval *) = NULL;
+    SP_RESOLVE(utimes);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("utimes", path, p);
+    return SP_REAL(utimes)(p, times);
+}
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags) {
+    static int (*SP_REAL(utimensat))(int, const char *, const struct timespec *, int) = NULL;
+    SP_RESOLVE(utimensat);
+    char x[SP_PATH_MAX];
+    const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
+    SP_TRACE("utimensat", path, p);
+    return SP_REAL(utimensat)(dirfd, p, times, flags);
+}
+
+/* BSD timeval APIs. dpkg's tar postprocessing ALSO imports lutimes()
+ * (existing utimes wrapper above covers only the follow-target form);
+ * glibc implements them via internal utimensat() calls, which bypass all
+ * PLT interception — same internal-syscall blind spot as ifstream/fopen. */
+int lutimes(const char *path, const struct timeval tv[2]) {
+    static int (*SP_REAL(lutimes))(const char *, const struct timeval *) = NULL;
+    SP_RESOLVE(lutimes);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_l(path, x);
+    SP_TRACE("lutimes", path, p);
+    return SP_REAL(lutimes)(p, tv);
+}
+
+/* filesystem-space probes (apt's 'determine free space' step) */
+#include <sys/statvfs.h>
+int statvfs(const char *path, struct statvfs *buf) {
+    static int (*SP_REAL(statvfs))(const char *, struct statvfs *) = NULL;
+    SP_RESOLVE(statvfs);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("statvfs", path, p);
+    return SP_REAL(statvfs)(p, buf);
+}
+int statvfs64(const char *path, struct statvfs64 *buf) {
+    static int (*SP_REAL(statvfs64))(const char *, struct statvfs64 *) = NULL;
+    SP_RESOLVE(statvfs64);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("statvfs64", path, p);
+    return SP_REAL(statvfs64)(p, buf);
+}
+
+/* stat-at family: GNU coreutils cp/c(LT)-h directives use fstatat; a missing
+ * wrapper makes the SOURCE lookup fail with ENOENT on the host tree */
+int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
+    static int (*SP_REAL(fstatat))(int, const char *, struct stat *, int) = NULL;
+    SP_RESOLVE(fstatat);
+    char x[SP_PATH_MAX];
+    const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
+    SP_TRACE("fstatat", path, p);
+    return SP_REAL(fstatat)(dirfd, p, st, flags);
+}
+int newfstatat(int dirfd, const char *path, struct stat *st, int flags) {
+    static int (*SP_REAL(newfstatat))(int, const char *, struct stat *, int) = NULL;
+    SP_RESOLVE(newfstatat);
+    char x[SP_PATH_MAX];
+    const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
+    SP_TRACE("newfstatat", path, p);
+    return SP_REAL(newfstatat)(dirfd, p, st, flags);
+}
+
+char *mkdtemp(char *tmpl) {
+    static char *(*SP_REAL(mkdtemp))(char *) = NULL;
+    SP_RESOLVE(mkdtemp);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(tmpl, x);
+    char big[SP_PATH_MAX];
+    const char *use = tmpl;
+    if (p != tmpl) {
+        strncpy(big, p, sizeof(big) - 1); big[sizeof(big) - 1] = 0;
+        use = big;
+    }
+    char *r = SP_REAL(mkdtemp)(use);
+    if (!r) return NULL;
+    if (use != tmpl) {
+        size_t tl = strlen(tmpl), ul = strlen(use);
+        if (ul >= 6 && tl >= 6) memcpy(tmpl + tl - 6, use + ul - 6, 6);
+        /* the caller continues with the guest spelling; wrappers translate */
+        return tmpl;
+    }
+    return r;
+}
+
+#include <stdio.h>
+#include <stdbool.h>
+FILE *tmpfile(void) {
+    static FILE *(*SP_REAL(tmpfile))(void) = NULL;
+    SP_RESOLVE(tmpfile);
+    return SP_REAL(tmpfile)();   /* glibc manages O_TMPFILE in rootfs/tmp */
+}
+
+struct hostent *gethostbyname2(const char *name, int af);
+#undef gethostbyname2
+struct hostent *gethostbyname2(const char *name, int af) {
+    if (af == AF_INET) return gethostbyname(name);
+    return NULL; /* IPv6 callers fall through to getaddrinfo */
+}
+
+int __open64(const char *path, int flags, ...) {
+    static int (*SP_REAL(__open64))(const char *, int, ...) = NULL;
+    SP_RESOLVE(__open64);
+    if (!SP_REAL(__open64)) SP_REAL(__open64) = dlsym(RTLD_NEXT, "open64");
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("__open64", path, p);
+    return SP_REAL(__open64)(p, flags, mode);
+}
+
+int __openat64(int dirfd, const char *path, int flags, ...) {
+    static int (*SP_REAL(__openat64))(int, const char *, int, ...) = NULL;
+    SP_RESOLVE(__openat64);
+    if (!SP_REAL(__openat64)) SP_REAL(__openat64) = dlsym(RTLD_NEXT, "openat64");
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, mode_t); va_end(ap);
+    }
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("__openat64", path, p);
+    return SP_REAL(__openat64)(dirfd, p, flags, mode);
+}
+
 int faccessat2(int dirfd, const char *path, int mode, int flags) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
@@ -485,7 +1092,7 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
     static int (*SP_REAL(statx))(int, const char *, int, unsigned int, struct statx *) = NULL;
     SP_RESOLVE(statx);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate_x(path, x);
+    const char *p = (flags & AT_SYMLINK_FOLLOW) ? sp_translate_x(path, x) : sp_translate_l(path, x);
     SP_TRACE("statx", path, p);
     return SP_REAL(statx)(dirfd, p, flags, mask, buf);
 }
@@ -494,7 +1101,7 @@ int mkdirat(int dirfd, const char *path, mode_t mode) {
     static int (*SP_REAL(mkdirat))(int, const char *, mode_t) = NULL;
     SP_RESOLVE(mkdirat);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate_x(path, x);
+    const char *p = sp_translate_l(path, x);
     SP_TRACE("mkdirat", path, p);
     return SP_REAL(mkdirat)(dirfd, p, mode);
 }
@@ -503,7 +1110,7 @@ int unlinkat(int dirfd, const char *path, int flags) {
     static int (*SP_REAL(unlinkat))(int, const char *, int) = NULL;
     SP_RESOLVE(unlinkat);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate_x(path, x);
+    const char *p = sp_translate_l(path, x);
     SP_TRACE("unlinkat", path, p);
     return SP_REAL(unlinkat)(dirfd, p, flags);
 }
@@ -514,7 +1121,7 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
     if (bufsiz == 0) return SP_REAL(readlinkat)(dirfd, path, buf, bufsiz);
     char x[SP_PATH_MAX];
     char target[SP_PATH_MAX];
-    const char *p = sp_translate_x(path, x);
+    const char *p = sp_translate_l(path, x);
     ssize_t n = SP_REAL(readlinkat)(dirfd, p, target, SP_PATH_MAX - 1);
     if (n <= 0) return n;
     target[n] = '\0';
@@ -532,6 +1139,46 @@ int chdir(const char *path) {
     const char *p = sp_translate_x(path, x);
     SP_TRACE("chdir", path, p);
     return SP_REAL(chdir)(p);
+}
+
+/* stdio family: glibc's fopen/ifstream do files via *internal* non-cancellable
+ * svc calls by the FILE* plumbing, so they never go through our open/open64
+ * PLT wrappers (apt's cputable read was the first proof). Wrapping the FILE
+ * entry points translates the path BEFORE glibc's internal open. */
+FILE *fopen(const char *path, const char *mode) {
+    static FILE *(*SP_REAL(fopen))(const char *, const char *) = NULL;
+    SP_RESOLVE(fopen);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("fopen", path, p);
+    return SP_REAL(fopen)(p, mode);
+}
+
+FILE *fopen64(const char *path, const char *mode) {
+    static FILE *(*SP_REAL(fopen64))(const char *, const char *) = NULL;
+    SP_RESOLVE(fopen64);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("fopen64", path, p);
+    return SP_REAL(fopen64)(p, mode);
+}
+
+FILE *freopen(const char *path, const char *mode, FILE *stream) {
+    static FILE *(*SP_REAL(freopen))(const char *, const char *, FILE *) = NULL;
+    SP_RESOLVE(freopen);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("freopen", path, p);
+    return SP_REAL(freopen)(p, mode, stream);
+}
+
+FILE *freopen64(const char *path, const char *mode, FILE *stream) {
+    static FILE *(*SP_REAL(freopen64))(const char *, const char *, FILE *) = NULL;
+    SP_RESOLVE(freopen64);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("freopen64", path, p);
+    return SP_REAL(freopen64)(p, mode, stream);
 }
 
 char *getcwd(char *buf, size_t size) {
@@ -692,12 +1339,6 @@ int getpeername(int fd, struct sockaddr *addr, socklen_t *len) {
     return r;
 }
 
-static char *sp_strdup(const char *out) {
-    size_t n = strlen(out) + 1;
-    char *p = malloc(n);
-    if (p) memcpy(p, out, n);
-    return p;
-}
 
 char *realpath(const char *path, char *resolved) {
     static char *(*SP_REAL(realpath))(const char *, char *) = NULL;
@@ -710,7 +1351,7 @@ char *realpath(const char *path, char *resolved) {
     char out[SP_PATH_MAX];
     sp_reverse(&g_cfg, tmp, out, sizeof(out));
     if (!resolved) {
-        resolved = sp_strdup(out);
+        resolved = sp_dns_strdup(out);
     } else {
         strcpy(resolved, out);
     }
@@ -740,7 +1381,7 @@ int lstat(const char *path, struct stat *st) {
     static int (*SP_REAL(lstat))(const char *, struct stat *) = NULL;
     SP_RESOLVE(lstat);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate_x(path, x);
+    const char *p = sp_translate_l(path, x);
     SP_TRACE("lstat", path, p);
     return SP_REAL(lstat)(p, st);
 }
@@ -749,7 +1390,7 @@ int lstat64(const char *path, struct stat64 *st) {
     static int (*SP_REAL(lstat64))(const char *, struct stat64 *) = NULL;
     SP_RESOLVE(lstat64);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate_x(path, x);
+    const char *p = sp_translate_l(path, x);
     SP_TRACE("lstat64", path, p);
     return SP_REAL(lstat64)(p, st);
 }
@@ -761,7 +1402,7 @@ ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
     if (bufsiz == 0) return SP_REAL(readlink)(path, buf, bufsiz);
     char x[SP_PATH_MAX];
     char target[SP_PATH_MAX];
-    const char *p = sp_translate_x(path, x);
+    const char *p = sp_translate_l(path, x);
     /* Reserve one byte: readlink allows n == bufsiz, which would leave no
      * room for the NUL the reverse-translation step needs. */
     ssize_t n = SP_REAL(readlink)(p, target, SP_PATH_MAX - 1);
@@ -789,7 +1430,7 @@ int unlink(const char *path) {
     static int (*SP_REAL(unlink))(const char *) = NULL;
     SP_RESOLVE(unlink);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate_x(path, x);
+    const char *p = sp_translate_l(path, x);
     SP_TRACE("unlink", path, p);
     return SP_REAL(unlink)(p);
 }
@@ -807,7 +1448,7 @@ int mkdir(const char *path, mode_t mode) {
     static int (*SP_REAL(mkdir))(const char *, mode_t) = NULL;
     SP_RESOLVE(mkdir);
     char x[SP_PATH_MAX];
-    const char *p = sp_translate_x(path, x);
+    const char *p = sp_translate_l(path, x);
     SP_TRACE("mkdir", path, p);
     return SP_REAL(mkdir)(p, mode);
 }
@@ -816,21 +1457,48 @@ int rename(const char *oldpath, const char *newpath) {
     static int (*SP_REAL(rename))(const char *, const char *) = NULL;
     SP_RESOLVE(rename);
     char xo[SP_PATH_MAX], xn[SP_PATH_MAX];
-    const char *po = sp_translate_x(oldpath, xo);
-    const char *pn = sp_translate_x(newpath, xn);
+    /* both sides are name-operations: move the LINK itself, never its target */
+    const char *po = sp_translate_l(oldpath, xo);
+    const char *pn = sp_translate_l(newpath, xn);
     SP_TRACE("rename", oldpath, po);
     return SP_REAL(rename)(po, pn);
+}
+int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
+    static int (*SP_REAL(renameat))(int, const char *, int, const char *) = NULL;
+    SP_RESOLVE(renameat);
+    char xo[SP_PATH_MAX], xn[SP_PATH_MAX];
+    const char *po = sp_translate_l(oldpath, xo);
+    const char *pn = sp_translate_l(newpath, xn);
+    SP_TRACE("renameat", oldpath, po);
+    return SP_REAL(renameat)(olddirfd, po, newdirfd, pn);
+}
+int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags) {
+    static int (*SP_REAL(renameat2))(int, const char *, int, const char *, unsigned int) = NULL;
+    SP_RESOLVE(renameat2);
+    char xo[SP_PATH_MAX], xn[SP_PATH_MAX];
+    const char *po = sp_translate_l(oldpath, xo);
+    const char *pn = sp_translate_l(newpath, xn);
+    SP_TRACE("renameat2", oldpath, po);
+    return SP_REAL(renameat2)(olddirfd, po, newdirfd, pn, flags);
 }
 
 int symlink(const char *target, const char *linkpath) {
     static int (*SP_REAL(symlink))(const char *, const char *) = NULL;
     SP_RESOLVE(symlink);
     char x[SP_PATH_MAX];
-    const char *lp = sp_translate_x(linkpath, x);
+    const char *lp = sp_translate_l(linkpath, x);
     /* target is guest-spelled by design; the reverse path is what readlink
      * hands back, so both directions stay consistent. */
     SP_TRACE("symlink", linkpath, lp);
     return SP_REAL(symlink)(target, lp);
+}
+int symlinkat(const char *target, int newdirfd, const char *linkpath) {
+    static int (*SP_REAL(symlinkat))(const char *, int, const char *) = NULL;
+    SP_RESOLVE(symlinkat);
+    char x[SP_PATH_MAX];
+    const char *lp = sp_translate_l(linkpath, x);
+    SP_TRACE("symlinkat", linkpath, lp);
+    return SP_REAL(symlinkat)(target, newdirfd, lp);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1036,13 +1704,44 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
         free(v);
         return rc;
     }
-    case SP_ELF_STATIC:
-        /* static guest: no libc to interpose, raw syscalls bypass us;
-         * full support = v0.3 supervisor. */
-        errno = EINVAL;
-        if (g_cfg.debug)
-            fprintf(stderr, "[sprout] execve: static ELF '%s' needs the supervisor (v0.3)\n", path);
-        return -1;
+    case SP_ELF_STATIC: {
+        /* Already under a ptrace supervisor (shadow mode): just exec the
+         * static image; the supervisor's exec-stop reclassifies it into
+         * full translation. Must NOT spawn a nested sprout-ptrace. */
+        if (getenv("SPROUT_SUPERVISED"))
+            return sp_real_execve(host, argv, envp);
+        /* static guest inside a dynamic process: raw syscalls bypass the
+         * interposer, so the supervisor (ptrace) must own the process.
+         * sprout-cli hands the supervisor's path via SPROUT_PTRACE; it is
+         * a HOST binary — the bionic loader would try to link the guest
+         * glibc LD_PRELOAD it inherits, so LD_* is stripped before exec. */
+        const char *px = getenv("SPROUT_PTRACE");
+        if (!px) { errno = ENOENT; return -1; }
+        int argc = 0;
+        while (argv[argc]) argc++;
+        char **v = malloc((size_t)(argc + 3) * sizeof(char *));
+        if (!v) { errno = ENOMEM; return -1; }
+        v[0] = (char *)px;
+        v[1] = "--";
+        v[2] = (char *)host;
+        for (int k = 1; k < argc; k++) v[k + 2] = argv[k];
+        v[argc + 2] = NULL;
+        /* env minus LD_PRELOAD/LD_LIBRARY_PATH (host-unsafe for bionic) */
+        int ec = 0;
+        while (envp[ec]) ec++;
+        char **e2 = malloc((size_t)(ec + 1) * sizeof(char *));
+        if (!e2) { free(v); errno = ENOMEM; return -1; }
+        int w = 0;
+        for (int k = 0; k < ec; k++) {
+            if (strncmp(envp[k], "LD_PRELOAD=", 11) == 0) continue;
+            if (strncmp(envp[k], "LD_LIBRARY_PATH=", 16) == 0) continue;
+            e2[w++] = envp[k];
+        }
+        e2[w] = NULL;
+        int rc = sp_real_execve(px, v, e2);
+        free(e2); free(v);
+        return rc;
+    }
     default:
         errno = ENOEXEC;
         return -1;
@@ -1055,6 +1754,45 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
      * cases (only for paths EXPLICITLY excluded from translation? none
      * today: everything goes through the chain when dynamic). */
     return sp_execve_chain(path, argv, envp, 0);
+}
+
+/* variadic exec family. glibc implements execl/execlp/execle via INSIDE-libc
+ * calls to execve/execvp: PLT intercepts on execve/execvp never trigger for
+ * them — DPKG's subprocess code uses execlp() for exactly the dpkg-split
+ * reassembly step (found via objdump import tables). */
+int execl(const char *path, const char *arg, ...) {
+    va_list ap; va_start(ap, arg);
+    char *a[128];
+    int i = 0;
+    if (arg) { a[i++] = (char *)arg; char *s; while ((s = va_arg(ap, char *)) && i < 127) a[i++] = s; }
+    va_end(ap);
+    a[i] = NULL;
+    return sp_execve_chain(path, (char *const *)a, environ, 0);
+}
+
+int execle(const char *path, const char *arg, ...) {
+    va_list ap; va_start(ap, arg);
+    char *a[128];
+    int i = 0;
+    if (arg) { a[i++] = (char *)arg; char *s; while ((s = va_arg(ap, char *)) && i < 127) a[i++] = s; }
+    char **envp = va_arg(ap, char **);
+    va_end(ap);
+    a[i] = NULL;
+    return sp_execve_chain(path, (char *const *)a, envp ? (char *const *)envp : environ, 0);
+}
+
+int execlp(const char *file, const char *arg, ...) {
+    va_list ap; va_start(ap, arg);
+    char *a[128];
+    int i = 0;
+    if (arg) { a[i++] = (char *)arg; char *s; while ((s = va_arg(ap, char *)) && i < 127) a[i++] = s; }
+    va_end(ap);
+    a[i] = NULL;
+    char cand[SP_PATH_MAX];
+    if (sp_guest_path_search(file, cand) == 0)
+        return sp_execve_chain(cand, (char *const *)a, environ, 0);
+    errno = ENOENT;
+    return -1;
 }
 
 int execv(const char *path, char *const argv[]) {
@@ -1105,11 +1843,15 @@ int system(const char *command) {
         const char *p = sp_translate(&g_cfg, "/bin/sh", x) ? x : "/bin/sh";
         return access(p, X_OK) == 0;
     }
-    /* keep it simple: fork + exec /bin/sh -c command */
+    /* keep it simple: fork + exec /bin/sh -c command via the shared chain.
+     * (execl is unwrapped: glibc's private exec call would bypass our
+     * translation — earlier apt Post-Invoke ran HOST /bin/sh + glibc chain
+     * env, yielding 'bad ELF magic' when the loader met a linker script.) */
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        char *const argv[] = {"sh", "-c", (char *)command, NULL};
+        sp_execve_chain("/bin/sh", argv, environ, 0);
         _exit(127);
     }
     int st;
@@ -1300,6 +2042,27 @@ gid_t getegid(void) {
     static gid_t (*SP_REAL(getegid))(void) = NULL;
     SP_RESOLVE(getegid);
     return g_cfg.fakeroot ? 0 : SP_REAL(getegid)();
+}
+
+/* dlopen entry interception. glibc's ld.so opens libraries via ITS OWN
+ * private __open* routines — a PLT interposer can never see those. What we
+ * CAN intercept is the exported dlopen() entry point: translate the path,
+ * hand ld.so an already-host-absolute spelling, and the internal open then
+ * works. Dependency resolution of the dl'd object works because the running
+ * ld.so is the guest's own initialized with LD_LIBRARY_PATH = translated,
+ * --inhibit-cache (plan.rs sp_launch_env). Only ABSOLUTE paths engaging the
+ * rootfs translate; bare soname lookups pass straight through. */
+#ifndef RTLD_LAZY
+#define RTLD_LAZY 1
+#endif
+void *dlopen(const char *file, int mode) {
+    static void *(*SP_REAL(dlopen))(const char *, int) = NULL;
+    SP_RESOLVE(dlopen);
+    if (!file || strchr(file, '/') == NULL) return SP_REAL(dlopen)(file, mode);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(file, x);
+    SP_TRACE("dlopen", file, p);
+    return SP_REAL(dlopen)(p, mode);
 }
 
 #endif /* SPROUT_INTERPOSE */

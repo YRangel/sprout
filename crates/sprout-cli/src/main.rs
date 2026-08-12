@@ -169,7 +169,7 @@ fn run() -> Result<u8, Error> {
                     supervisor,
                     program_host,
                     &program_name,
-                    &cli.cmd,
+                    &cli.cmd[1..],
                     cli.verbose,
                     preload_so,
                     &cache_dir,
@@ -209,7 +209,7 @@ fn run() -> Result<u8, Error> {
                 supervisor,
                 program_host,
                 &program_name,
-                &cli.cmd,
+                &cli.cmd[1..],
                 cli.verbose,
                 preload_so,
                 &cache_dir,
@@ -223,19 +223,50 @@ fn run() -> Result<u8, Error> {
             sprout_preload::core_library_path().ok_or(Error::PreloadNotFound)?
         };
         let cache_dir = cache_dir();
-        LaunchPlan::preload(
+        let pre = LaunchPlan::preload(
             &rootfs,
             program_host,
             &full_cmd,
             preload_so,
             cli.verbose,
             &cache_dir,
-        )?
+        )?;
+        /* SHADOW SUPERVISION (ADR-0012): interposed glibc processes make
+         * raw syscalls that PLT can never see (libuv's io_uring_setup,
+         * V8/JSC internals, ...). A ptrace supervisor MUST watch for
+         * SECCOMP SIGSYS and emulate a truthful fallback, or the guest
+         * dies outright. Shadow tracees free-run via PTRACE_CONT: the only
+         * stops are signals + exec events, so fast-path perf is preserved.
+         * Supervise() strips LD_* for the host supervisor binary and
+         * re-injects the guest stack via SPROUT_GUEST_PRELOAD. */
+        let shadow_off = std::env::var("SPROUT_NO_SHADOW").is_ok();
+        if !shadow_off {
+            if let Some(supervisor) = sprout_ptrace::supervisor_path() {
+                let mut plan = LaunchPlan::supervise(pre, supervisor);
+                plan.env.push(("SPROUT_SHADOW".into(), "1".into()));
+                plan
+            } else {
+                pre
+            }
+        } else {
+            pre
+        }
     };
 
     if cli.dry_run {
         eprintln!("{}", plan.explain());
         return Ok(0);
+    }
+
+    let mut plan = plan;
+    /* Static binaries launched from INSIDE the preload interposer must
+     * route through the supervisor (the interposer can't seccomp-emulate
+     * them). Advertising the supervisor's own path via env lets the C
+     * exec-chain exec it directly (SP_ELF_STATIC arm of sp_execve_chain). */
+    if !plan.env.iter().any(|(k, _)| k == "SPROUT_PTRACE") {
+        if let Some(px) = sprout_ptrace::supervisor_path() {
+            plan.env.push(("SPROUT_PTRACE".into(), px.display().to_string()));
+        }
     }
 
     let status = plan.run()?;
