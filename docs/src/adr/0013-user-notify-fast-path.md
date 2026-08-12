@@ -22,9 +22,16 @@ fallback (5.5+).
 ## Decision
 
 Install the translation filter **in the supervisor's forked child before
-execve**, then pass the listener fd to the supervisor over a pre-fork
-`socketpair(SOCK_SEQPACKET)` via SCM_RIGHTS (no pidfd dependency).
-Inheritance covers the whole child tree.
+execve**. The listener fd reaches the supervisor NOT via SCM_RIGHTS:
+sendmsg() itself is a trapped syscall (AF_UNIX family), so the child's
+first SCM_RIGHTS sendmsg would deadlock against the parent's matching
+recv. Instead the child write()s the 4-byte fd number over a pre-fork
+`socketpair(SOCK_SEQPACKET)` and blocks until the supervisor ACKs; the
+supervisor reconstructs the descriptor with `pidfd_open` + `pidfd_getfd`
+(kernel >=5.6; we are the child's tracer, so access is permitted) and
+replies with one byte. The listener stays non-CLOEXEC so the queue
+survives the child's execve. Inheritance then covers the whole child
+tree.
 
 The supervisor event loop multiplexes:
 
@@ -37,6 +44,9 @@ Servicing (per trapped syscall):
 - **fd-returning ops** (`openat`, `openat2`) — supervisor performs the
   translated open, injects the host fd into the tracee's table via
   `SECCOMP_IOCTL_NOTIF_ADDFD`, returns the child descriptor as val.
+- **AF_UNIX ops** (`bind`, `connect`, `sendto`, `sendmsg`) — supervisor
+  translates the pathname sockaddr and performs the op on a pidfd_dup of
+  the tracee's socket fd (same struct file, same socket state machine).
 - **value ops** (`faccessat`) — supervisor answers with `error`/0.
 - **mutation family** (`mkdirat`, `unlinkat`, `mknodat`, `fchmodat`,
   `fchownat`, `utimensat`, `symlinkat`, `linkat`, `renameat`,
