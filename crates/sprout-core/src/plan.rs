@@ -304,6 +304,31 @@ impl LaunchPlan {
         })
     }
 
+
+    /// Ensure the supervisor's translation layers treat host Termux
+    /// paths (loader dir, libc shadow cache, tmp) as pass-through. This
+    /// matters once the ptrace supervisor installs its usernotify filter:
+    /// without it, the guest loader's own absolute host paths would be
+    /// double-prefixed with the guest rootfs.
+    fn push_passthrough(env: &mut Vec<(String, String)>, prefixes: &[&str]) {
+        let mut merged: Vec<String> = vec!["/proc".into(), "/sys".into(), "/dev".into()];
+        if let Some((_, v)) = env.iter().find(|(k, _)| k == "SPROUT_PASSTHROUGH") {
+            for part in v.split(';') {
+                let part = part.trim();
+                if !part.is_empty() && !merged.iter().any(|e| e == part) {
+                    merged.push(part.to_string());
+                }
+            }
+            env.retain(|(k, _)| k != "SPROUT_PASSTHROUGH");
+        }
+        for p in prefixes {
+            if !p.is_empty() && p.starts_with('/') && !merged.iter().any(|e| e == p) {
+                merged.push((*p).to_string());
+            }
+        }
+        env.push(("SPROUT_PASSTHROUGH".into(), merged.join(";")));
+    }
+
     /// Wrap an existing plan (normally a preload plan) under the ptrace
     /// supervisor. Used for Go-dynamic images: they are ET_DYN with
     /// PT_INTERP — so they still need the sanitized loader chain as the
@@ -317,6 +342,31 @@ impl LaunchPlan {
         // The supervisor performs its exec rewrites using
         // SPROUT_GUEST_PRELOAD (interposer:sanitized-libc pair); the
         // preload plan holds exactly that pair in LD_PRELOAD.
+        let mut pts: Vec<String> = Vec::new();
+        for (k, v) in &plan.env {
+            if k == "SPROUT_LOADER" || k == "SPROOT_LIBRARY_PATH" || k == "SPROUT_LIBRARY_PATH" {
+                for part in v.split(':') {
+                    if part.starts_with('/') { pts.push(part.to_string()); }
+                }
+            }
+            if k == "SPROUT_GUEST_PRELOAD" {
+                for part in v.split(':') {
+                    if let Some(dir) = std::path::Path::new(part).parent() {
+                        pts.push(dir.display().to_string());
+                    }
+                }
+            }
+        }
+        {
+            let mut prefix = std::env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".into());
+            pts.push(prefix);
+            prefix = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".into());
+            pts.push(prefix);
+        }
+        {
+            let refs: Vec<&str> = pts.iter().map(|s| s.as_str()).collect();
+            Self::push_passthrough(&mut plan.env, &refs);
+        }
         let has_guest_preload = plan.env.iter().any(|(k, _)| k == "SPROUT_GUEST_PRELOAD");
         if !has_guest_preload {
             if let Some((_, ld)) = plan.env.iter().find(|(k, _)| k == "LD_PRELOAD") {

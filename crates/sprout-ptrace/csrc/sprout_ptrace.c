@@ -43,6 +43,16 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <linux/audit.h>
+#include <linux/stat.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/prctl.h>
+#include <poll.h>
+
 
 /* Pure translation from the preload core. */
 #include "../../sprout-preload/csrc/sprout_preload.h"
@@ -1176,6 +1186,412 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
     if (regs_dirty) ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovchk);
 }
 
+
+/* statx(2): bionic lacks the symbol; the supervisor itself never goes
+ * through our interposer, so call the veneer directly. */
+static int sp_statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *buf) {
+    return (int)syscall(291, dirfd, path, flags, mask, buf);
+}
+
+/* ================= Seccomp user_notify fast path (ADR-0013) =============
+ * When kernels allow it (5.0+ for NEW_LISTENER, 5.14+ for ADDFD), the
+ * supervisor translates paths WITHOUT syscall-stop every call:
+ *   - children carry a seccomp filter trapping only the hot translate set;
+ *   - the supervisor listens on the filter's notify fd, reads args via
+ *     process_vm_readv, performs the translated open/stat itself and gives
+ *     the child the result (ADDFD injection for fd-returns;
+ *     process_vm_writev for buf-returns);
+ *   - execve/execveat/chdir stay ptrace-owned via SECCOMP_RET_TRACE
+ *     (PTRACE_EVENT_SECCOMP single stop), io_uring-like Android-killed
+ *     syscalls stay SIGSYS-signal-stops (ptrace swallows, see SP_EMULATE).
+ * glibc-dynamic + LD_PRELOAD children do NOT install the filter: the
+ * interposer already translates at PLT level and paying notify dispatch
+ * would only double their work. The filter is installed in the fork()ed
+ * child right before execve; the listener fd hops to the supervisor via
+ * SCM_RIGHTS over a pre-fork socketpair (no pidfd requirement). */
+
+#ifndef SECCOMP_USER_NOTIF_FLAG_CONTINUE
+#define SECCOMP_USER_NOTIF_FLAG_CONTINUE 1
+#endif
+// (seccomp_notif_addfd lives in bionic's linux/seccomp.h)
+#ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
+#define SECCOMP_FILTER_FLAG_NEW_LISTENER (1UL << 3)
+#endif
+#ifndef SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
+#define SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV (1UL << 5)
+#endif
+#ifndef SECCOMP_GET_NOTIF_SIZES
+#define SECCOMP_GET_NOTIF_SIZES 3
+#endif
+#ifndef SECCOMP_RET_USER_NOTIF
+#define SECCOMP_RET_USER_NOTIF 0x40000000
+#endif
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+
+static int g_notify = 0;           /* 1 = install+serve the filter */
+static int g_notify_fd = -1;       /* listener fd owned by supervisor */
+static int g_notify_addfd = -1;    /* ADDFD ioctl availability (live-probed) */
+
+#define SP_OFT(...) do { if (g_debug) fprintf(stderr, "[notify] " __VA_ARGS__); } while(0)
+
+/* syscall traps: hot translation set for aarch64 */
+#define AUDIT_ARCH_AARCH64_OWN 0xC00000B7u
+
+static long sp_seccomp(unsigned int op, unsigned int flags, void *args) {
+    return syscall(277 /*__NR_seccomp (aarch64)*/, op, flags, args);
+}
+
+static int sp_notify_install(void) {
+    static const int traps[] = {
+        56 /*openat*/, 437 /*openat2*/, 79 /*newfstatat*/,
+        48 /*faccessat*/, 291 /*statx*/, 78 /*readlinkat*/,
+        34 /*mkdirat*/, 35 /*unlinkat*/, 33 /*mknodat*/,
+        53 /*fchmodat*/, 54 /*fchownat*/, 88 /*utimensat*/,
+        36 /*symlinkat*/, 37 /*linkat*/, 38 /*renameat*/,
+        276 /*renameat2*/,
+    };
+    const int ntr = (int)(sizeof(traps)/sizeof(traps[0]));
+    /* layout:
+       [0]   LD nr
+       [1..ntr] JEQ traps[i-1], jt = (ntr+2 - i), jf = 0      (on match -> UN)
+       [ntr+1] RET ALLOW
+       [ntr+2] RET USER_NOTIF
+       arch check: LD arch / JEQ aarch64 1,0 / KILL */
+    struct sock_filter prog[4 + 32 + 2];
+    int p = 0;
+    prog[p++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                             offsetof(struct seccomp_data, arch));
+    prog[p++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                             AUDIT_ARCH_AARCH64_OWN, 1, 0);
+    prog[p++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL);
+    prog[p++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                                             offsetof(struct seccomp_data, nr));
+    for (int i = 0; i < ntr; i++) {
+        /* instruction index of this JEQ = 4 + i (0-based within prog) */
+        int here = 4 + i;
+        int target = 4 + ntr + 1;             /* USER_NOTIF index */
+        unsigned char jt = (unsigned char)(target - (here + 1));
+        prog[p++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                 (unsigned)traps[i], jt, 0);
+    }
+    prog[p++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    prog[p++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF);
+    struct sock_fprog fp = { (unsigned short)p, prog };
+    /* plain NEW_LISTENER: TSYNC needs every thread sync-capable (EINVAL on
+     * this box), WAIT_KILLABLE_RECV is unavailable here. Fork-inherited in
+     * a freshly-spawned single-thread child anyway. */
+    long fd = sp_seccomp(SECCOMP_SET_MODE_FILTER,
+                         SECCOMP_FILTER_FLAG_NEW_LISTENER, &fp);
+    return (int)fd;
+}
+
+/* ioctl availability probe: fake-id -ADDFD returns EINVAL, ENOSYS means kernel
+ * lacks ADDFD (pre-5.14). */
+static int sp_notify_probe_addfd(void) {
+    if (g_notify_fd < 0) return 0;
+    struct seccomp_notif_addfd af;
+    memset(&af, 0, sizeof(af));
+    af.id = ~0ULL; af.srcfd = -1;
+    int rc = ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &af);
+    if (rc < 0 && errno == ENOSYS) return 0;
+    return 1;
+}
+
+static ssize_t sp_vm_read(pid_t pid, void *buf, size_t n, unsigned long long addr) {
+    struct iovec lw = { buf, n }, rw = { (void *)addr, n };
+    ssize_t rc = process_vm_readv(pid, &lw, 1, &rw, 1, 0);
+    if (rc < 0 && errno == ENOSYS) {
+        /* kernel without process_vm_readv: last-resort via ptrace peek */
+        return -1;
+    }
+    return rc;
+}
+static ssize_t sp_vm_write(pid_t pid, const void *buf, size_t n, unsigned long long addr) {
+    struct iovec lw = { (void *)buf, n }, rw = { (void *)addr, n };
+    return process_vm_writev(pid, &lw, 1, &rw, 1, 0);
+}
+
+static int sp_notify_read_str(pid_t pid, unsigned long long addr,
+                              char *dst, size_t cap) {
+    if (addr == 0 || addr >= 0x800000000000ULL) return -1;
+    size_t i = 0;
+    while (i < cap) {
+        char chunk[256];
+        size_t want = (cap - i) < sizeof(chunk) ? (cap - i) : sizeof(chunk);
+        ssize_t rc = sp_vm_read(pid, chunk, want, addr + i);
+        if (rc <= 0) return -1;
+        for (size_t k = 0; k < (size_t)rc; k++) {
+            dst[i++] = chunk[k];
+            if (chunk[k] == '\0') return (int)i;
+        }
+    }
+    dst[cap - 1] = '\0';
+    return (int)i;
+}
+
+static int sp_notify_continue(struct seccomp_notif_resp *resp) {
+    resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+    resp->error = 0; resp->val = 0;
+    return 0;
+}
+
+/* fd-injection path: translate then open in SUPERVISOR, then ADDFD into the
+ * tracee's table so the child sees the right local fd. */
+static void sp_notify_reply_open(unsigned long long id,
+                                 struct seccomp_notif_resp *resp,
+                                 const char *path, int flags, mode_t mode) {
+    int lf = open(path, flags, mode);
+    if (lf < 0) {
+        resp->error = -errno; resp->val = 0; resp->flags = 0;
+        SP_OFT("openat reply err %d for %s\n", errno, path);
+        return;
+    }
+    struct seccomp_notif_addfd af;
+    memset(&af, 0, sizeof(af));
+    af.id = id; af.flags = 0; af.srcfd = lf;
+    af.newfd_flags = (flags & O_CLOEXEC) ? O_CLOEXEC : 0;
+    long nfd = ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &af);
+    close(lf);
+    if (nfd < 0) {
+        resp->error = -errno; resp->val = 0; resp->flags = 0;
+        SP_OFT("ADDFD fail %d\n", errno);
+        return;
+    }
+    resp->error = 0; resp->val = (uint64_t)nfd; resp->flags = 0;
+    SP_OFT("openat -> host fd=%ld childval %s\n", nfd, path);
+}
+
+static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
+                                unsigned long long *args,
+                                unsigned long long id,
+                                struct seccomp_notif_resp *resp) {
+    char guest[SP_PATH_MAX], host[SP_PATH_MAX];
+    resp->flags = 0;
+    switch (nr) {
+    case 56: { /* openat(dirfd,path,flags,mode) */
+        int dirfd = (int)args[0];
+        int flags = (int)args[2];
+        if (dirfd != -100 /*AT_FDCWD*/) { sp_notify_continue(resp); return; }
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        sp_notify_reply_open(id, resp, host, flags, 0);
+        return; }
+    case 437: { /* openat2(dirfd,path,how*,size) */
+        int dirfd = (int)args[0];
+        size_t hsz = (size_t)args[3];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        if (hsz != 24) { sp_notify_continue(resp); return; }
+        struct open_how { unsigned long long flags, mode, resolve; } how;
+        if (sp_vm_read(pid, &how, sizeof(how), args[2]) != sizeof(how)) { sp_notify_continue(resp); return; }
+        if (how.resolve) { sp_notify_continue(resp); return; }
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        int lf = open(host, (int)how.flags, (mode_t)how.mode);
+        if (lf < 0) { resp->error = -errno; return; }
+        /* ADDFD not embedded in how; reuse same ioctl */
+        struct seccomp_notif_addfd af;
+        memset(&af, 0, sizeof(af));
+        af.id = id; af.flags = SECCOMP_ADDFD_FLAG_SETFD; af.srcfd = lf;
+        long nfd = ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &af);
+        close(lf);
+        if (nfd < 0) { resp->error = -errno; return; }
+        resp->error = 0; resp->val = (uint64_t)nfd;
+        return; }
+    case 79: { /* newfstatat(dirfd,path,st*,flags) */
+        int dirfd = (int)args[0];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        int sflags = (int)args[3];
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        struct stat st;
+        int rc = (sflags & 0x100 /*AT_SYMLINK_NOFOLLOW*/) ? lstat(host, &st) : stat(host, &st);
+        if (rc < 0) { resp->error = -errno; return; }
+        if (sp_vm_write(pid, &st, sizeof(st), args[2]) != sizeof(st)) { sp_notify_continue(resp); return; }
+        resp->error = 0; resp->val = 0;
+        SP_OFT("fstatat ok %s\n", host);
+        return; }
+    case 48: { /* faccessat(dirfd,path,mode,flags) */
+        int dirfd = (int)args[0];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        int rc = access(host, (int)args[2]);
+        if (rc < 0) { resp->error = -errno; return; }
+        resp->error = 0; resp->val = 0;
+        return; }
+    case 291: { /* statx(dirfd,path,flags,mask,buf) */
+        int dirfd = (int)args[0];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        struct statx sx;
+        memset(&sx, 0, sizeof(sx));
+        int rc = sp_statx(-100, host, (int)args[2], (unsigned)args[3], &sx);
+        if (rc < 0) { resp->error = -errno; return; }
+        if (sp_vm_write(pid, &sx, sizeof(sx), args[4]) != sizeof(sx)) { sp_notify_continue(resp); return; }
+        resp->error = 0; resp->val = 0;
+        return; }
+    case 78: { /* readlinkat(dirfd,path,buf,size) */
+        int dirfd = (int)args[0];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        char lnk[SP_PATH_MAX];
+        ssize_t n = readlink(host, lnk, sizeof(lnk) - 1);
+        if (n < 0) { resp->error = -errno; return; }
+        if ((size_t)n > (size_t)args[3]) n = (ssize_t)args[3];
+        if (n > 0 && sp_vm_write(pid, lnk, (size_t)n, args[2]) != n) { sp_notify_continue(resp); return; }
+        resp->error = 0; resp->val = (uint64_t)n;
+        return; }
+    /* mutation family: supervisor performs with translated paths */
+    case 34: { /* mkdirat(dirfd,path,mode) */
+        int dirfd = (int)args[0];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        int rc = mkdir(host, (mode_t)args[2]);
+        if (rc < 0) { resp->error = -errno; return; }
+        resp->error = 0; resp->val = 0;
+        return; }
+    case 35: { /* unlinkat(dirfd,path,flags) */
+        int dirfd = (int)args[0];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        int rc = (args[2] & 0x200 /*AT_REMOVEDIR*/) ? rmdir(host) : unlink(host);
+        if (rc < 0) { resp->error = -errno; return; }
+        resp->error = 0; resp->val = 0;
+        return; }
+    case 53: { /* fchmodat(dirfd,path,mode,flags) */
+        int dirfd = (int)args[0];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        int rc = fchmodat(-100, host, (mode_t)args[2], (int)args[3]);
+        if (rc < 0) { resp->error = -errno; return; }
+        resp->error = 0; resp->val = 0; return; }
+    case 54: { /* fchownat(dirfd,path,u,g,flags) */
+        int dirfd = (int)args[0];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        int rc = fchownat(-100, host, (uid_t)args[2], (gid_t)args[3], (int)args[4]);
+        if (rc < 0) { resp->error = -errno; return; }
+        resp->error = 0; resp->val = 0; return; }
+    case 88: { /* utimensat(dirfd,path,times,flags) */
+        int dirfd = (int)args[0];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        if (args[1] == 0) { sp_notify_continue(resp); return; } /* NULL path: fd-based futimens */
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        struct timespec ts[2];
+        const struct timespec *tsp = NULL;
+        if (args[2] != 0) {
+            if (sp_vm_read(pid, ts, sizeof(ts), args[2]) != (ssize_t)sizeof(ts)) { sp_notify_continue(resp); return; }
+            tsp = ts;
+        }
+        int rc = utimensat(-100, host, tsp, (int)args[3]);
+        if (rc < 0) { resp->error = -errno; return; }
+        resp->error = 0; resp->val = 0;
+        SP_OFT("utimensat ok %s\n", host);
+        return; }
+    case 33: { /* mknodat(dirfd,path,mode,dev) */
+        int dirfd = (int)args[0];
+        if (dirfd != -100) { sp_notify_continue(resp); return; }
+        if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
+        if (!sp_translate(&g_cfg, guest, host)) { sp_notify_continue(resp); return; }
+        int rc = mknod(host, (mode_t)args[2], (dev_t)args[3]);
+        if (rc < 0) { resp->error = -errno; return; }
+        resp->error = 0; resp->val = 0; return; }
+    /* remaining: chownat/dirfd variants and two-path family get ptrace
+     * fallback (CONTINUE) until M2 */
+    default:
+        sp_notify_continue(resp);
+        return;
+    }
+}
+
+static unsigned long long g_notify_n = 0, g_notify_serv = 0, g_notify_cont = 0, g_notify_err = 0, g_notify_poller = 0;
+
+/* SIGCHLD -> self-pipe: ptrace stops deliver SIGCHLD; this lets one poll()
+ * wake on both ptrace events and user-notify requests. */
+static int g_spipe[2] = { -1, -1 };
+static void sp_sigchld_wake(int s) { (void)s; char b = 1; if (g_spipe[1] >= 0) (void)write(g_spipe[1], &b, 1); }
+static void sp_sigchld_init(void) {
+    if (pipe2(g_spipe, O_NONBLOCK | O_CLOEXEC) == 0) {
+        struct sigaction sa; memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = sp_sigchld_wake; sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;   /* CAUTION: NO SA_NOCLDSTOP — stops must wake too */
+        sigaction(SIGCHLD, &sa, NULL);
+    }
+}
+
+static void sp_notify_pump(void) {
+    struct seccomp_notif req;
+    memset(&req, 0, sizeof(req));
+    if (ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0) { g_notify_err++; return; }
+    g_notify_n++;
+    struct seccomp_notif_resp resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.id = req.id;
+    resp.val = 0; resp.error = 0; resp.flags = 0;
+    pid_t tid = req.pid;
+    sp_notify_serve_one(tid, req.data.nr, req.data.args, req.id, &resp);
+    if (resp.flags & SECCOMP_USER_NOTIF_FLAG_CONTINUE) g_notify_cont++; else g_notify_serv++;
+    ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
+}
+
+void sp_notify_child_install_and_send(int sockfd) {
+    { struct seccomp_notif_sizes szp; memset(&szp, 0, sizeof(szp));
+      if (sp_seccomp(SECCOMP_GET_NOTIF_SIZES, 0, &szp) < 0) {
+        SP_OFT("child: GET_NOTIF_SIZES errno=%d\n", errno);
+        close(sockfd);
+        return;
+      }
+      if (szp.seccomp_notif < 64) { SP_OFT("child: sizes too small\n"); close(sockfd); return; } }
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) { SP_OFT("child: NNP errno=%d\n", errno); close(sockfd); return; }
+    int fd = sp_notify_install();
+    if (fd < 0) { SP_OFT("child: install errno=%d (%s)\n", errno, strerror(errno)); close(sockfd); return; }
+    /* pass fd to supervisor: one byte of marker data */
+    char b = 'N';
+    struct iovec io = { &b, 1 };
+    char cms[CMSG_SPACE(sizeof(int))];
+    struct msghdr mh = { 0 };
+    mh.msg_iov = &io; mh.msg_iovlen = 1;
+    mh.msg_control = cms; mh.msg_controllen = sizeof(cms);
+    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+    c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    *(int *)CMSG_DATA(c) = fd;
+    sendmsg(sockfd, &mh, 0);
+    close(sockfd);
+    close(fd); /* child keeps filter; supervisor received its own ref */
+}
+
+int sp_notify_parent_recv(int sockfd) {
+    char b;
+    struct iovec io = { &b, 1 };
+    char cms[CMSG_SPACE(sizeof(int))];
+    struct msghdr mh = { 0 };
+    mh.msg_iov = &io; mh.msg_iovlen = 1;
+    mh.msg_control = cms; mh.msg_controllen = sizeof(cms);
+    ssize_t rc = recvmsg(sockfd, &mh, 0);
+    close(sockfd);
+    if (rc <= 0) return -1;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+    if (!c || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) return -1;
+    return *(int *)CMSG_DATA(c);
+}
+
+int sp_notify_probe(void) {
+    struct seccomp_notif_sizes sz;
+    memset(&sz, 0, sizeof(sz));
+    if (sp_seccomp(SECCOMP_GET_NOTIF_SIZES, 0, &sz) < 0) return 0;
+    return (sz.seccomp_notif >= 64) ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     const char *rootfs = getenv("SPROUT_ROOTFS");
     if (!rootfs) {
@@ -1213,16 +1629,63 @@ int main(int argc, char **argv) {
     /* then clear ourselves */
     unsetenv("LD_PRELOAD");
 
+    /* user-notify selection: env opt-out (SPROUT_USER_NOTIFY=0), else
+     * auto-probe. glibc-dynamic+LD_PRELOAD stays shadow (interposer
+     * already translates); statics + musl + Go own the notify filter when
+     * available. */
+    {   const char *u = getenv("SPROUT_USER_NOTIFY");
+        if (u && strcmp(u, "0") == 0) g_notify = 0;
+        else                        g_notify = sp_notify_probe();
+    }
+    if (g_debug)
+        fprintf(stderr, "[notify] mode=%s\n", g_notify ? "user-notify" : "ptrace-only");
+
+    int notify_pair[2] = { -1, -1 };
+    if (g_notify) {
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, notify_pair) != 0) {
+            perror("notify socketpair"); g_notify = 0;
+        }
+    }
+
     pid_t child = fork();
     if (child < 0) { perror("fork"); return 1; }
     if (child == 0) {
+        if (g_notify) {
+            close(notify_pair[0]);
+            sp_notify_child_install_and_send(notify_pair[1]);
+        }
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) _exit(127);
         if (guest_preload) setenv("LD_PRELOAD", guest_preload, /*override=*/1);
         execve(argv[2], &argv[2], environ);
         _exit(127);
     }
+    if (g_notify) {
+        close(notify_pair[1]);
+        g_notify_fd = sp_notify_parent_recv(notify_pair[0]);
+        if (g_notify_fd < 0) {
+            g_notify = 0;
+            if (g_debug) fprintf(stderr, "[notify] listener handshake failed -> ptrace-only\n");
+        } else {
+            g_notify_addfd = sp_notify_probe_addfd();
+            if (g_debug) fprintf(stderr, "[notify] listener=%d addfd=%d\n", g_notify_fd, g_notify_addfd);
+        }
+    }
 
-    if (waitpid(child, NULL, 0) < 0) { perror("waitpid"); return 1; }
+    /* First-stop acquisition: the child can already be blocked inside a
+     * user-notify request *before* its ptrace stop materializes (notify
+     * waits in the syscall; ptrace stops only surface on the return-to-
+     * userland path). waitpid-blocking here would deadlock: pump and wait
+     * together until the child shows its initial exec stop. */
+    if (g_notify && g_notify_fd >= 0) {
+        for (int iter = 0; iter < 4000; iter++) {
+            struct pollfd pfd = { g_notify_fd, POLLIN, 0 };
+            (void)poll(&pfd, 1, 2);
+            if (pfd.revents & POLLIN) sp_notify_pump();
+            pid_t w0 = waitpid(child, NULL, WNOHANG);
+            if (w0 == child) break;
+            if (w0 < 0) { perror("waitpid"); return 1; }
+        }
+    } else if (waitpid(child, NULL, 0) < 0) { perror("waitpid"); return 1; }
     if (ptrace(PTRACE_SETOPTIONS, child, 0,
                PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
                PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL) < 0) {
@@ -1232,15 +1695,46 @@ int main(int argc, char **argv) {
     if (ptrace(PTRACE_SYSCALL, child, 0, 0) < 0) { perror("PTRACE_SYSCALL"); return 1; }
 
     int status = 0;
+    /* Event-loop discipline: BOTH ptrace stops and user-notify requests
+     * must be serviced at stop-rate, not poll-tick rate. SIGCHLD wakes a
+     * self-pipe (ptrace stops deliver SIGCHLD), so one poll() covers both
+     * sources and wait4 drains *all* queued events per wake. The old 200ms
+     * poll cadence turned N ptrace stops into N*200ms of stall. */
+    sp_sigchld_init();
     for (;;) {
-        pid_t w = waitpid(-1, &status, 0);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            if (errno == ECHILD) break;
-            perror("waitpid"); break;
+        struct pollfd pfds[2];
+        int nfd = 0;
+        int ni = -1, si = -1;
+        if (g_notify) { ni = nfd; pfds[nfd].fd = g_notify_fd; pfds[nfd].events = POLLIN; nfd++; }
+        if (g_spipe[0] >= 0) { si = nfd; pfds[nfd].fd = g_spipe[0]; pfds[nfd].events = POLLIN; nfd++; }
+        if (nfd > 0) (void)poll(pfds, nfd, 500);
+        if (ni >= 0 && (pfds[ni].revents & POLLIN)) {
+            sp_notify_pump();
+            for (;;) {
+                struct pollfd q = { g_notify_fd, POLLIN, 0 };
+                if (poll(&q, 1, 0) <= 0 || !(q.revents & POLLIN)) break;
+                sp_notify_pump();
+            }
         }
+        if (si >= 0 && (pfds[si].revents & POLLIN)) { char buf[64]; while (read(g_spipe[0], buf, sizeof buf) > 0) ; }
+        int nevents = 0;
+        for (;;) {
+            pid_t w = waitpid(-1, &status, WNOHANG);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                if (errno == ECHILD) goto done;
+                perror("waitpid"); goto done;
+            }
+            if (w == 0) break;
+            nevents++;
+            SP_OFT("wait4 pid=%d status=%x\n", w, status);
         if (WIFEXITED(status)) {
-            if (w == child) return WEXITSTATUS(status);
+            if (w == child) {
+                if (g_notify_n || g_notify_poller)
+                    SP_OFT("notify stats: recv=%llu served=%llu cont=%llu recverr=%llu poller=%llu\n",
+                           g_notify_n, g_notify_serv, g_notify_cont, g_notify_err, g_notify_poller);
+                return WEXITSTATUS(status);
+            }
             goto cont;
         }
         if (WIFSIGNALED(status)) {
@@ -1385,6 +1879,10 @@ int main(int argc, char **argv) {
         continue;
     cont:
         ptrace(t->shadow ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, 0);
+        } /* end drain loop */
+        /* outer loop repeats: repoll both sources */
+        continue;
+        done: break;
     }
     return 0;
 }
