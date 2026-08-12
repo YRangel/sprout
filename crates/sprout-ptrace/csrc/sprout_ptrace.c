@@ -717,6 +717,14 @@ static int translate_reg_path(tracee_t *t, pid_t pid, struct user_pt_regs *r, in
     return 1;
 }
 
+static void sp_dbg_cwd(const char *tag, pid_t pid) {
+    char cw[SP_PATH_MAX];
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/%d/cwd", pid);
+    ssize_t n = readlink(link, cw, sizeof(cw) - 1);
+    if (n > 0) { cw[n] = 0; SP_TRACE("[cwd] %s pid=%d cwd=%s\n", tag, pid, cw); }
+}
+
 typedef struct {
     int ok;             /* 1 if GSI is available and op == ENTRY */
     int op;             /* 1=ENTRY 2=EXIT 0=unknown (GSI absent/failed) */
@@ -1182,6 +1190,7 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
         /* first pathname clause: dirfd-AT_FDCWD gated (a real dirfd
          * resolves in kernel space against an fd we don't mirror) */
         if (rule->dirfd_argi < 0 || (int)rchk.regs[rule->dirfd_argi] == AT_FDCWD_VAL) {
+            sp_dbg_cwd("gov", pid);
             if (translate_reg_path(t, pid, &rchk, rule->path_argi, rule->name))
                 regs_dirty = 1;
         }
@@ -2137,6 +2146,19 @@ int main(int argc, char **argv) {
             if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &iov) != 0) goto cont;
             sp_syscall_view v = sp_view_syscall(w, &r);
             if (v.op == 2) {           /* GSI EXIT stop: no entry-policy */
+                /* SELinux-denied hardlink (EPERM/EACCES on /data/data/.../files):
+                 * answer with a journal-safe content copy (parity with the
+                 * interposer + notify fallbacks). */
+                if (v.nr == 37 /*linkat*/ && getenv("SPROUT_LINK2SYMLINK") &&
+                    ((long)r.regs[0] == -1 /*-EPERM*/ || (long)r.regs[0] == -13 /*-EACCES*/)) {
+                    char oh[SP_PATH_MAX], nh[SP_PATH_MAX];
+                    if (peek_str(w, r.regs[1], oh, sizeof(oh)) > 0 &&
+                        peek_str(w, r.regs[3], nh, sizeof(nh)) > 0 &&
+                        sp_link_fallback_copy(oh, nh) == 0) {
+                        r.regs[0] = 0;
+                        ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
+                    }
+                }
                 if (t->rev_sysno) reverse_pending_addr(w, t);
                 goto cont;
             }

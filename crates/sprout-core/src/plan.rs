@@ -113,10 +113,13 @@ impl LaunchPlan {
                 loader,
                 argv,
                 env,
-                cwd: rootfs
-                    .cwd
-                    .as_ref()
-                    .map(|c| rootfs.to_host(std::path::Path::new(c))),
+                /* proot parity: guest cwd defaults to the guest root.
+                 * Inheriting the host cwd drops the child OUTSIDE the
+                 * rootfs, and root-relative guest programs (apk!) then
+                 * create junk like '/home/projeto/triggers.tmp.PID'. */
+                cwd: Some(rootfs.to_host(std::path::Path::new(
+                    rootfs.cwd.as_deref().unwrap_or("/"),
+                ))),
                 display: guest_prog.display().to_string(),
             });
         }
@@ -177,10 +180,10 @@ impl LaunchPlan {
             env.push(("SPROUT_DEBUG".into(), "1".into()));
         }
 
-        let cwd = rootfs
-            .cwd
-            .as_ref()
-            .map(|c| rootfs.to_host(std::path::Path::new(c)));
+        /* same default: no host-cwd inheritance outside the rootfs. */
+        let cwd = Some(rootfs.to_host(std::path::Path::new(
+            rootfs.cwd.as_deref().unwrap_or("/"),
+        )));
 
         Ok(Self {
             strategy: Strategy::Preload,

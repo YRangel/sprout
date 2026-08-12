@@ -281,6 +281,23 @@ static void sp_xcache_put(const char *g, const char *h) {
 static int (*sp_real_lstat)(const char *, struct stat *) = NULL;
 static ssize_t (*sp_real_readlink)(const char *, char *, size_t) = NULL;
 static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int follow_final) {
+    /* Relative paths: hang onto the real cwd in HOST view, then run the
+     * normal absolute translation (apk's db-write mix of absolute charm +
+     * relative journal journaling across mixed cwd changes lands at the
+     * right rootfs location under any cwd). */
+    char joined[SP_PATH_MAX];
+    if (path && path[0] != '/') {
+        char cw[SP_PATH_MAX];
+        ssize_t cn = readlink("/proc/self/cwd", cw, sizeof(cw) - 1);
+        if (cn > 0 && (size_t)cn < sizeof(cw)) {
+            cw[cn] = '\0';
+            size_t rl = g_cfg.rootfs_len;
+            if (rl && strncmp(cw, g_cfg.rootfs, rl) == 0) {
+                int w = snprintf(joined, sizeof(joined), "%s/%s", cw + rl, path);
+                if (w > 0 && (size_t)w < sizeof(joined)) path = joined;
+            }
+        }
+    }
     /* fast path: cache hit (covers the exec-chain hot loop). The cache is
      * chase-dependent, so only follow_final=1 results are cached/serve. */
     if (follow_final && sp_xcache_get(path, buf)) return buf;
@@ -357,6 +374,9 @@ int open64(const char *path, int flags, ...) {
     return SP_REAL(open64)(p, flags, mode);
 }
 
+/* Directory-relative passthrough: a dirfd-relative path belongs to the
+ * HOST's fd table; translating it against cwd would falsify the target
+ * (apk db rotation, nftw walk patterns). Raw pass-through is exact. */
 int openat(int dirfd, const char *path, int flags, ...) {
     static int (*SP_REAL(openat))(int, const char *, int, ...) = NULL;
     SP_RESOLVE(openat);
@@ -365,6 +385,8 @@ int openat(int dirfd, const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags);
         mode = va_arg(ap, mode_t); va_end(ap);
     }
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(openat)(dirfd, path, flags, mode);
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("openat", path, p);
@@ -379,6 +401,8 @@ int openat64(int dirfd, const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags);
         mode = va_arg(ap, mode_t); va_end(ap);
     }
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(openat64)(dirfd, path, flags, mode);
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("openat64", path, p);
@@ -896,6 +920,8 @@ int chmod(const char *path, mode_t mode) {
 int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
     static int (*SP_REAL(fchmodat))(int, const char *, mode_t, int) = NULL;
     SP_RESOLVE(fchmodat);
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(fchmodat)(dirfd, path, mode, flags);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("fchmodat", path, p);
@@ -1004,6 +1030,8 @@ int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
     static int fake_root3 = -1;
     if (fake_root3 < 0) fake_root3 = getenv("SPROUT_FAKEROOT") != NULL;
     SP_RESOLVE(fchownat);
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(fchownat)(dirfd, path, uid, gid, flags);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("fchownat", path, p);
@@ -1076,6 +1104,31 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
     static int (*SP_REAL(linkat))(int, const char *, int, const char *, int) = NULL;
     static int (*SP_REAL(symlinkat))(const char *, int, const char *) = NULL;
     SP_RESOLVE(linkat);
+    if ((olddirfd != -100 /*AT_FDCWD*/ && oldpath && oldpath[0] != '/') ||
+        (newdirfd != -100 /*AT_FDCWD*/ && newpath && newpath[0] != '/')) {
+        int rc = SP_REAL(linkat)(olddirfd, oldpath, newdirfd, newpath, flags);
+        /* SELinux still laughs at hardlinks even inside our db dir:
+         * journal-safe copy, mirroring the notify/governed fallbacks. */
+        if (rc != 0 && (errno == EPERM || errno == EACCES) && getenv("SPROUT_LINK2SYMLINK")) {
+            char ab[SP_PATH_MAX], nb[SP_PATH_MAX];
+            ab[0] = nb[0] = 0;
+            if (oldpath[0] != '/') {
+                char l1[128];
+                snprintf(l1, sizeof l1, "/proc/self/fd/%d", olddirfd);
+                ssize_t n = readlink(l1, ab, sizeof(ab) - 1);
+                if (n > 0) { ab[n] = 0; strncat(ab, "/", sizeof(ab) - strlen(ab) - 1); strncat(ab, oldpath, sizeof(ab) - strlen(ab) - 1); }
+            } else snprintf(ab, sizeof ab, "%s", oldpath);
+            if (newpath[0] != '/') {
+                char l2[128];
+                snprintf(l2, sizeof l2, "/proc/self/fd/%d", newdirfd);
+                ssize_t n = readlink(l2, nb, sizeof(nb) - 1);
+                if (n > 0) { nb[n] = 0; strncat(nb, "/", sizeof(nb) - strlen(nb) - 1); strncat(nb, newpath, sizeof(nb) - strlen(nb) - 1); }
+            } else snprintf(nb, sizeof nb, "%s", newpath);
+            if (ab[0] && nb[0] && sp_link_fallback_copy(ab, nb) == 0)
+                rc = 0;
+        }
+        return rc;
+    }
     char x1[SP_PATH_MAX], x2[SP_PATH_MAX];
     const char *p1 = sp_translate_x(oldpath, x1);
     const char *p2 = sp_translate_l(newpath, x2);
@@ -1111,6 +1164,8 @@ int utimes(const char *path, const struct timeval times[2]) {
 int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags) {
     static int (*SP_REAL(utimensat))(int, const char *, const struct timespec *, int) = NULL;
     SP_RESOLVE(utimensat);
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(utimensat)(dirfd, path, times, flags);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("utimensat", path, p);
@@ -1154,6 +1209,8 @@ int statvfs64(const char *path, struct statvfs64 *buf) {
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
     static int (*SP_REAL(fstatat))(int, const char *, struct stat *, int) = NULL;
     SP_RESOLVE(fstatat);
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(fstatat)(dirfd, path, st, flags);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("fstatat", path, p);
@@ -1164,6 +1221,8 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
 int newfstatat(int dirfd, const char *path, struct stat *st, int flags) {
     static int (*SP_REAL(newfstatat))(int, const char *, struct stat *, int) = NULL;
     SP_RESOLVE(newfstatat);
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(newfstatat)(dirfd, path, st, flags);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("newfstatat", path, p);
@@ -1276,6 +1335,8 @@ int setfsgid(gid_t fsgid) {
 int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *buf) {
     static int (*SP_REAL(statx))(int, const char *, int, unsigned int, struct statx *) = NULL;
     SP_RESOLVE(statx);
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(statx)(dirfd, path, flags, mask, buf);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_FOLLOW) ? sp_translate_x(path, x) : sp_translate_l(path, x);
     SP_TRACE("statx", path, p);
@@ -1287,6 +1348,8 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
 int mkdirat(int dirfd, const char *path, mode_t mode) {
     static int (*SP_REAL(mkdirat))(int, const char *, mode_t) = NULL;
     SP_RESOLVE(mkdirat);
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(mkdirat)(dirfd, path, mode);
     char x[SP_PATH_MAX];
     const char *p = sp_translate_l(path, x);
     SP_TRACE("mkdirat", path, p);
@@ -1296,6 +1359,8 @@ int mkdirat(int dirfd, const char *path, mode_t mode) {
 int unlinkat(int dirfd, const char *path, int flags) {
     static int (*SP_REAL(unlinkat))(int, const char *, int) = NULL;
     SP_RESOLVE(unlinkat);
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(unlinkat)(dirfd, path, flags);
     char x[SP_PATH_MAX];
     const char *p = sp_translate_l(path, x);
     SP_TRACE("unlinkat", path, p);
@@ -1305,6 +1370,8 @@ int unlinkat(int dirfd, const char *path, int flags) {
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
     static ssize_t (*SP_REAL(readlinkat))(int, const char *, char *, size_t) = NULL;
     SP_RESOLVE(readlinkat);
+    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+        return SP_REAL(readlinkat)(dirfd, path, buf, bufsiz);
     if (bufsiz == 0) return SP_REAL(readlinkat)(dirfd, path, buf, bufsiz);
     char x[SP_PATH_MAX];
     char target[SP_PATH_MAX];
@@ -1680,6 +1747,9 @@ int rename(const char *oldpath, const char *newpath) {
 int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
     static int (*SP_REAL(renameat))(int, const char *, int, const char *) = NULL;
     SP_RESOLVE(renameat);
+    if ((olddirfd != -100 /*AT_FDCWD*/ && oldpath && oldpath[0] != '/') ||
+        (newdirfd != -100 /*AT_FDCWD*/ && newpath && newpath[0] != '/'))
+        return SP_REAL(renameat)(olddirfd, oldpath, newdirfd, newpath);
     char xo[SP_PATH_MAX], xn[SP_PATH_MAX];
     const char *po = sp_translate_l(oldpath, xo);
     const char *pn = sp_translate_l(newpath, xn);
@@ -1689,6 +1759,9 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
 int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags) {
     static int (*SP_REAL(renameat2))(int, const char *, int, const char *, unsigned int) = NULL;
     SP_RESOLVE(renameat2);
+    if ((olddirfd != -100 /*AT_FDCWD*/ && oldpath && oldpath[0] != '/') ||
+        (newdirfd != -100 /*AT_FDCWD*/ && newpath && newpath[0] != '/'))
+        return SP_REAL(renameat2)(olddirfd, oldpath, newdirfd, newpath, flags);
     char xo[SP_PATH_MAX], xn[SP_PATH_MAX];
     const char *po = sp_translate_l(oldpath, xo);
     const char *pn = sp_translate_l(newpath, xn);
@@ -1709,6 +1782,8 @@ int symlink(const char *target, const char *linkpath) {
 int symlinkat(const char *target, int newdirfd, const char *linkpath) {
     static int (*SP_REAL(symlinkat))(const char *, int, const char *) = NULL;
     SP_RESOLVE(symlinkat);
+    if (newdirfd != -100 /*AT_FDCWD*/ && linkpath && linkpath[0] != '/')
+        return SP_REAL(symlinkat)(target, newdirfd, linkpath);
     char x[SP_PATH_MAX];
     const char *lp = sp_translate_l(linkpath, x);
     SP_TRACE("symlinkat", linkpath, lp);
