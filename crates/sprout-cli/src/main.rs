@@ -93,8 +93,23 @@ struct Cli {
     cmd: Vec<OsString>,
 }
 
+extern "C" {
+    fn umask(mask: u32) -> u32;
+}
+
 fn run() -> Result<u8, Error> {
     let cli = Cli::parse();
+
+    // Android/Termux apps run with umask 077; a Linux guest that believes
+    // it is uid=0 expects the distro default 022. proot-distro hides this
+    // because it enters via a login shell whose profile re-sets umask; we
+    // exec guests directly, so the host umask leaks through (observed:
+    // gcc's output binary became 0700 -> `test -x conftest` in autoconf
+    // fails -> configure marks every libc function missing). Guest distro
+    // profiles still override; override ours via SPROUT_KEEP_UMASK=1.
+    if std::env::var_os("SPROUT_KEEP_UMASK").is_none() {
+        unsafe { umask(0o022) };
+    }
 
     let mut rootfs = Rootfs::new(cli.rootfs)?;
     rootfs.cwd = cli.cwd;

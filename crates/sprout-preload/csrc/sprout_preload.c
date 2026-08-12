@@ -212,13 +212,58 @@ __attribute__((constructor)) static void sprout_init(void) {
     sp_config_load(&g_cfg);
 }
 
+static void sp_trace_line(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#define SP_SYS_openat 56
+#define SP_SYS_write 64
+#define SP_SYS_close 57
+static void sp_trace_line(const char *fmt, ...) {
+    const char *logf = getenv("SPROUT_TRACELOG");
+    if (!logf || !*logf) return;
+    /* RAW syscall path: no PLT, no recursion through our own wrappers */
+    int fd = (int)syscall(SP_SYS_openat, AT_FDCWD, logf,
+                          O_WRONLY | O_APPEND | O_CREAT, 0600);
+    if (fd < 0) return;
+    char buf[2048];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) (void)!syscall(SP_SYS_write, fd, buf, (size_t)n);
+    (void)syscall(SP_SYS_close, fd);
+}
+
 #define SP_TRACE(name, orig, trans)                                        \
     do {                                                                   \
         if (g_cfg.debug) {                                                 \
             fprintf(stderr, "[sprout] %s(\"%s\") -> \"%s\"\n", name,        \
                     orig ? orig : "(null)", trans);                        \
         }                                                                  \
+        sp_trace_line("TR %s pid=%d '%s' -> '%s'\n", name,                \
+                    (int)getpid(), orig ? orig : "(null)", trans);          \
     } while (0)
+
+/* configure-style guests redirect ALL child stderr to /dev/null or files,
+ * hiding every debug print the interposer wants to emit. SPROUT_TRACELOG
+ * names a host-fs file that receives a JSON-ish event stream per process.
+ * This opened the fcntl-AC_CHECK_FUNCS-producing-mystery to diagnosis:
+ * fcntl spawned pos_spawn(children) whose stderr never reached us before. */
+static void sp_trace_exec(const char *path, char *const argv[], int class_) {
+    const char *logf = getenv("SPROUT_TRACELOG");
+    if (!logf || !*logf) return;
+    int fd = (int)syscall(SP_SYS_openat, AT_FDCWD, logf,
+                          O_WRONLY | O_APPEND | O_CREAT, 0600);
+    if (fd < 0) return;
+    char buf[4096];
+    int n = 0;
+    n = snprintf(buf + n, sizeof(buf) - (size_t)n, "TRACE pid=%d class=%d path=%s",
+                 (int)getpid(), class_, path ? path : "(null)");
+    if (argv) {
+        for (int i = 0; argv[i] && i < 64 && n < (int)sizeof(buf) - 128; i++)
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n, " |%s", argv[i]);
+    }
+    buf[n++] = '\n';
+    (void)!write(fd, buf, (size_t)n);
+    close(fd);
+}
 
 #define SP_REAL(name) real_##name
 
@@ -962,7 +1007,10 @@ int chmod(const char *path, mode_t mode) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("chmod", path, p);
-    return SP_REAL(chmod)(p, mode);
+    int rc = SP_REAL(chmod)(p, mode);
+    sp_trace_line("TRM chmod pid=%d '%s' -> '%s' mode=%04o rc=%d errno=%d\n", (int)getpid(),
+                    path ? path : "(null)", p, (unsigned)mode & 07777, rc, rc < 0 ? errno : 0);
+    return rc;
 }
 int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
     static int (*SP_REAL(fchmodat))(int, const char *, mode_t, int) = NULL;
@@ -972,6 +1020,8 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("fchmodat", path, p);
+    sp_trace_line("TRM fchmodat pid=%d '%s' -> '%s' mode=%04o flags=%x\n", (int)getpid(),
+                    path ? path : "(null)", p, (unsigned)mode & 07777, flags);
     return SP_REAL(fchmodat)(dirfd, p, mode, flags);
 }
 
@@ -2039,7 +2089,14 @@ static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
  * scribble the RUNNING PARENT's glibc arena (observed on-device as the
  * parent's next spawn tripping glibc's sysmalloc assertion). All chain
  * structures are therefore built in CALLER STACK memory, never the heap. */
-#define SP_CHAIN_MAX_ARGS 256
+/* 256 was the original cap; autotools/rpm/docker-style guests regularly
+ * exec commands after glob expansion with hundreds of args (the argv-build
+ * EIO bug report: configure's grep got EIO 'errno=5' once argv arg-count
+ * exceeded vmax). 4096 pointers = 32 KiB of caller stack — safe pre-exec
+ * (glibc thread stack >= 8 MiB) and preserves ADR-0014 vfork-safety
+ * (still caller-stack memory, never heap). Configurability via env is
+ * left out deliberately: bigger static stack is strictly better here. */
+#define SP_CHAIN_MAX_ARGS 4096
 static int sp_build_loader_argv(char **v, size_t vmax,
                                 const char *host_prog, char *const argv[],
                                 int extra, int *outc) {
@@ -2048,8 +2105,10 @@ static int sp_build_loader_argv(char **v, size_t vmax,
     const char *loader = getenv("SPROUT_LOADER");
     const char *lp = getenv("SPROUT_LIBRARY_PATH");
     const char *libc_kind = getenv("SPROUT_LIBC"); /* "musl" or "glibc" (default) */
-    if (!loader && vmax < 8) return -1;
-    if (!loader) return -1;
+    if (!loader) {
+        fprintf(stderr, "[sprout] argv-build fail: SPROUT_LOADER unset (argc=%d)\n", argc);
+        return -2; /* -2: missing loader — different from cap overflow */
+    }
     int musl = libc_kind && strcmp(libc_kind, "musl") == 0;
     int i = 0;
     v[i++] = (char *)loader;
@@ -2059,7 +2118,11 @@ static int sp_build_loader_argv(char **v, size_t vmax,
     v[i++] = "--library-path";
     v[i++] = (char *)(lp ? lp : "");
     v[i++] = (char *)host_prog;
-    if (vmax < (size_t)(i + argc)) return -1;
+    if (vmax < (size_t)(i + argc)) {
+        fprintf(stderr, "[sprout] argv-build fail: argc=%d vneed=%d vmax=%zu\n",
+                argc, i + argc, vmax);
+        return -1; /* cap overflow */
+    }
     for (int k = 1; k < argc; k++) v[i++] = argv[k];
     v[i] = NULL;
     if (outc) *outc = i;
@@ -2106,12 +2169,13 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
     int cls = sp_classify_host(host, interp);
     if (g_cfg.debug)
         fprintf(stderr, "[sprout] execve('%s') host='%s' class=%d\n", path, host, cls);
+    sp_trace_exec(path, argv, cls);
     switch (cls) {
     case SP_ELF_DYNAMIC: {
         char *vstack[SP_CHAIN_MAX_ARGS + 8];
-        if (sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL) != 0) {
-            return sp_chain_fail(path, depth, EIO, "argv-build");
-        }
+        int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL);
+        if (b == -2) return sp_chain_fail(path, depth, EIO, "argv-build:no-loader");
+        if (b != 0) return sp_chain_fail(path, depth, E2BIG, "argv-build:cap");
         int rc = sp_real_execve(getenv("SPROUT_LOADER"), vstack, envp);
         if (rc < 0) return sp_chain_fail(path, depth, errno, "loader-execve");
         return rc;
@@ -2251,9 +2315,9 @@ int fexecve(int fd, char *const argv[], char *const envp[]) {
     switch (sp_classify_host(host, interp)) {
     case SP_ELF_DYNAMIC: {
         char *vstack[SP_CHAIN_MAX_ARGS + 8];
-        if (sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL) != 0) {
-            errno = EIO; return -1;
-        }
+        int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL);
+        if (b == -2) { errno = EIO; return -1; }
+        if (b != 0) { errno = E2BIG; return -1; }
         return sp_real_execve(getenv("SPROUT_LOADER"), vstack, envp);
     }
     default:

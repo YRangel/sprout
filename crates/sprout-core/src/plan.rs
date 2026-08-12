@@ -182,6 +182,11 @@ impl LaunchPlan {
                 ("SPROUT_LOADER".into(), loader.display().to_string()),
                 ("SPROUT_LIBRARY_PATH".into(), library_path),
                 ("SPROUT_LIBC".into(), "musl".into()),
+                // Autoconf-style guests fork/exec hundreds of conftest binaries;
+                // pre-binding every PLT entry on load prevents a class of
+                // stationary hangs observed in dash's variable-hashing
+                // paths under the lazy loader (≣`cqc` in bug reports).
+                ("LD_BIND_NOW".into(), "1".into()),
             ];
             if !rootfs.bindings.is_empty() {
                 env.push(("SPROUT_BIND".into(), rootfs.binds_env()));
@@ -257,6 +262,8 @@ impl LaunchPlan {
             ("LD_LIBRARY_PATH".into(), library_path.clone()),
             ("SPROUT_LOADER".into(), loader.display().to_string()),
             ("SPROUT_LIBRARY_PATH".into(), library_path),
+            // See musl branch note above: avoids conftest-hang class.
+            ("LD_BIND_NOW".into(), "1".into()),
         ];
         if !rootfs.bindings.is_empty() {
             env.push(("SPROUT_BIND".into(), rootfs.binds_env()));

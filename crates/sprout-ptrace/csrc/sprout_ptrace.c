@@ -104,6 +104,7 @@ static const sp_emul_rule SP_EMULATE_BASE[] = {
     { 426, -38 },  /* io_uring_enter    -> -ENOSYS */
     { 427, -38 },  /* io_uring_register -> -ENOSYS */
     { 439, -38 },  /* faccessat2 raw callers -> -ENOSYS (libc falls back) */
+    { 452, -38 },  /* fchmodat2 (GNU tar >= 1.35) -> -ENOSYS (fallback to fchmodat) */
     /* accept(202) deliberately NOT here: Android policy layers trigger
      * SIGSYS on it under our supervisor chain (tmux server accept is the
      * case). It must be PIVOTED to accept4(242) at the SIGSYS stop
@@ -1314,7 +1315,7 @@ static int sp_notify_install(void) {
         56 /*openat*/, 437 /*openat2*/,
         48 /*faccessat*/,
         34 /*mkdirat*/, 35 /*unlinkat*/, 33 /*mknodat*/,
-        53 /*fchmodat*/, 54 /*fchownat*/, 88 /*utimensat*/,
+        53 /*fchmodat*/, 54 /*fchownat*/, 55 /*fchown*/, 88 /*utimensat*/,
         36 /*symlinkat*/, 37 /*linkat*/, 38 /*renameat*/,
         276 /*renameat2*/,
         /* accept(202)/accept4(242) deliberately NOT trapped: Android TRAPs
@@ -1866,10 +1867,25 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
-        int rc = fchmodat(-100, host, (mode_t)args[2], (int)args[3]);
-        if (rc < 0) { resp->error = -errno; return; }
+        /* args[3] observed WILD (7fe1… junk) in some guests — glibc
+         * __chmod(fchmodat) reaches the trap with x3 un-zeroed: the kernel
+         * tolerates any flags value ≠ AT_-mask, but OUR forwarded bionic
+         * fchmodat ALSO fails EINVAL. Sanitize: forward only legal AT_ bits. */
+        int fch_flags = (int)args[3] & 0x100 /*AT_SYMLINK_NOFOLLOW only legal bit*/;
+        int rc = fchmodat(-100, host, (mode_t)args[2], fch_flags);
+        if (rc < 0) {
+            fprintf(stderr, "[notify] fchmodat serve pid=%d '%s' mode=%04o flags=%llx -> %d (%d)\n",
+                    pid, host, (unsigned)args[2] & 07777, (unsigned long long)args[3], rc, errno);
+            resp->error = -errno; return;
+        }
         resp->error = 0; resp->val = 0; return; }
     case 54: { /* fchownat(dirfd,path,u,g,flags) */
+        /* proot -0 parity: under FAKEROOT the guest believes it is uid=0, so
+         * the interposer fakes chown-family success (sprout_preload.c ~1051).
+         * The notify lane MUST mirror that: calling the real fchownat here
+         * relays the kernel EPERM for uid=10372 and breaks tar/dpkg/apt
+         * (which check the result and abort extraction). */
+        if (getenv("SPROUT_FAKEROOT")) { resp->error = 0; resp->val = 0; return; }
         int dirfd = (int)args[0];
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
@@ -1877,6 +1893,10 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         int rc = fchownat(-100, host, (uid_t)args[2], (gid_t)args[3], (int)args[4]);
         if (rc < 0) { resp->error = -errno; return; }
         resp->error = 0; resp->val = 0; return; }
+    case 55: { /* fchown(fd,u,g) — FAKEROOT: fake success (proot -0 parity;
+                 * see case 54). No path translation needed. */
+        if (getenv("SPROUT_FAKEROOT")) { resp->error = 0; resp->val = 0; return; }
+        sp_notify_continue(resp); return; }
     case 88: { /* utimensat(dirfd,path,times,flags) */
         int dirfd = (int)args[0];
         if (dirfd != -100) { sp_notify_continue(resp); return; }
