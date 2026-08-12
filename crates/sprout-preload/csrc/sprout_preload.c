@@ -2057,8 +2057,12 @@ static int sp_classify_host(const char *host, char interp[SP_PATH_MAX]) {
  * -1 when nothing matched. */
 static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
     if (strchr(name, '/') != NULL) {
-        /* already path-qualified */
+        /* already path-qualified: must still exist (shebang search, exec
+         * PATH bypass). Mirroring the PATH-search branch's access(X_OK). */
         if (strlen(name) >= SP_PATH_MAX) return -1;
+        char hostabs[SP_PATH_MAX];
+        const char *ha = sp_translate_x(name, hostabs);
+        if (access(ha, X_OK) != 0) return -1;
         strcpy(out, name);
         return 0;
     }
