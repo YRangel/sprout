@@ -78,6 +78,13 @@ T "user-musl-bin"               "$($S -r $A --user bin /bin/busybox id -u 2>/dev
 T "user-musl-nobody"            "$($S -r $A --user nobody /bin/busybox id -u 2>/dev/null)" "65534"
 T "user-default-unchanged"      "$($S -r $B /bin/bash -c 'echo $(id -u):$(id -g)' 2>/dev/null)" "0:0"
 
+# --- guest user lifecycle (useradd/audit netlink/nlink lock parity)
+T "audit-netlink-eprotonosupport" "$($S -r $B python3 /tmp/aud.py 2>/dev/null | grep -c 'errno=93')" "1"
+T "useradd-lifecycle"            "$($S -r $B /bin/bash -c 'rm -f /etc/passwd.lock /etc/group.lock /etc/shadow.lock /etc/gshadow.lock; userdel tprobe 2>/dev/null; rm -rf /home/tprobe; useradd -m tprobe 2>&1 >/dev/null; rc=$?; grep -c ^tprobe: /etc/passwd; exit $rc' | tail -1)" "1"
+T "user-created-home-drop"        "$($S -r $B --user tester /bin/bash -c 'pwd' 2>/dev/null)" "/home/tester"
+T "user-created-whoami"           "$($S -r $B --user tester /usr/bin/whoami 2>/dev/null)" "tester"
+T "apt-as-daemon-runs"           "$(timeout 90 $S -r $B --user daemon apt-get update 2>/dev/null 1>&2; echo rc=$?)" "rc=0"
+
 # --- sanity: supervisor not left running as zombie after each call
 T "no-zombie-sprout"            "$(n=0; for p in $(pgrep -f sprout-super 2>/dev/null); do [ "$(basename $(readlink /proc/$p/exe 2>/dev/null))" = "sprout-super" ] && n=$((n+1)); done; echo $n)" "0"
 

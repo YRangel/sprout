@@ -1080,6 +1080,27 @@ static void sp_spoof_uid_gid(uid_t *u, gid_t *g) {
     if (g && *g == hg) *g = g_fake_gid;
 }
 
+/* proot link2symlink-parity registry: hardlinks emulated as symlinks/copies
+ * leave nlink==1, which shadow's lock protocol (useradd: /etc/passwd.<pid>
+ * -> /etc/passwd.lock demands nlink==2) reads as "lock file already used".
+ * proot keeps an in-memory registry of symlinked-as-hardlink paths and
+ * reports nlink=2 via its stat wrappers; mirror it, process-local exec-live
+ * (lock+check happen inside one tool lifetime). */
+#define SP_HREG_MAX 256
+static char sp_hreg_paths[SP_HREG_MAX][SP_PATH_MAX];
+static int  sp_hreg_n = 0;
+static int sp_hreg_hit(const char *gpath) {
+    if (!gpath) return 0;
+    for (int i = 0; i < sp_hreg_n; i++)
+        if (strcmp(sp_hreg_paths[i], gpath) == 0) return 1;
+    return 0;
+}
+static void sp_hreg_note(const char *gpath) {
+    if (!gpath || !*gpath || *gpath != '/' || sp_hreg_n >= SP_HREG_MAX) return;
+    if (sp_hreg_hit(gpath)) return;
+    snprintf(sp_hreg_paths[sp_hreg_n++], SP_PATH_MAX, "%s", gpath);
+}
+
 /* state backing the fake answers; the get* wrappers below report
  * whatever the most recent fake set*id call promised. */
 uid_t  g_fake_uid = 0;
@@ -1257,6 +1278,7 @@ int link(const char *oldpath, const char *newpath) {
             }
         }
     }
+    if (rc == 0) { sp_hreg_note(newpath); sp_hreg_note(oldpath); } /* shadow nlink==2 lock quote ref: proot registry */
     return rc;
 }
 int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags) {
@@ -1306,6 +1328,7 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
             }
         }
     }
+    if (rc == 0) { sp_hreg_note(newpath); sp_hreg_note(oldpath); }
     return rc;
 }
 int truncate(const char *path, off_t length) {
@@ -1378,7 +1401,7 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("fstatat", path, p);
     int rc = SP_REAL(fstatat)(dirfd, p, st, flags);
-    if (rc == 0) sp_spoof_uid_gid(&st->st_uid, &st->st_gid);
+    if (rc == 0) { sp_spoof_uid_gid(&st->st_uid, &st->st_gid); if (sp_hreg_hit(path) && st->st_nlink == 1) st->st_nlink = 2; }
     return rc;
 }
 int newfstatat(int dirfd, const char *path, struct stat *st, int flags) {
@@ -1390,7 +1413,7 @@ int newfstatat(int dirfd, const char *path, struct stat *st, int flags) {
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("newfstatat", path, p);
     int rc = SP_REAL(newfstatat)(dirfd, p, st, flags);
-    if (rc == 0) sp_spoof_uid_gid(&st->st_uid, &st->st_gid);
+    if (rc == 0) { sp_spoof_uid_gid(&st->st_uid, &st->st_gid); if (sp_hreg_hit(path) && st->st_nlink == 1) st->st_nlink = 2; }
     return rc;
 }
 
@@ -1504,7 +1527,7 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
     const char *p = (flags & AT_SYMLINK_FOLLOW) ? sp_translate_x(path, x) : sp_translate_l(path, x);
     SP_TRACE("statx", path, p);
     int rc = SP_REAL(statx)(dirfd, p, flags, mask, buf);
-    if (rc == 0) sp_spoof_uid_gid(&buf->stx_uid, &buf->stx_gid);
+    if (rc == 0) { sp_spoof_uid_gid(&buf->stx_uid, &buf->stx_gid); if (sp_hreg_hit(path) && buf->stx_nlink == 1) buf->stx_nlink = 2; }
     return rc;
 }
 
@@ -1751,6 +1774,23 @@ int accept(int fd, struct sockaddr *addr, socklen_t *len) {
     return SP_REAL(accept4)(fd, addr, len, 0);
 }
 
+/* proot-distro parity for NETLINK_AUDIT: untrusted_app audit sockets are
+ * SELinux-denied with EACCES; shadow's useradd/adduser/usermod family
+ * aborts ("Cannot open audit interface") unless the audit netlink reads
+ * as UNSUPPORTED. proot-distro reports EPROTONOSUPPORT for the identical
+ * call on the same kernel (verified live, proot=93 vs sprout=13 before
+ * this wrapper). Minimal-lie errno remap, audit protocol only. */
+int socket(int domain, int type, int protocol) {
+    static int (*SP_REAL(socket))(int, int, int) = NULL;
+    SP_RESOLVE(socket);
+    int fd = SP_REAL(socket)(domain, type, protocol);
+    if (fd < 0 && domain == AF_NETLINK && protocol == 9 /*NETLINK_AUDIT*/
+        && errno == EACCES) {
+        errno = EPROTONOSUPPORT;
+    }
+    return fd;
+}
+
 /* proot-compat: fake SO_PEERCRED results the way proot does — the guest
  * believes it is uid=0 (SPROUT_FAKEROOT) but the kernel still reports the
  * real Android uid in ucred for AF_UNIX peers; servers with peer-AACl checks
@@ -1814,7 +1854,7 @@ int stat(const char *path, struct stat *st) {
     const char *p = sp_translate_x(path, x);
     SP_TRACE("stat", path, p);
     int rc = SP_REAL(stat)(p, st);
-    if (rc == 0) sp_spoof_uid_gid(&st->st_uid, &st->st_gid);
+    if (rc == 0) { sp_spoof_uid_gid(&st->st_uid, &st->st_gid); if (sp_hreg_hit(path) && st->st_nlink == 1) st->st_nlink = 2; }
     return rc;
 }
 
@@ -1833,7 +1873,7 @@ int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("fstatat64", path, p);
     int rc = SP_REAL(fstatat64)(dirfd, p, st, flags);
-    if (rc == 0) sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid);
+    if (rc == 0) { sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid); if (sp_hreg_hit(path) && ((struct stat *)st)->st_nlink == 1) ((struct stat *)st)->st_nlink = 2; }
     return rc;
 }
 
@@ -1844,7 +1884,7 @@ int stat64(const char *path, struct stat64 *st) {
     const char *p = sp_translate_x(path, x);
     SP_TRACE("stat64", path, p);
     int rc = SP_REAL(stat64)(p, st);
-    if (rc == 0) sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid);
+    if (rc == 0) { sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid); if (sp_hreg_hit(path) && ((struct stat *)st)->st_nlink == 1) ((struct stat *)st)->st_nlink = 2; }
     return rc;
 }
 
@@ -1855,7 +1895,7 @@ int lstat(const char *path, struct stat *st) {
     const char *p = sp_translate_l(path, x);
     SP_TRACE("lstat", path, p);
     int rc = SP_REAL(lstat)(p, st);
-    if (rc == 0) sp_spoof_uid_gid(&st->st_uid, &st->st_gid);
+    if (rc == 0) { sp_spoof_uid_gid(&st->st_uid, &st->st_gid); if (sp_hreg_hit(path) && st->st_nlink == 1) st->st_nlink = 2; }
     return rc;
 }
 
@@ -1866,7 +1906,7 @@ int lstat64(const char *path, struct stat64 *st) {
     const char *p = sp_translate_l(path, x);
     SP_TRACE("lstat64", path, p);
     int rc = SP_REAL(lstat64)(p, st);
-    if (rc == 0) sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid);
+    if (rc == 0) { sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid); if (sp_hreg_hit(path) && ((struct stat *)st)->st_nlink == 1) ((struct stat *)st)->st_nlink = 2; }
     return rc;
 }
 
