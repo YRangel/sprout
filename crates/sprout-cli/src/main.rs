@@ -115,23 +115,59 @@ fn run() -> Result<u8, Error> {
 
     let mut program_name = cli.cmd[0].to_string_lossy().into_owned();
     let mut program_host = rootfs.find_program(&program_name)?;
+    /* Symlink-forest guests (Alpine: every applet -> /bin/busybox) must be
+     * classified/read through the ROOTFS-relative resolution; fs::File::open
+     * on the raw host path would chase the link against the HOST root,
+     * where /bin/busybox doesn't exist. Derive the guest-absolute path from
+     * the (rootfs-prefixed) resolution find_program returned. */
+    let guest_abs = program_name.starts_with('/').then(|| std::path::PathBuf::from(&program_name))
+        .or_else(|| {
+            program_host
+                .strip_prefix(&rootfs.root)
+                .ok()
+                .map(|rel| std::path::Path::new("/").join(rel))
+        });
+    let classify_path = guest_abs
+        .as_ref()
+        .and_then(|g| rootfs.guest_real(g))
+        .unwrap_or_else(|| program_host.clone());
+    /* Rootfs-internal absolute symlinks (Alpine busybox foresterie) must
+     * be handed to the loader RESOLVED: the musl/glibc loaders open the
+     * program path on the HOST side, where chasing 'bin/sh -> /bin/busybox'
+     * lands on the host root and ENOENTs. argv[0] (guest spelling) still
+     * carries the applet identity forwarded by the chain. */
+    if classify_path != program_host {
+        program_host = classify_path.clone();
+    }
 
     // Full argv passed to the plan (argv[0] included, matching kernel exec):
     // for shebang scripts this becomes [interp, opt?, script, orig args...].
     let mut full_cmd: Vec<OsString> = cli.cmd.clone();
 
-    let mut class = classify(&program_host)?;
+    let mut class = classify(&classify_path)?;
 
     // Shebang (#!): exec the script's interpreter instead (kernel semantics:
     // argv = [interp, opt-arg?, script, orig args...]). The interpreter must
     // itself be a guest binary on PATH (supports '#!/usr/bin/env X' too).
     if matches!(class, GuestClass::NotElf) {
-        if let Some((interp, opt)) = parse_shebang(&program_host) {
+        if let Some((interp, opt)) = parse_shebang(&classify_path) {
             let interp_host = rootfs.find_program(&interp).map_err(|_| Error::UnsupportedElf {
                 program: program_name.clone(),
                 class: class.clone(),
             })?;
-            let interp_class = classify(&interp_host)?;
+            let interp_class_path = std::path::Path::new(&interp)
+                .is_absolute()
+                .then(|| rootfs.guest_real(std::path::Path::new(&interp)))
+                .flatten()
+                .or_else(|| {
+                    interp_host
+                        .strip_prefix(&rootfs.root)
+                        .ok()
+                        .map(|rel| std::path::Path::new("/").join(rel))
+                        .and_then(|g| rootfs.guest_real(&g))
+                })
+                .unwrap_or_else(|| interp_host.clone());
+            let interp_class = classify(&interp_class_path)?;
             let script_guest = program_name.clone();
             let orig_args: Vec<OsString> = cli.cmd[1..].to_vec();
             let mut rebuilt: Vec<OsString> = vec![interp.clone().into()];

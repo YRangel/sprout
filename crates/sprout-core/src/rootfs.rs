@@ -97,12 +97,31 @@ impl Rootfs {
         self.root.join(guest.strip_prefix("/").unwrap_or(guest))
     }
 
+    /// Resolve `guest` (absolute path inside THIS rootfs) through symlink
+    /// chains *relative to the rootfs*, not the host root. Bare
+    /// fs::metadata() evaluates an absolute symlink like `bin/ls -&gt;
+    /// /bin/busybox` against the HOST's /bin — dead under proot-distro
+    /// Alpine, where every applet is exactly that link.
+    pub fn guest_real(&self, guest_abs: &Path) -> Option<PathBuf> {
+        let mut cur = guest_abs.to_path_buf();
+        for _ in 0..8 {
+            let host = self.to_host(&cur);
+            let md = std::fs::symlink_metadata(&host).ok()?;
+            if !md.file_type().is_symlink() {
+                return Some(host);
+            }
+            let t = std::fs::read_link(&host).ok()?;
+            cur = if t.is_absolute() { t } else { cur.parent().unwrap_or(Path::new("/")).join(t) };
+        }
+        None
+    }
+
     /// Locate a bare command name against the standard guest PATH dirs.
     pub fn find_program(&self, name: &str) -> Result<PathBuf, Error> {
         if name.contains('/') {
-            let p = self.to_host(Path::new(name));
-            if p.exists() {
-                return Ok(p);
+            let guest = Path::new(name);
+            if self.guest_real(guest).is_some() {
+                return Ok(self.to_host(guest));
             }
             return Err(Error::ProgramNotFound(name.to_string()));
         }
@@ -115,9 +134,11 @@ impl Rootfs {
             "/bin",
         ];
         for d in DIRS {
-            let host = self.to_host(Path::new(d)).join(name);
-            if is_executable(&host) {
-                return Ok(host);
+            let guest = Path::new(d).join(name);
+            if let Some(host) = self.guest_real(&guest) {
+                if is_executable(&host) {
+                    return Ok(self.to_host(&guest));
+                }
             }
         }
         Err(Error::ProgramNotFound(name.to_string()))

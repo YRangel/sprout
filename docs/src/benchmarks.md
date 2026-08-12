@@ -75,6 +75,70 @@ Honest notes:
   runtime that never lets LD_PRELOAD near its paths) is materially faster
   than proot.
 
+## Extended battery (v0.5.1, 2026-08-12, median-of-5, release build)
+
+New harness: `MODE=full bench/run.sh` (+ `bench/run-alpine.sh`) — spawn
+churn, pipelines, traversal, I/O, compute, local git, lane A/Bs. All
+rootfses from proot-distro v5 containers on the same device.
+
+### Debian 13 (glibc 2.41)
+
+| workload                        | proot-distro | sprout  | speedup  |
+|---------------------------------|--------------|---------|----------|
+| `python3 -c pass`               | 235 ms       | 46 ms   | **5.1×** |
+| `bash -c true`                  | 210 ms       | 37 ms   | **5.7×** |
+| exec-chain (20× `/bin/true`)    | 232 ms       | 77 ms   | **3.0×** |
+| `find /etc -maxdepth 2`         | 214 ms       | 35 ms   | **6.1×** |
+| cmdsubst-pipe 100×              | 816 ms       | 480 ms  | **1.7×** |
+| grep-churn 200×                 | 1108 ms      | 881 ms  | **1.3×** |
+| `sh -c 'while true loop'` 500×  | 208 ms       | 32 ms   | **6.5×** |
+| `find /usr -type f`             | 5745 ms      | 347 ms  | **16.6×** |
+| `ls -R /usr/lib`                | 334 ms       | 60 ms   | **5.6×** |
+| `python os.walk /usr/lib`       | 446 ms       | 79 ms   | **5.7×** |
+| dd write 100MB + sync           | 330 ms       | 150 ms  | **2.2×** |
+| dd read 100MB (warm)            | 307 ms       | 124 ms  | **2.5×** |
+| `tar czf /etc`                  | 401 ms       | 76 ms   | **5.3×** |
+| `seq 200000 \| awk sum`         | 241 ms       | 63 ms   | **3.8×** |
+| `git status` (500-file repo)    | 267 ms       | 31 ms   | **8.6×** |
+| `git log --oneline --all`       | 212 ms       | 36 ms   | **5.9×** |
+
+`find /usr` at 16.6× is the syscall-per-inode profile where proot's
+ptrace-per-stat melts down; `cmdsubst-pipe 100×` (1.7×) is the floor —
+short-lived pipeline children pay fork+exec+wait costs on both sides.
+
+### Alpine (musl, busybox applets)
+
+| workload                        | proot-distro | sprout  | speedup  |
+|---------------------------------|--------------|---------|----------|
+| `sh -c true` (busybox ash)      | 213 ms       | 33 ms   | **6.5×** |
+| exec-chain 20× true             | 238 ms       | 118 ms  | **2.0×** |
+| cmdsubst-pipe 100×              | 567 ms       | 742 ms  | **0.76× (LOSS)** |
+| `python3 -c pass` (musl)        | 227 ms       | 87 ms   | **2.6×** |
+| `find /usr/bin -type f`         | 222 ms       | 42 ms   | **5.3×** |
+| dd write 64MB + sync            | 210 ms       | 35 ms   | **6.0×** |
+
+The musl cmdsubst-pipe LOSS is real and recorded honestly: under kind=3
+musl every short-lived pipeline child pays supervisor-side round-trips
+(classification + exec rewrite per spawn), and a pipe-fanout loop is the
+worst flood profile for it. Every spawn=one-stop. Everywhere else musl
+wins 2–6.5×.
+
+### Lane A/B (notify fast path vs ptrace-only lane, same build)
+
+| case            | sprout(notify) | sprout(ptrace-only) | ratio |
+|-----------------|----------------|---------------------|-------|
+| glibc `bash -c true` | 34 ms    | 28 ms       | 0.82×   |
+| glibc `find /etc`    | 34 ms    | 26 ms       | 0.76×   |
+| musl `find /usr`     | 453 ms   | 447 ms      | 0.99×   |
+| musl `sh -c true`    | 27 ms    | 30 ms       | 1.11×   |
+
+On spawn-dominated micro-markers the notify lane accrues a small
+handshake/ADDFD tax vs the plain ptrace lane on this device (0.76–0.82×);
+absolutely tiny in wall-clock terms (6–8ms across a whole invocation), and
+it buys the AF_UNIX/serve-side machinery used by X11 + sockets + the
+disk-write rotation families. Kept ON as the default because sockets
+mathematically cannot be served through a caller-only interposer.
+
 ## Historical (v0.3 toolchain sweep, 2026-08-11, same host)
 
 First published release pass: python3 239→41 (5.8×), exec-chain 285→49
