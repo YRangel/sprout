@@ -2114,7 +2114,7 @@ static int run_notify_statics(const char *stub, int argc, char **argv) {
           dl += snprintf(db + dl, 1000 - dl, "| stub=%s\n", stub);
           (void)!write(2, db, (size_t)dl); }
         execve(stub, nargv, environ);
-        { char eb[128]; int el = snprintf(eb, sizeof eb, "[notify] stub execve('%s') failed errno=%d\n", stub, errno); (void)!write(2, eb, (size_t)el); }
+        { char eb[128]; int el = snprintf(eb, sizeof eb, "[notify] stub execve('%s') failed errno=%d\n", stub, errno); if (el > (int)sizeof eb) el = (int)sizeof eb; (void)!write(2, eb, (size_t)el); }
         _exit(127);
     }
     close(np[1]);
@@ -2354,7 +2354,7 @@ int main(int argc, char **argv) {
         if (guest_preload) setenv("LD_PRELOAD", guest_preload, /*override=*/1);
         if (g_debug) { char mb[160]; int ml = snprintf(mb, sizeof mb, "[ptrace] child pre-exec target='%s'\n", argv[2]); (void)!write(2, mb, (size_t)ml); }
         execve(argv[2], &argv[2], environ);
-        { char eb[128]; int el = snprintf(eb, sizeof eb, "[ptrace] child execve('%s') failed: errno=%d (%s)\n", argv[2], errno, strerror(errno)); (void)!write(2, eb, (size_t)el); }
+        { char eb[128]; int el = snprintf(eb, sizeof eb, "[ptrace] child execve('%s') failed: errno=%d (%s)\n", argv[2], errno, strerror(errno)); if (el > (int)sizeof eb) el = (int)sizeof eb; (void)!write(2, eb, (size_t)el); }
         _exit(127);
     }
     if (g_notify) {

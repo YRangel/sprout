@@ -208,6 +208,14 @@ impl LaunchPlan {
             } else {
                 guest_home(rootfs)
             };
+            /* cwd must stay HOST-absolute: --host-home gives an already-host
+             * path; feeding it through to_host() double-prefixes the root
+             * ("os error 2" on launch). */
+            let host_cwd = if rootfs.host_home {
+                std::path::PathBuf::from(&def_cwd)
+            } else {
+                rootfs.to_host(std::path::Path::new(&def_cwd))
+            };
             return Ok(Self {
                 strategy: Strategy::Preload,
                 loader,
@@ -218,7 +226,7 @@ impl LaunchPlan {
                  * drops the child OUTSIDE the rootfs, and root-relative
                  * guest programs (apk!) then create junk like
                  * '/home/projeto/triggers.tmp.PID'. */
-                cwd: Some(rootfs.to_host(std::path::Path::new(&def_cwd))),
+                cwd: Some(host_cwd),
                 display: guest_prog.display().to_string(),
             });
         }
@@ -286,7 +294,11 @@ impl LaunchPlan {
         } else {
             guest_home(rootfs)
         };
-        let cwd = Some(rootfs.to_host(std::path::Path::new(&def_cwd)));
+        let cwd = if rootfs.host_home {
+            Some(std::path::PathBuf::from(&def_cwd))
+        } else {
+            Some(rootfs.to_host(std::path::Path::new(&def_cwd)))
+        };
 
         Ok(Self {
             strategy: Strategy::Preload,

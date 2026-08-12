@@ -291,6 +291,21 @@ fn run() -> Result<u8, Error> {
                 )?;
                 LaunchPlan::supervise(pre, supervisor)
             }
+            /* Dynamic ELF under --fallback ptrace: the raw binary cannot be
+             * exec'd natively (host kernel rejects an ENOENT PT_INTERP).
+             * Mirror the GoDynamic arm: preload-plan wrapped under the
+             * supervisor, so the loader chain runs with ptrace semantics. */
+            GuestClass::Dynamic { .. } => {
+                let pre = LaunchPlan::preload(
+                    &rootfs,
+                    program_host,
+                    &full_cmd,
+                    preload_so,
+                    cli.verbose,
+                    &cache_dir,
+                )?;
+                LaunchPlan::supervise(pre, supervisor)
+            }
             _ => {
                 let mut plan = LaunchPlan::supervisor(
                     &rootfs,

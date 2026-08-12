@@ -2151,6 +2151,7 @@ static int sp_chain_fail(const char *path, int depth, int err, const char *why) 
                       "[sprout] chain-fail depth=%d path='%s' why=%s errno=%d (%s) loader=%s\n",
                       depth, path ? path : "?", why, err, strerror(err),
                       getenv("SPROUT_LOADER") ? getenv("SPROUT_LOADER") : "(null)");
+    if (el > (int)sizeof eb) el = (int)sizeof eb;
     (void)!write(2, eb, (size_t)el);
     errno = err;
     return -1;
@@ -2344,7 +2345,7 @@ int system(const char *command) {
     if (pid == 0) {
         char *const argv[] = {"sh", "-c", (char *)command, NULL};
         sp_execve_chain("/bin/sh", argv, environ, 0);
-        { char eb[160]; int el = snprintf(eb, sizeof eb, "[sprout] system() chain exec failed errno=%d (%s)\n", errno, strerror(errno)); (void)!write(2, eb, (size_t)el); }
+        { char eb[160]; int el = snprintf(eb, sizeof eb, "[sprout] system() chain exec failed errno=%d (%s)\n", errno, strerror(errno)); if (el > (int)sizeof eb) el = (int)sizeof eb; (void)!write(2, eb, (size_t)el); }
         _exit(127);
     }
     int st;
@@ -2503,7 +2504,7 @@ static int sp_spawn_impl(pid_t *restrict pid, const char *path,
         if (err) { errno = err; _exit(127); }
         if (use_path) execvp(path, argv);
         else execve(path, argv, envp);
-        { char eb[160]; int el = snprintf(eb, sizeof eb, "[sprout] spawn-child exec('%s') failed errno=%d (%s)\n", path ? path : "?", errno, strerror(errno)); (void)!write(2, eb, (size_t)el); }
+        { char eb[160]; int el = snprintf(eb, sizeof eb, "[sprout] spawn-child exec('%s') failed errno=%d (%s)\n", path ? path : "?", errno, strerror(errno)); if (el > (int)sizeof eb) el = (int)sizeof eb; (void)!write(2, eb, (size_t)el); }
         _exit(127);
     }
     if (pid) *pid = child;
