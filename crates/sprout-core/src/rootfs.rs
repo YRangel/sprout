@@ -63,6 +63,14 @@ pub struct Rootfs {
     /// append the host $PREFIX/bin to the guest PATH (default: clean
     /// guest-only view)
     pub host_path: bool,
+    /// `--user` stance: resolved guest identity the fake-id family anchors
+    /// to (None = root anchor 0:0, proot -0 parity). Fake-id stays active
+    /// (`fakeroot=true`) — only the anchor moves, like `proot -i`.
+    pub fake_uid: Option<u32>,
+    pub fake_gid: Option<u32>,
+    pub user_name: Option<String>,
+    pub user_home: Option<String>,
+    pub user_shell: Option<String>,
 }
 
 impl Rootfs {
@@ -87,7 +95,89 @@ impl Rootfs {
             link2symlink: false,
             host_home: false,
             host_path: false,
+            fake_uid: None,
+            fake_gid: None,
+            user_name: None,
+            user_home: None,
+            user_shell: None,
         })
+    }
+
+    /// Resolve a `--user` spec `NAME[:GROUP]` / `UID[:GID]` against this
+    /// rootfs' /etc/passwd (+ /etc/group). proot `-i` parity for the
+    /// name-or-number grammar. Returns (uid, gid, name, home, shell).
+    pub fn resolve_user(&self, spec: &str) -> Result<(u32, u32, String, String, String), Error> {
+        let (u_part, g_part) = match spec.split_once(':') {
+            Some((u, g)) => (u, Some(g)),
+            None => (spec, None),
+        };
+        if u_part.is_empty() {
+            return Err(Error::UnknownUser(spec.to_string()));
+        }
+        let passwd_path = self.root.join("etc/passwd");
+        let passwd = std::fs::read_to_string(&passwd_path)
+            .map_err(|_| Error::UnknownUser(spec.to_string()))?;
+        let mut hit: Option<(&str, &str, u32, u32)> = None; // (name, home, uid, gid)
+        let mut shell_of = String::new();
+        for line in passwd.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = line.split(':').collect();
+            if f.len() < 7 {
+                continue;
+            }
+            let (name, uid_s, gid_s) = (f[0], f[2], f[3]);
+            let (Ok(uid), Ok(gid)) = (uid_s.parse::<u32>(), gid_s.parse::<u32>()) else {
+                continue;
+            };
+            let matches = if u_part.chars().all(|c| c.is_ascii_digit()) {
+                uid.to_string() == u_part
+            } else {
+                name == u_part
+            };
+            if matches {
+                shell_of = f[6].to_string();
+                hit = Some((name, f[5], uid, gid));
+                break;
+            }
+        }
+        let Some((name, home, uid, mut gid)) = hit else {
+            return Err(Error::UnknownUser(spec.to_string()));
+        };
+        if let Some(g) = g_part {
+            if g.chars().all(|c| c.is_ascii_digit()) {
+                gid = g.parse::<u32>()
+                    .map_err(|_| Error::UnknownUser(spec.to_string()))?;
+            } else {
+                let group_path = self.root.join("etc/group");
+                let groups = std::fs::read_to_string(&group_path)
+                    .map_err(|_| Error::UnknownUser(spec.to_string()))?;
+                let mut ghit = None;
+                for line in groups.lines() {
+                    let f: Vec<&str> = line.split(':').collect();
+                    if f.len() >= 3 && f[0] == g {
+                        ghit = f[2].parse::<u32>().ok();
+                        break;
+                    }
+                }
+                gid = ghit.ok_or_else(|| Error::UnknownUser(spec.to_string()))?;
+            }
+        }
+        let shell = if shell_of.is_empty() {
+            "/bin/sh".to_string()
+        } else {
+            shell_of
+        };
+        /* passwd homes like /nonexistent (nobody) would kill the launch
+         * on cwd ENOENT — fall back to guest / (proot-distro behaves the
+         * same when su(1) lands there). */
+        let home = if self.guest_real(std::path::Path::new(home)).map(|p| p.is_dir()).unwrap_or(false) {
+            home.to_string()
+        } else {
+            "/".to_string()
+        };
+        Ok((uid, gid, name.to_string(), home, shell))
     }
 
     /// Guest-spelled path → host path (root prefixing only; bindings are

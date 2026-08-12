@@ -208,8 +208,29 @@ size_t sp_reverse(const sp_config_t *cfg, const char *host, char *out, size_t ou
 
 static sp_config_t g_cfg;
 
+/* Fake-identity anchor state (definitions live next to the set*id stubs;
+ * referenced by the constructor above + spoof/peercred helpers below). */
+extern uid_t g_fake_uid;
+extern gid_t g_fake_gid;
+extern gid_t g_fake_groups[64];
+extern int   g_fake_ngroups;
+
 __attribute__((constructor)) static void sprout_init(void) {
     sp_config_load(&g_cfg);
+    /* --user anchor (proot -i / proot-distro --user parity): the resolved
+     * guest identity is forwarded by the launcher as SPROUT_FAKE_UID/GID;
+     * absent = root anchor (0/0). Musl-safe digit loop (no sscanf/atoi). */
+    {
+        const char *fu = getenv("SPROUT_FAKE_UID");
+        const char *fg = getenv("SPROUT_FAKE_GID");
+        unsigned long u = 0, g = 0;
+        if (fu && *fu) { for (const char *p = fu; *p >= '0' && *p <= '9'; p++) u = u * 10u + (unsigned)(*p - '0'); }
+        if (fg && *fg) { for (const char *p = fg; *p >= '0' && *p <= '9'; p++) g = g * 10u + (unsigned)(*p - '0'); }
+        g_fake_uid = (uid_t)u;
+        g_fake_gid = (gid_t)g;
+        g_fake_groups[0] = g_fake_gid;
+        g_fake_ngroups = 1;
+    }
 }
 
 static void sp_trace_line(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -1055,8 +1076,8 @@ static void sp_spoof_uid_gid(uid_t *u, gid_t *g) {
         he = sp_real_geteuid ? sp_real_geteuid() : 0;
         hg = sp_real_getegid ? sp_real_getegid() : 0;
     }
-    if (u && *u == he) *u = 0;
-    if (g && *g == hg) *g = 0;
+    if (u && *u == he) *u = g_fake_uid;
+    if (g && *g == hg) *g = g_fake_gid;
 }
 
 /* state backing the fake answers; the get* wrappers below report
@@ -1744,8 +1765,8 @@ int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) 
         && optlen != NULL && *optlen >= (socklen_t)sizeof(struct sp_ucred)
         && getenv("SPROUT_FAKEROOT") != NULL) {
         struct sp_ucred *u = (struct sp_ucred *)optval;
-        u->uid = 0;
-        u->gid = 0;
+        u->uid = g_fake_uid;
+        u->gid = g_fake_gid;
     }
     return r;
 }

@@ -61,6 +61,23 @@ T "argv-dash-leading"           "$($S -r $B /bin/bash -c 'printf "<%s>" "$1"' _ 
 T "argv-big-count"              "$($S -r $B /bin/bash -c '/usr/bin/gcc -o /dev/null $(for i in $(seq 1 400); do printf /temp/x$i.c; printf " "; done) 2>/dev/null 1>&2; echo rc=$?; exit 0' | tail -1)" "rc=1"
 T "host-path-addit-not-override" "$($S -r $B --host-path /bin/bash -c 'echo $PATH' | awk -v RS=':' '/files\/usr\/bin/ { hits++; next } /\/usr\/bin/ { guest++ } END { print (hits>0 && guest>0)?1:0 }')" "1"
 
+# --- --user anchor (proot -i / proot-distro --user parity)
+T "user-daemon-id"              "$($S -r $B --user daemon /bin/bash -c 'echo $(id -u):$(id -g)' 2>/dev/null)" "1:1"
+T "user-daemon-whoami"          "$($S -r $B --user daemon /usr/bin/whoami 2>/dev/null)" "daemon"
+T "user-numeric-1-2"            "$($S -r $B --user 1:2 /bin/bash -c 'echo $(id -u):$(id -g)' 2>/dev/null)" "1:2"
+T "user-nobody-home-fallback"   "$($S -r $B --user nobody /bin/bash -c pwd 2>/dev/null)" "/"
+T "user-daemon-home-cwd"        "$($S -r $B --user daemon /bin/bash -c pwd 2>/dev/null)" "/usr/sbin"
+T "user-env-USER-LOGNAME"       "$($S -r $B --user daemon /usr/bin/env 2>/dev/null | grep -cE '^(USER|LOGNAME)=daemon')" "2"
+T "user-shell-from-passwd"      "$($S -r $B --user daemon /usr/bin/env 2>/dev/null | grep '^SHELL=')" "SHELL=/usr/sbin/nologin"
+T "user-anchor-owner-spoof"     "$($S -r $B --user daemon /bin/bash -c 'rm -f /tmp/uu; touch /tmp/uu; stat -c %U /tmp/uu' 2>/dev/null)" "daemon"
+T "user-anchor-peercred"        "$(timeout 30 $S -r $B --user daemon python3 /tmp/pc.py 2>/dev/null | awk -F'[= ]' '{print $5":"$7}' | head -1)" "1:1"
+T "user-unknown-rc"             "$($S -r $B --user ghost /usr/bin/true 2>/dev/null; echo rc=$?)" "rc=1"
+T "user-unknown-msg"            "$($S -r $B --user ghost /usr/bin/true 2>&1 | grep -c 'not found')" "1"
+T "user-conflict-rc2"           "$($S -r $B --user daemon --no-fakeroot /usr/bin/true 2>/dev/null >/dev/null; echo rc=$?)" "rc=2"
+T "user-musl-bin"               "$($S -r $A --user bin /bin/busybox id -u 2>/dev/null)" "1"
+T "user-musl-nobody"            "$($S -r $A --user nobody /bin/busybox id -u 2>/dev/null)" "65534"
+T "user-default-unchanged"      "$($S -r $B /bin/bash -c 'echo $(id -u):$(id -g)' 2>/dev/null)" "0:0"
+
 # --- sanity: supervisor not left running as zombie after each call
 T "no-zombie-sprout"            "$(n=0; for p in $(pgrep -f sprout-super 2>/dev/null); do [ "$(basename $(readlink /proc/$p/exe 2>/dev/null))" = "sprout-super" ] && n=$((n+1)); done; echo $n)" "0"
 

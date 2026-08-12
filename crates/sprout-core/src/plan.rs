@@ -61,6 +61,8 @@ fn guest_path_for(rootfs: &Rootfs) -> String {
 fn guest_home(rootfs: &Rootfs) -> String {
     if rootfs.host_home {
         std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+    } else if let Some(h) = &rootfs.user_home {
+        h.clone()
     } else {
         "/root".into()
     }
@@ -85,19 +87,31 @@ fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
         env.push(("TERM".into(), term));
     }
+    if let Some(name) = &rootfs.user_name {
+        if !env.iter().any(|(k, _)| k == "USER") {
+            env.push(("USER".into(), name.clone()));
+        }
+        if !env.iter().any(|(k, _)| k == "LOGNAME") {
+            env.push(("LOGNAME".into(), name.clone()));
+        }
+    }
     if !env.iter().any(|(k, _)| k == "SHELL") {
         let base = std::env::var("SHELL")
             .ok()
             .and_then(|s| s.rsplit('/').next().map(|b| b.to_string()))
             .filter(|b| !b.is_empty());
-        let mut guest_shell: Option<String> = None;
-        if let Some(base) = base {
-            for c in [format!("/bin/{base}"), format!("/usr/bin/{base}")] {
-                if rootfs.guest_real(std::path::Path::new(&c)).map(|p| p.is_file()).unwrap_or(false) {
+        /* `--user`: the passwd record's login shell wins over probing the
+         * inherited host $SHELL basename — it IS the user's login shell. */
+        let mut guest_shell: Option<String> = rootfs.user_shell.clone();
+        if guest_shell.is_none() {
+            if let Some(base) = base {
+                for c in [format!("/bin/{base}"), format!("/usr/bin/{base}")] {
+                    if rootfs.guest_real(std::path::Path::new(&c)).map(|p| p.is_file()).unwrap_or(false) {
                     guest_shell = Some(c);
                     break;
                 }
             }
+        }
         }
         if guest_shell.is_none() {
             for c in ["/bin/bash", "/bin/sh"] {
@@ -193,6 +207,12 @@ impl LaunchPlan {
             }
             if rootfs.fakeroot {
                 env.push(("SPROUT_FAKEROOT".into(), "1".into()));
+                /* --user anchor: the interposer's fake-id family answers
+                 * from these instead of root (proot -i parity). */
+                if let (Some(u), Some(g)) = (rootfs.fake_uid, rootfs.fake_gid) {
+                    env.push(("SPROUT_FAKE_UID".into(), u.to_string()));
+                    env.push(("SPROUT_FAKE_GID".into(), g.to_string()));
+                }
             }
             if rootfs.link2symlink {
                 env.push(("SPROUT_LINK2SYMLINK".into(), "1".into()));
@@ -278,6 +298,10 @@ impl LaunchPlan {
         }
         if rootfs.fakeroot {
             env.push(("SPROUT_FAKEROOT".into(), "1".into()));
+            if let (Some(u), Some(g)) = (rootfs.fake_uid, rootfs.fake_gid) {
+                env.push(("SPROUT_FAKE_UID".into(), u.to_string()));
+                env.push(("SPROUT_FAKE_GID".into(), g.to_string()));
+            }
         }
         if rootfs.link2symlink {
             env.push(("SPROUT_LINK2SYMLINK".into(), "1".into()));

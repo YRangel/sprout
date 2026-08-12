@@ -62,6 +62,15 @@ struct Cli {
     #[arg(long = "host-home")]
     host_home: bool,
 
+    /// Fake-login as a guest user instead of root: `-u NAME`, `-u UID`,
+    /// `-u NAME:GROUP` or `-u UID:GID` (proot `-i` / proot-distro `--user`
+    /// parity). Resolved against the guest's /etc/passwd (+ /etc/group).
+    /// The fake-id family, ownership spoof, SO_PEERCRED, HOME/SHELL/USER/
+    /// LOGNAME and the default cwd all anchor to that user. Kernel truth
+    /// is unchanged (the app uid) — this is fake-id, not privilege change.
+    #[arg(short = 'u', long = "user", value_name = "USER[:GROUP]", conflicts_with = "no_fakeroot")]
+    user: Option<String>,
+
     /// Append the host $PREFIX/bin to the guest PATH (default: the clean
     /// guest-only PATH).
     #[arg(long = "host-path")]
@@ -117,6 +126,17 @@ fn run() -> Result<u8, Error> {
     rootfs.link2symlink = cli.link2symlink && !cli.no_link2symlink;
     rootfs.host_home = cli.host_home;
     rootfs.host_path = cli.host_path;
+    if let Some(spec) = &cli.user {
+        let (uid, gid, name, home, shell) = rootfs.resolve_user(spec)?;
+        /* `--user` implies the fake-id machinery at a non-root anchor
+         * (proot -i works identically: id-family faked, kernel untouched). */
+        rootfs.fakeroot = true;
+        rootfs.fake_uid = Some(uid);
+        rootfs.fake_gid = Some(gid);
+        rootfs.user_name = Some(name);
+        rootfs.user_home = Some(home);
+        rootfs.user_shell = Some(shell);
+    }
     for spec in &cli.binds {
         rootfs.bindings.push(Binding::parse(spec)?);
     }

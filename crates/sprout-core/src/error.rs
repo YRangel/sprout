@@ -13,7 +13,7 @@ pub enum Error {
     #[error("guest program '{0}' not found inside rootfs (searched standard PATH dirs)")]
     ProgramNotFound(String),
 
-    #[error("guest program '{program}' is {class:?}; sprout v0.1 runs 64-bit ELF binaries only. Shebang scripts (#!) land in v0.2 via interpreter-dir parsing; 32-bit support is not planned (ADR-0005).")]
+    #[error("guest program '{program}' is {class:?}; shebang scripts are supported when the interpreter resolves inside the guest (this one did not); 32-bit support is not planned (ADR-0005).")]
     UnsupportedElf {
         program: String,
         class: crate::GuestClass,
@@ -36,6 +36,9 @@ pub enum Error {
 
     #[error("libc sanitization failed: {0}")]
     Sanitize(String),
+
+    #[error("guest user '{0}' not found in rootfs' /etc/passwd (or unknown group)")]
+    UnknownUser(String),
 
     #[error(transparent)]
     Elf(#[from] ElfError),
