@@ -30,6 +30,7 @@
 
 #include <elf.h>
 #include <errno.h>
+#include <fcntl.h> /* O_* — host sys/chains pull this in transitively, guest glibc doesn't; was the only reason guest-side -Wall compiles errored on O_* */
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>

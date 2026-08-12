@@ -1216,9 +1216,12 @@ static int sp_link_fallback_l2s(const char *p1, const char *p2) {
             goto have_hidden;
         }
     }
-    snprintf(hid, sizeof hid, "%s/.l2s/.l2s.%s.%lx%lx", g_cfg.rootfs, base,
-             (unsigned long)getpid(), (unsigned long)++l2s_n);
-    if (mkdir((snprintf(tmp, sizeof tmp, "%s/.l2s", g_cfg.rootfs), tmp), 0700) != 0 && errno != EEXIST)
+    if (snprintf(hid, sizeof hid, "%s/.l2s/.l2s.%s.%lx%lx", g_cfg.rootfs, base,
+                 (unsigned long)getpid(), (unsigned long)++l2s_n) >= (int)sizeof hid)
+        return -1; /* long-path safety: silent truncation below would rename to the WRONG file */
+    if (snprintf(tmp, sizeof tmp, "%s/.l2s", g_cfg.rootfs) >= (int)sizeof tmp)
+        return -1;
+    if (mkdir(tmp, 0700) != 0 && errno != EEXIST)
         return -1;
     if (rename(p1, hid) != 0) return -1;
     if (symlink(hid, p1) != 0) {
@@ -1803,7 +1806,7 @@ int getsockopt(int fd, int level, int optname, void *optval, socklen_t *optlen) 
     int r = SP_REAL(getsockopt)(fd, level, optname, optval, optlen);
     if (r == 0 && level == SOL_SOCKET && optname == SO_PEERCRED && optval != NULL
         && optlen != NULL && *optlen >= (socklen_t)sizeof(struct sp_ucred)
-        && getenv("SPROUT_FAKEROOT") != NULL) {
+        && sp_fakeroot_on()) {
         struct sp_ucred *u = (struct sp_ucred *)optval;
         u->uid = g_fake_uid;
         u->gid = g_fake_gid;
@@ -2050,7 +2053,8 @@ static void sp_resolve_absolute_symlink(char host[SP_PATH_MAX]) {
             char *sl = strrchr(dir, '/');
             if (!sl) return;
             *sl = '\0';
-            snprintf(host, SP_PATH_MAX, "%s/%s", dir, target);
+            int w = snprintf(host, SP_PATH_MAX, "%s/%s", dir, target);
+            if (w < 0 || w >= SP_PATH_MAX) return; /* truncated join = wrong path; leave host as-is */
         }
     }
 }
