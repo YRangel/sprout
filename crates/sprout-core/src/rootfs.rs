@@ -280,6 +280,19 @@ impl Rootfs {
 
     /// Host-absolute library search path for the guest loader, built from
     /// dirs that actually exist in the rootfs.
+    ///
+    /// Side effect (proot-parity gap): loader-stage opens bypass BOTH the
+    /// interposer (ld.so uses internal syscalls) and user-notify (no filter
+    /// installed until the preload ctor runs). Any ABSOLUTE symlink inside
+    /// those dirs (the update-alternatives classic: /usr/lib/.../libX.so.N
+    /// -> /etc/alternatives/... -> /usr/lib/...) escapes into the HOST's /
+    /// when the kernel follows it mid-open, so NEEDED libs behind such
+    /// chains fail ENOENT (ffplay -> libblas.so.3 repro). The interposer's
+    /// 8-hop readlink loop fixes app-stage opens but can never run here,
+    /// so each launch we rewrite absolute guest-internal symlinks in the
+    /// loader dirs + /etc/alternatives to RELATIVE ones — guest semantics
+    /// identical, kernel-side resolution stays inside the rootfs.
+    /// Cheap: one readdir + lstat per existing dir.
     pub fn library_path(&self) -> String {
         const DIRS: [&str; 6] = [
             "/lib/aarch64-linux-gnu",
@@ -289,6 +302,9 @@ impl Rootfs {
             "/lib",
             "/usr/lib",
         ];
+        for d in DIRS.iter().copied().chain(["/etc/alternatives"]) {
+            self.normalize_absolute_symlinks(d);
+        }
         DIRS.iter()
             .map(Path::new)
             .map(|d| self.to_host(d))
@@ -296,6 +312,63 @@ impl Rootfs {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join(":")
+    }
+
+    /// Rewrite absolute symlinks under guest dir `gdir` (guest spelling)
+    /// into relative ones when the target is guest-internal. Skips
+    /// genuinely host/pseudo-absolute targets (/proc /sys /dev) which no
+    /// relative rewrite could fix. Recursive one level is unnecessary:
+    /// each chained link is rewritten individually, so the kernel can walk
+    /// the whole chain itself afterwards.
+    fn normalize_absolute_symlinks(&self, gdir: &str) {
+        let host_dir = self.to_host(Path::new(gdir));
+        // usr-merge /lib->/usr/lib trap: the kernel resolves gdir through
+        // rootfs symlinks BEFORE walking relative targets, so the effective
+        // base is the canonical dir — compute relativeness against THAT or
+        // links written via the /lib spelling are short one ".." at the
+        // /usr/lib spelling (libblas repro: loader tries both).
+        let Ok(canon) = std::fs::canonicalize(&host_dir) else { return };
+        let host_prefix = match std::fs::canonicalize(&self.root) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let Some(gdir_canon) = canon
+            .strip_prefix(&host_prefix)
+            .ok()
+            .and_then(|p| p.to_str())
+            .map(|s| format!("/{s}"))
+        else {
+            return;
+        };
+        let Ok(rd) = std::fs::read_dir(&canon) else { return };
+        for entry in rd.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if !ft.is_symlink() {
+                continue;
+            }
+            let target = match std::fs::read_link(entry.path()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let Some(tstr) = target.to_str() else { continue };
+            if !tstr.starts_with('/') {
+                continue; // already relative
+            }
+            if ["/proc/", "/sys/", "/dev/"].iter().any(|p| tstr.starts_with(p)) {
+                continue; // kernel-space pseudo paths, not guest-tree content
+            }
+            let Some(rel) = relative_symlink_target(&gdir_canon, tstr) else { continue };
+            // atomic replace: build next to the link, rename over it
+            let tmp = canon.join(format!(".sprout-ln-{}", std::process::id()));
+            let _ = std::fs::remove_file(&tmp);
+            if std::os::unix::fs::symlink(&rel, &tmp).is_ok() {
+                let _ = std::fs::rename(&tmp, entry.path());
+            }
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     /// Locate the guest's libc.so.6 (a real shared object, not the
@@ -341,9 +414,54 @@ fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
+/// Relative symlink target from guest dir `from_dir` (guest-absolute) to
+/// guest-absolute `to_abs`. e.g. ("/usr/lib/aarch64-linux-gnu",
+/// "/etc/alternatives/x") -> "../../../etc/alternatives/x".
+fn relative_symlink_target(from_dir: &str, to_abs: &str) -> Option<String> {
+    let from: Vec<&str> = from_dir.split('/').filter(|s| !s.is_empty()).collect();
+    let to: Vec<&str> = to_abs.split('/').filter(|s| !s.is_empty()).collect();
+    let mut i = 0;
+    while i < from.len() && i < to.len() && from[i] == to[i] {
+        i += 1;
+    }
+    let mut rel = String::new();
+    for n in i..from.len() {
+        if n > i || !rel.is_empty() {
+            rel.push('/');
+        }
+        rel.push_str("..");
+    }
+    for seg in &to[i..] {
+        if !rel.is_empty() {
+            rel.push('/');
+        }
+        rel.push_str(seg);
+    }
+    if rel.is_empty() {
+        None
+    } else {
+        Some(rel)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_symlink_math() {
+        use super::relative_symlink_target as r;
+        assert_eq!(
+            r("/usr/lib/aarch64-linux-gnu", "/etc/alternatives/x").unwrap(),
+            "../../../etc/alternatives/x"
+        );
+        assert_eq!(
+            r("/usr/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu/blas/libblas.so.3",).unwrap(),
+            "blas/libblas.so.3"
+        );
+        assert_eq!(r("/etc/alternatives", "/usr/lib/x").unwrap(), "../../usr/lib/x");
+        assert_eq!(r("/lib64", "/lib64/ld.so").unwrap(), "ld.so");
+    }
 
     #[test]
     fn parses_binding_forms() {

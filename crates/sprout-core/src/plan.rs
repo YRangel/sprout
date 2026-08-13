@@ -129,6 +129,15 @@ fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
     if !env.iter().any(|(k, _)| k == "OLDPWD") {
         env.push(("OLDPWD".into(), guest_home(rootfs)));
     }
+    // proot-distro audio parity: their login profile exports PULSE_SERVER=
+    // 127.0.0.1 because the unix-socket path authenticates on SO_PEERCRED,
+    // which BOTH proot and sprout spoof under the fake-id anchor (hole: the
+    // host pulse server rightfully distrusts a peer claiming its own uid).
+    // TCP + auth-anonymous sidesteps cred spoofing — proot-distro's exact
+    // answer. User override wins (env check first).
+    if !env.iter().any(|(k, _)| k == "PULSE_SERVER") {
+        env.push(("PULSE_SERVER".into(), "127.0.0.1".into()));
+    }
 }
 
 /// Ensure the guest has a working POSIX-shm directory: python's

@@ -32,5 +32,8 @@ T "tmux-clean"              "$($S -r $B /bin/bash /tmp/probe3.sh 2>/dev/null | g
 T "statics-10-B"            "$(for i in $(seq 1 10); do $S -r $B /tmp/sp_asm >/dev/null 2>&1; [ $? -eq 42 ] || echo x; done | wc -l)" "0"
 T "statics-10-A"            "$(for i in $(seq 1 10); do $S -r $A /tmp/sp_asm >/dev/null 2>&1; [ $? -eq 42 ] || echo x; done | wc -l)" "0"
 T "shared-tmp-vis"          "$($S -r $B --shared-tmp /bin/bash -c 'ls /tmp | head -1 | wc -l')" "1"
-T "dry-run-exports"         "$($S -r $B --dry-run /usr/bin/true 2>&1 | grep -c '^export')" "16"
+
+T "dry-run-exports"         "$($S -r $B --dry-run /usr/bin/true 2>&1 | grep -c '^export')" "17"
+
 echo "SUMMARY: pass=$pass fail=$fail"
+

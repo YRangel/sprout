@@ -54,7 +54,7 @@ T "musl-exit39"                 "$($S -r $A /bin/busybox sh -c 'exit 39' 2>/dev/
 
 # --- script/shebang class
 T "script-smoke"                "$($S -r $B /bin/bash -c 'rm -f /tmp/noob.sh; printf "#!/bin/nonexistent\\n" > /tmp/noob.sh; chmod +x /tmp/noob.sh; /tmp/noob.sh; echo rc=$?; exit 0' 2>&1 | tail -1)" "rc=127"
-T "dry-run-statics-env"         "$($S -r $B --dry-run /tmp/sp_asm 2>&1 | grep -c '^export')" "11"
+T "dry-run-statics-env"         "$($S -r $B --dry-run /tmp/sp_asm 2>&1 | grep -c '^export')" "12"
 
 # --- command arg edge cases
 T "argv-dash-leading"           "$($S -r $B /bin/bash -c 'printf "<%s>" "$1"' _ -x)" "<-x>"
