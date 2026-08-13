@@ -16,7 +16,8 @@ own ADR.
 ## v0.1 exit criteria
 
 - `sprout -r /path/to/ubuntu /usr/bin/node --version` prints the node version.
-- `cargo test --workspace` green on Termux and on ubuntu-24.04-arm.
+- `cargo test --workspace` green on Termux (self-hosted runner, see
+  development workflow notes).
 - `--dry-run` documents the full exec plan for any guest ELF.
 - No `.text` patching, no `ptrace`, no temp files created at run time.
 

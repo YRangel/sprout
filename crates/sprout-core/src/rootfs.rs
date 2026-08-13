@@ -77,7 +77,10 @@ impl Rootfs {
     /// Guest libc flavor detection: musl rootfses ship /lib/ld-musl-*.so.1
     /// (which IS the libc); glibc rootfses ship ld-linux sources.
     pub fn libc_flavor(&self) -> LibcFlavor {
-        if self.to_host(Path::new("/lib/ld-musl-aarch64.so.1")).exists() {
+        if self
+            .to_host(Path::new("/lib/ld-musl-aarch64.so.1"))
+            .exists()
+        {
             return LibcFlavor::Musl;
         }
         LibcFlavor::Glibc
@@ -147,7 +150,8 @@ impl Rootfs {
         };
         if let Some(g) = g_part {
             if g.chars().all(|c| c.is_ascii_digit()) {
-                gid = g.parse::<u32>()
+                gid = g
+                    .parse::<u32>()
                     .map_err(|_| Error::UnknownUser(spec.to_string()))?;
             } else {
                 let group_path = self.root.join("etc/group");
@@ -172,7 +176,11 @@ impl Rootfs {
         /* passwd homes like /nonexistent (nobody) would kill the launch
          * on cwd ENOENT — fall back to guest / (proot-distro behaves the
          * same when su(1) lands there). */
-        let home = if self.guest_real(std::path::Path::new(home)).map(|p| p.is_dir()).unwrap_or(false) {
+        let home = if self
+            .guest_real(std::path::Path::new(home))
+            .map(|p| p.is_dir())
+            .unwrap_or(false)
+        {
             home.to_string()
         } else {
             "/".to_string()
@@ -201,7 +209,11 @@ impl Rootfs {
                 return Some(host);
             }
             let t = std::fs::read_link(&host).ok()?;
-            cur = if t.is_absolute() { t } else { cur.parent().unwrap_or(Path::new("/")).join(t) };
+            cur = if t.is_absolute() {
+                t
+            } else {
+                cur.parent().unwrap_or(Path::new("/")).join(t)
+            };
         }
         None
     }
@@ -327,7 +339,9 @@ impl Rootfs {
         // base is the canonical dir — compute relativeness against THAT or
         // links written via the /lib spelling are short one ".." at the
         // /usr/lib spelling (libblas repro: loader tries both).
-        let Ok(canon) = std::fs::canonicalize(&host_dir) else { return };
+        let Ok(canon) = std::fs::canonicalize(&host_dir) else {
+            return;
+        };
         let host_prefix = match std::fs::canonicalize(&self.root) {
             Ok(p) => p,
             Err(_) => return,
@@ -340,7 +354,9 @@ impl Rootfs {
         else {
             return;
         };
-        let Ok(rd) = std::fs::read_dir(&canon) else { return };
+        let Ok(rd) = std::fs::read_dir(&canon) else {
+            return;
+        };
         for entry in rd.flatten() {
             let ft = match entry.file_type() {
                 Ok(ft) => ft,
@@ -353,14 +369,21 @@ impl Rootfs {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            let Some(tstr) = target.to_str() else { continue };
+            let Some(tstr) = target.to_str() else {
+                continue;
+            };
             if !tstr.starts_with('/') {
                 continue; // already relative
             }
-            if ["/proc/", "/sys/", "/dev/"].iter().any(|p| tstr.starts_with(p)) {
+            if ["/proc/", "/sys/", "/dev/"]
+                .iter()
+                .any(|p| tstr.starts_with(p))
+            {
                 continue; // kernel-space pseudo paths, not guest-tree content
             }
-            let Some(rel) = relative_symlink_target(&gdir_canon, tstr) else { continue };
+            let Some(rel) = relative_symlink_target(&gdir_canon, tstr) else {
+                continue;
+            };
             // atomic replace: build next to the link, rename over it
             let tmp = canon.join(format!(".sprout-ln-{}", std::process::id()));
             let _ = std::fs::remove_file(&tmp);
@@ -456,10 +479,17 @@ mod tests {
             "../../../etc/alternatives/x"
         );
         assert_eq!(
-            r("/usr/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu/blas/libblas.so.3",).unwrap(),
+            r(
+                "/usr/lib/aarch64-linux-gnu",
+                "/usr/lib/aarch64-linux-gnu/blas/libblas.so.3",
+            )
+            .unwrap(),
             "blas/libblas.so.3"
         );
-        assert_eq!(r("/etc/alternatives", "/usr/lib/x").unwrap(), "../../usr/lib/x");
+        assert_eq!(
+            r("/etc/alternatives", "/usr/lib/x").unwrap(),
+            "../../usr/lib/x"
+        );
         assert_eq!(r("/lib64", "/lib64/ld.so").unwrap(), "ld.so");
     }
 

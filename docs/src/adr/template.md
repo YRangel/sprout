@@ -1,8 +1,8 @@
-# ADR-NNNN: <short imperative title>
+# ADR-NNNN: `<short imperative title>`
 
 - **Status:** proposed | accepted | deprecated | superseded by ADR-XXXX
 - **Date:** YYYY-MM-DD
-- **Deciders:** <names>
+- **Deciders:** `<names>`
 
 ## Context
 

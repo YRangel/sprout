@@ -49,8 +49,8 @@ fn guest_path_for(rootfs: &Rootfs) -> String {
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
     });
     if rootfs.host_path {
-        let prefix = std::env::var("PREFIX")
-            .unwrap_or_else(|_| "/data/data/com.termux/files/usr".into());
+        let prefix =
+            std::env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".into());
         p.push_str(&format!(":{prefix}/bin"));
     }
     p
@@ -106,22 +106,33 @@ fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
         if guest_shell.is_none() {
             if let Some(base) = base {
                 for c in [format!("/bin/{base}"), format!("/usr/bin/{base}")] {
-                    if rootfs.guest_real(std::path::Path::new(&c)).map(|p| p.is_file()).unwrap_or(false) {
-                    guest_shell = Some(c);
-                    break;
+                    if rootfs
+                        .guest_real(std::path::Path::new(&c))
+                        .map(|p| p.is_file())
+                        .unwrap_or(false)
+                    {
+                        guest_shell = Some(c);
+                        break;
+                    }
                 }
             }
         }
-        }
         if guest_shell.is_none() {
             for c in ["/bin/bash", "/bin/sh"] {
-                if rootfs.guest_real(std::path::Path::new(c)).map(|p| p.is_file()).unwrap_or(false) {
+                if rootfs
+                    .guest_real(std::path::Path::new(c))
+                    .map(|p| p.is_file())
+                    .unwrap_or(false)
+                {
                     guest_shell = Some(c.to_string());
                     break;
                 }
             }
         }
-        env.push(("SHELL".into(), guest_shell.unwrap_or_else(|| "/bin/sh".into())));
+        env.push((
+            "SHELL".into(),
+            guest_shell.unwrap_or_else(|| "/bin/sh".into()),
+        ));
     }
     if !env.iter().any(|(k, _)| k == "TMPDIR") {
         env.push(("TMPDIR".into(), "/tmp".into()));
@@ -148,7 +159,11 @@ fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
             if !d.is_empty() {
                 env.push(("DISPLAY".into(), d));
             }
-        } else if rootfs.bindings.iter().any(|b| b.guest == PathBuf::from("/tmp")) {
+        } else if rootfs
+            .bindings
+            .iter()
+            .any(|b| b.guest == *"/tmp")
+        {
             env.push(("DISPLAY".into(), ":0".into()));
         }
     }
@@ -195,11 +210,7 @@ impl LaunchPlan {
              * --library-path order. */
             let loader = crate::sanitize::ensure_musl_shadow_ldso(&loader, cache_dir)
                 .map_err(|e| crate::error::Error::Sanitize(e.to_string()))?;
-            let library_path = format!(
-                "{}:{}",
-                loader.parent().unwrap().display(),
-                library_path
-            );
+            let library_path = format!("{}:{}", loader.parent().unwrap().display(), library_path);
             let mut argv: Vec<OsString> = vec![
                 "--argv0".into(),
                 args.first()
@@ -245,7 +256,7 @@ impl LaunchPlan {
                 env.push(("SPROUT_DEBUG".into(), "1".into()));
             }
             push_home_term(&mut env, rootfs);
-        ensure_dev_shm(rootfs);
+            ensure_dev_shm(rootfs);
             ensure_dev_shm(rootfs);
             let def_cwd = if rootfs.cwd.is_some() {
                 rootfs.cwd.clone().unwrap()
@@ -425,10 +436,7 @@ impl LaunchPlan {
         // possible under the supervisor.
         let mut env: Vec<(String, String)> = vec![
             ("SPROUT_ROOTFS".into(), rootfs.root.display().to_string()),
-            (
-                "PATH".into(),
-                guest_path_for(rootfs),
-            ),
+            ("PATH".into(), guest_path_for(rootfs)),
         ];
         push_home_term(&mut env, rootfs);
         if flavor == LibcFlavor::Musl {
@@ -439,11 +447,14 @@ impl LaunchPlan {
                 let loader = crate::sanitize::ensure_musl_shadow_ldso(&loader, cache_dir)
                     .map_err(|e| crate::error::Error::Sanitize(e.to_string()))?;
                 env.push(("SPROUT_LOADER".into(), loader.display().to_string()));
-                env.push(("SPROUT_LIBRARY_PATH".into(), format!(
-                    "{}:{}",
-                    loader.parent().unwrap().display(),
-                    rootfs.library_path()
-                )));
+                env.push((
+                    "SPROUT_LIBRARY_PATH".into(),
+                    format!(
+                        "{}:{}",
+                        loader.parent().unwrap().display(),
+                        rootfs.library_path()
+                    ),
+                ));
                 env.push(("SPROUT_LIBC".into(), "musl".into()));
                 env.push((
                     "SPROUT_GUEST_PRELOAD".into(),
@@ -475,7 +486,6 @@ impl LaunchPlan {
             display: display_program.to_string(),
         })
     }
-
 
     /// Ensure the supervisor's translation layers treat host Termux
     /// paths (loader dir, libc shadow cache, tmp) as pass-through. This
@@ -514,7 +524,11 @@ impl LaunchPlan {
         /* musl-dynamic (kind 3) shadows exactly like glibc: its ldso-chain
          * interposer covers the PLT surface. (static musl / Go stay on
          * per-syscall stops — they never carry the interposer.) */
-        if plan.env.iter().any(|(k, v)| k == "SPROUT_LIBC" && v == "musl") {
+        if plan
+            .env
+            .iter()
+            .any(|(k, v)| k == "SPROUT_LIBC" && v == "musl")
+        {
             plan.env.push(("SPROUT_SHADOW".into(), "1".into()));
         }
         // The supervisor performs its exec rewrites using
@@ -524,7 +538,9 @@ impl LaunchPlan {
         for (k, v) in &plan.env {
             if k == "SPROUT_LOADER" || k == "SPROOT_LIBRARY_PATH" || k == "SPROUT_LIBRARY_PATH" {
                 for part in v.split(':') {
-                    if part.starts_with('/') { pts.push(part.to_string()); }
+                    if part.starts_with('/') {
+                        pts.push(part.to_string());
+                    }
                 }
             }
             if k == "SPROUT_GUEST_PRELOAD" {
@@ -536,9 +552,11 @@ impl LaunchPlan {
             }
         }
         {
-            let mut prefix = std::env::var("PREFIX").unwrap_or_else(|_| "/data/data/com.termux/files/usr".into());
+            let mut prefix = std::env::var("PREFIX")
+                .unwrap_or_else(|_| "/data/data/com.termux/files/usr".into());
             pts.push(prefix);
-            prefix = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".into());
+            prefix =
+                std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".into());
             pts.push(prefix);
         }
         {
@@ -558,7 +576,8 @@ impl LaunchPlan {
         // glibc objects. The supervisor re-injects LD_PRELOAD into the
         // tracee child itself from SPROUT_GUEST_PRELOAD, and the guest lib
         // path travels in the chain argv via --library-path.
-        plan.env.retain(|(k, _)| k != "LD_PRELOAD" && k != "LD_LIBRARY_PATH");
+        plan.env
+            .retain(|(k, _)| k != "LD_PRELOAD" && k != "LD_LIBRARY_PATH");
         plan.loader = supervisor;
         plan.argv = argv;
         plan.strategy = Strategy::Ptrace;
@@ -580,11 +599,7 @@ mod tests {
         fs::write(r.join("lib/ld-linux-aarch64.so.1"), fake_libc_bytes()).unwrap();
         fs::write(r.join("usr/bin/mytool"), b"fake").unwrap();
         set_exec(r.join("usr/bin/mytool"));
-        fs::write(
-            r.join("lib/aarch64-linux-gnu/libc.so.6"),
-            fake_libc_bytes(),
-        )
-        .unwrap();
+        fs::write(r.join("lib/aarch64-linux-gnu/libc.so.6"), fake_libc_bytes()).unwrap();
         let mut fsroot = Rootfs::new(r.to_path_buf()).unwrap();
         fsroot.cwd = Some("/root".into());
         (t, fsroot)
@@ -625,8 +640,15 @@ mod tests {
         let (_t, rootfs) = fake_rootfs();
         let prog = rootfs.find_program("mytool").unwrap();
         let args = vec![OsString::from("mytool"), OsString::from("--flag")];
-        let plan = LaunchPlan::preload(&rootfs, prog.clone(), &args, PathBuf::from("/so.so"), true, _t.path())
-            .unwrap();
+        let plan = LaunchPlan::preload(
+            &rootfs,
+            prog.clone(),
+            &args,
+            PathBuf::from("/so.so"),
+            true,
+            _t.path(),
+        )
+        .unwrap();
 
         assert_eq!(plan.strategy, Strategy::Preload);
         assert!(

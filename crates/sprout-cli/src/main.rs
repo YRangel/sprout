@@ -33,7 +33,12 @@ struct Cli {
 
     /// Fake uid/gid 0 — DEFAULT, proot parity. Guests believe they run as
     /// root unless --no-fakeroot is given.
-    #[arg(short = '0', long = "root-id", default_value_t = true, overrides_with = "no_fakeroot")]
+    #[arg(
+        short = '0',
+        long = "root-id",
+        default_value_t = true,
+        overrides_with = "no_fakeroot"
+    )]
     root_id: bool,
 
     /// Run as the REAL host uid/gid: identity syscalls and get*id answers
@@ -50,7 +55,11 @@ struct Cli {
 
     /// Convert hardlinks to symlinks on guest writes — DEFAULT (proot-distro
     /// parity: SELinux denies hardlinks under /data/data/.../files).
-    #[arg(long = "link2symlink", default_value_t = true, overrides_with = "no_link2symlink")]
+    #[arg(
+        long = "link2symlink",
+        default_value_t = true,
+        overrides_with = "no_link2symlink"
+    )]
     link2symlink: bool,
 
     /// Disable the default hardlink→symlink fallback.
@@ -68,7 +77,12 @@ struct Cli {
     /// The fake-id family, ownership spoof, SO_PEERCRED, HOME/SHELL/USER/
     /// LOGNAME and the default cwd all anchor to that user. Kernel truth
     /// is unchanged (the app uid) — this is fake-id, not privilege change.
-    #[arg(short = 'u', long = "user", value_name = "USER[:GROUP]", conflicts_with = "no_fakeroot")]
+    #[arg(
+        short = 'u',
+        long = "user",
+        value_name = "USER[:GROUP]",
+        conflicts_with = "no_fakeroot"
+    )]
     user: Option<String>,
 
     /// Append the host $PREFIX/bin to the guest PATH (default: the clean
@@ -145,14 +159,19 @@ fn run() -> Result<u8, Error> {
         let tmp = std::env::var("PREFIX")
             .map(|p| format!("{}/tmp", p))
             .unwrap_or_else(|_| std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
-        rootfs.bindings.push(Binding::parse(&format!("{}:/tmp", tmp))?);
+        rootfs
+            .bindings
+            .push(Binding::parse(&format!("{}:/tmp", tmp))?);
     }
     // Implicit bind: guest /dev/shm → $ROOTFS/tmp (proot-distro parity;
     // proot-distro binds its rootfs's own /tmp as /dev/shm, giving python's
     // multiprocessing SemLock, postgres, etc. a writable POSIX-shm dir even
     // though Android hosts have no /dev/shm). Pushed LAST so an explicit
     // -b …:/dev/shm of equal length still wins (ties = insertion order).
-    rootfs.bindings.push(Binding::parse(&format!("{}:/dev/shm", rootfs.root.join("tmp").display()))?);
+    rootfs.bindings.push(Binding::parse(&format!(
+        "{}:/dev/shm",
+        rootfs.root.join("tmp").display()
+    ))?);
 
     let mut program_name = cli.cmd[0].to_string_lossy().into_owned();
     let mut program_host = rootfs.find_program(&program_name)?;
@@ -161,7 +180,9 @@ fn run() -> Result<u8, Error> {
      * on the raw host path would chase the link against the HOST root,
      * where /bin/busybox doesn't exist. Derive the guest-absolute path from
      * the (rootfs-prefixed) resolution find_program returned. */
-    let guest_abs = program_name.starts_with('/').then(|| std::path::PathBuf::from(&program_name))
+    let guest_abs = program_name
+        .starts_with('/')
+        .then(|| std::path::PathBuf::from(&program_name))
         .or_else(|| {
             program_host
                 .strip_prefix(&rootfs.root)
@@ -192,10 +213,12 @@ fn run() -> Result<u8, Error> {
     // itself be a guest binary on PATH (supports '#!/usr/bin/env X' too).
     if matches!(class, GuestClass::NotElf) {
         if let Some((interp, opt)) = parse_shebang(&classify_path) {
-            let interp_host = rootfs.find_program(&interp).map_err(|_| Error::UnsupportedElf {
-                program: program_name.clone(),
-                class: class.clone(),
-            })?;
+            let interp_host = rootfs
+                .find_program(&interp)
+                .map_err(|_| Error::UnsupportedElf {
+                    program: program_name.clone(),
+                    class: class.clone(),
+                })?;
             let interp_class_path = std::path::Path::new(&interp)
                 .is_absolute()
                 .then(|| rootfs.guest_real(std::path::Path::new(&interp)))
@@ -305,57 +328,57 @@ fn run() -> Result<u8, Error> {
             }
         } else {
             match class {
-            /* Dynamic Go: libc-linked for cgo, but io walks raw syscalls.
-             * Interposer never sees them → supervisor translates. It still
-             * launches via the sanitized loader chain (PT_INTERP present),
-             * so wrap the preload plan under the supervisor. */
-            GuestClass::GoDynamic { .. } => {
-                let pre = LaunchPlan::preload(
-                    &rootfs,
-                    program_host,
-                    &full_cmd,
-                    preload_so,
-                    cli.verbose,
-                    &cache_dir,
-                )?;
-                LaunchPlan::supervise(pre, supervisor)
-            }
-            /* Dynamic ELF under --fallback ptrace: the raw binary cannot be
-             * exec'd natively (host kernel rejects an ENOENT PT_INTERP).
-             * Mirror the GoDynamic arm: preload-plan wrapped under the
-             * supervisor, so the loader chain runs with ptrace semantics. */
-            GuestClass::Dynamic { .. } => {
-                let pre = LaunchPlan::preload(
-                    &rootfs,
-                    program_host,
-                    &full_cmd,
-                    preload_so,
-                    cli.verbose,
-                    &cache_dir,
-                )?;
-                LaunchPlan::supervise(pre, supervisor)
-            }
-            _ => {
-                let mut plan = LaunchPlan::supervisor(
-                    &rootfs,
-                    supervisor,
-                    program_host,
-                    &program_name,
-                    &cli.cmd[1..],
-                    cli.verbose,
-                    preload_so,
-                    &cache_dir,
-                )?;
-                /* ADR-0016: kind=1 lets the supervisor pick the
-                 * notify-statics lane (sprout-stub, no steady-state
-                 * ptrace) when the kernel supports it. Go statics also
-                 * take the Static class (no PT_INTERP): the supervisor
-                 * distinguishes 1/2 itself if ever needed. */
-                if matches!(class, GuestClass::Static) {
-                    plan.env.push(("SPROUT_GUEST_KIND".into(), "1".into()));
+                /* Dynamic Go: libc-linked for cgo, but io walks raw syscalls.
+                 * Interposer never sees them → supervisor translates. It still
+                 * launches via the sanitized loader chain (PT_INTERP present),
+                 * so wrap the preload plan under the supervisor. */
+                GuestClass::GoDynamic { .. } => {
+                    let pre = LaunchPlan::preload(
+                        &rootfs,
+                        program_host,
+                        &full_cmd,
+                        preload_so,
+                        cli.verbose,
+                        &cache_dir,
+                    )?;
+                    LaunchPlan::supervise(pre, supervisor)
                 }
-                plan
-            }
+                /* Dynamic ELF under --fallback ptrace: the raw binary cannot be
+                 * exec'd natively (host kernel rejects an ENOENT PT_INTERP).
+                 * Mirror the GoDynamic arm: preload-plan wrapped under the
+                 * supervisor, so the loader chain runs with ptrace semantics. */
+                GuestClass::Dynamic { .. } => {
+                    let pre = LaunchPlan::preload(
+                        &rootfs,
+                        program_host,
+                        &full_cmd,
+                        preload_so,
+                        cli.verbose,
+                        &cache_dir,
+                    )?;
+                    LaunchPlan::supervise(pre, supervisor)
+                }
+                _ => {
+                    let mut plan = LaunchPlan::supervisor(
+                        &rootfs,
+                        supervisor,
+                        program_host,
+                        &program_name,
+                        &cli.cmd[1..],
+                        cli.verbose,
+                        preload_so,
+                        &cache_dir,
+                    )?;
+                    /* ADR-0016: kind=1 lets the supervisor pick the
+                     * notify-statics lane (sprout-stub, no steady-state
+                     * ptrace) when the kernel supports it. Go statics also
+                     * take the Static class (no PT_INTERP): the supervisor
+                     * distinguishes 1/2 itself if ever needed. */
+                    if matches!(class, GuestClass::Static) {
+                        plan.env.push(("SPROUT_GUEST_KIND".into(), "1".into()));
+                    }
+                    plan
+                }
             }
         }
     } else {
@@ -407,7 +430,8 @@ fn run() -> Result<u8, Error> {
      * exec-chain exec it directly (SP_ELF_STATIC arm of sp_execve_chain). */
     if !plan.env.iter().any(|(k, _)| k == "SPROUT_PTRACE") {
         if let Some(px) = sprout_ptrace::supervisor_path() {
-            plan.env.push(("SPROUT_PTRACE".into(), px.display().to_string()));
+            plan.env
+                .push(("SPROUT_PTRACE".into(), px.display().to_string()));
         }
     }
 

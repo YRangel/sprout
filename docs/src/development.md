@@ -79,13 +79,16 @@ Found-and-fixed before first push:
    a `[self-hosted]` job with no registered runner queues 24h → CI red.
 4. `.github/actionlint.yaml` declares the custom `termux` runner label.
 
-Handoff (user action required — needs network + GitHub account):
-- repo MUST be **public** for free `ubuntu-24.04-arm` runners (private repos
-  need paid larger runners; otherwise switch test/build jobs to ubuntu-latest + QEMU)
-- update `git-repository-url` in docs/book.toml + README links (currently the
-  placeholder org `sprout-os/sprout`)
-- `git remote add origin <url> && git push -u origin main`
-- `gh run watch` (or Actions tab) for first green checkmarks
+Handoff (done 2026-08-13):
+- repo is public at `github.com/YRangel/sprout`; push CI = lint (rustfmt +
+  clippy) + mdBook on `ubuntu-latest` only. The ubuntu/ARM test/build lanes
+  were dropped: testing glibc cargo harnesses on ubuntu proved nothing about
+  the Android target — runtime gates live in `termux-selfhosted.yml`
+  (manual dispatch until a Termux runner is registered).
+- `ubuntu-24.04-arm` survives in exactly one place: `release.yml`, to produce
+  the glibc-linked `libsprout-core.so` release artifacts (needs a glibc
+  toolchain Termux's rust+clang can't provide).
+- repo MUST stay public for free `ubuntu-24.04-arm` *release* runners.
 - `git tag v0.4.0 && git push --tags` exercises release.yml end-to-end
   (collects sprout + libsprout-core.so + sprout-super + optional musl .so,
   strips, SHA256SUMS, GitHub Release, gh-pages docs deploy)

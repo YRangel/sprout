@@ -1,15 +1,14 @@
 [book]
 authors = ["sprout contributors"]
 language = "en"
-multilingual = false
 src = "src"
 title = "sprout — Rootless glibc Linux on Android"
 
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/sprout-os/sprout"
-edit-url-template = "https://github.com/sprout-os/sprout/edit/main/docs/{path}"
+git-repository-url = "https://github.com/YRangel/sprout"
+edit-url-template = "https://github.com/YRangel/sprout/edit/main/docs/{path}"
 
 [output.linkcheck]
 follow-web-links = false

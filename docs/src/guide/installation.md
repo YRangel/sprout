@@ -46,8 +46,9 @@ proot-distro login debian --work-dir $PWD -- /usr/bin/sh -c \
 ./install.sh                               # picks release artifacts
 ```
 
-CI builds the exact same artifacts on `ubuntu-24.04-arm`; local musl /
-bionic hosts must always use the in-guest route (see `development.md`).
+The release workflow builds the exact same artifacts on `ubuntu-24.04-arm`
+and ships them as release downloads; local musl / bionic hosts must always
+use the in-guest route (see `development.md`).
 
 ## Where files live at runtime
 

@@ -149,7 +149,8 @@ fn find_sites_for(bytes: &[u8], ranges: &[(usize, usize)], sysnos: &[u32]) -> Ve
                         }
                         // stop at unconditional control flow: call target
                         // stops belonging to our call-site bundle
-                        if next & 0xfc00_0000 == 0x1400_0000 { // b / bl
+                        if next & 0xfc00_0000 == 0x1400_0000 {
+                            // b / bl
                             break;
                         }
                     }
@@ -168,7 +169,11 @@ fn find_sites_for(bytes: &[u8], ranges: &[(usize, usize)], sysnos: &[u32]) -> Ve
 ///
 /// `kind` is a short tag embedded in the cache name ("libc", "ldso") so
 /// the two artifacts never collide.
-pub fn ensure_sanitized_glibc(lib: &Path, cache_dir: &Path, kind: &str) -> Result<PathBuf, SanitizeError> {
+pub fn ensure_sanitized_glibc(
+    lib: &Path,
+    cache_dir: &Path,
+    kind: &str,
+) -> Result<PathBuf, SanitizeError> {
     sanitize_impl(lib, cache_dir, kind, &EMULATED_SYSNOS_GLIBC)
 }
 
@@ -189,7 +194,8 @@ pub fn ensure_musl_shadow_ldso(lib: &Path, cache_dir: &Path) -> Result<PathBuf, 
     let dst = shadow_dir.join("libc.musl-aarch64.so.1");
     // content-addressed src means: if it exists it is already correct
     if !dst.exists() {
-        std::fs::hard_link(&sanitized, &dst).or_else(|_| std::fs::copy(&sanitized, &dst).map(|_| ()))?;
+        std::fs::hard_link(&sanitized, &dst)
+            .or_else(|_| std::fs::copy(&sanitized, &dst).map(|_| ()))?;
     }
     Ok(dst)
 }
@@ -199,7 +205,12 @@ pub fn ensure_sanitized_libc(libc: &Path, cache_dir: &Path) -> Result<PathBuf, S
     ensure_sanitized_glibc(libc, cache_dir, "libc")
 }
 
-fn sanitize_impl(libc: &Path, cache_dir: &Path, kind: &str, sysnos: &[u32]) -> Result<PathBuf, SanitizeError> {
+fn sanitize_impl(
+    libc: &Path,
+    cache_dir: &Path,
+    kind: &str,
+    sysnos: &[u32],
+) -> Result<PathBuf, SanitizeError> {
     let src = fs::read(libc)?;
     let ranges = exec_ranges(&src).ok_or_else(|| SanitizeError::NotElf64(libc.to_path_buf()))?;
     if ranges.is_empty() {
@@ -248,7 +259,7 @@ mod tests {
         b[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff=64
         b[54..56].copy_from_slice(&56u16.to_le_bytes());
         b[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum=1
-        // phdr: PT_LOAD|PF_X, offset 256, vaddr irrelevant, filesz 64
+                                                        // phdr: PT_LOAD|PF_X, offset 256, vaddr irrelevant, filesz 64
         b[64..68].copy_from_slice(&1u32.to_le_bytes());
         b[68..72].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
         b[72..80].copy_from_slice(&256u64.to_le_bytes());

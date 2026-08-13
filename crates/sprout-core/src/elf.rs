@@ -190,10 +190,10 @@ mod tests {
         let mut b = vec![0u8; 768];
         b[..512].copy_from_slice(&fixture_dynamic());
         b[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum = 2
-        // phdr[1] @ 120: PT_NOTE at offset 320
+                                                        // phdr[1] @ 120: PT_NOTE at offset 320
         b[120..124].copy_from_slice(&PT_NOTE.to_le_bytes());
         b[128..136].copy_from_slice(&320u64.to_le_bytes()); // p_offset
-        // note: namesz=4 "Go\0\0", descsz=8, type=4
+                                                            // note: namesz=4 "Go\0\0", descsz=8, type=4
         let mut note = Vec::new();
         note.extend_from_slice(&4u32.to_le_bytes());
         note.extend_from_slice(&8u32.to_le_bytes());

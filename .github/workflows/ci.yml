@@ -10,6 +10,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Android-only project: the ubuntu/ARM lanes (cargo test on a *glibc* runner,
+# libsprout cross-build) were removed 2026-08-13 — green runs there proved
+# nothing about the real target (Android kernel quirks are half the runtime).
+# Static checks here are host-agnostic; runtime tests live in
+# termux-selfhosted.yml (workflow_dispatch until a Termux runner attaches).
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -21,37 +26,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --workspace -- -D warnings
-
-  test-glibc:
-    name: test (ubuntu-24.04 ARM)
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo test
-        run: cargo test --workspace --all-targets
-      - name: verify preload artifact is a real glibc-linked .so
-        run: |
-          so=$(find target/debug/build/sprout-preload-*/out -name libsprout-core.so | head -1)
-          test -n "$so" && file "$so" | grep -q 'ELF 64-bit LSB shared object, ARM aarch64'
-          # glibc-linked: must *not* reference Android-only symbols
-          ! readelf -d "$so" | grep -qi android
-
-
-  build-cdylib:
-    name: build libsprout-core.so (glibc)
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p sprout-preload --release
-      - uses: actions/upload-artifact@v4
-        with:
-          name: libsprout-core.so-aarch64
-          path: target/release/build/sprout-preload-*/out/libsprout-core.so
-          if-no-files-found: error
 
   docs:
     name: mdBook build
