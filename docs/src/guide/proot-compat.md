@@ -1,5 +1,11 @@
 # proot CLI compatibility
 
+> **FAKE-ROOT IS HONEST NOISE.** `id -u == 0` inside a sprout guest
+> describes the *guest's* view of its own address space, never a host
+> privilege. If a security decision trusts `id -u`, it was already wrong
+> under proot too. See [environment policy](./environment.md) for the
+> full env/env-injection table.
+
 The goal is that replacing `proot` with `sprout` in any existing script
 is a no-op. The table is sorted by how `proot-distro login` uses flags.
 

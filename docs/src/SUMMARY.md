@@ -6,6 +6,8 @@
 
 - [Installation](./guide/installation.md)
 - [proot compatibility](./guide/proot-compat.md)
+- [Environment policy](./guide/environment.md)
+- [X11 / GPU](./guide/x11-gpu.md)
 - [FAQ](./guide/faq.md)
 
 # Architecture

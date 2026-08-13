@@ -268,6 +268,12 @@ flow; the network-dominated workload measurement is the realistic hit (< 20%).
 ## Extensive full-surface sweep (v0.6.x post-#74, 2026-08-12 22:40, median-of-7)
 Host: Xiaomi 25102PCBEG, Android 16, kernel 6.12.23-android16-5, aarch64.
 Commit: `c9a7bc2` (+ bench harness). Baseline: `proot-distro login` (same rootfs in both).
+**Fairness note:** `proot-distro login` carries wrapper+login-shell startup
+(~200ms on this device) that `sprout -r` does not; the harness now also
+reports a raw `proot -R` lane (3-column output) so the asymmetry stays
+measurable. Raw proot remains faster on one-shot commands than sprout's
+stub+supervisor boot for statics; the proot-distro column is the one
+users actually occupy, so it stays the headline.
 Harness: `bench/run-extensive.sh 7` (this repo; raw TSV + per-cell medians under
 `bench/results/extensive-20260812-224034/`). Note the harness defaults SPROUT_BIN
 to `$PREFIX/bin/sprout`; the older per-section scripts default to target/debug.
