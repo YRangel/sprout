@@ -1,0 +1,6 @@
+# Single source of truth for fmt/clippy parity between GitHub CI and the
+# Termux device (pkg rust is 1.97.1). dtolnay/rust-toolchain reads this file
+# automatically in CI; rustup users get it locally for free. Bump deliberately.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
