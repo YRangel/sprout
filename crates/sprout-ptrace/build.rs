@@ -8,6 +8,16 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    /* The supervisor handles aarch64 ptrace registers and the stub is raw
+     * aarch64 svc asm — both exist only for aarch64 guests. On non-aarch64
+     * hosts (ubuntu-latest lint/CI) skip cleanly, like sprout-preload's
+     * glibc gate; lib.rs resolves None when nothing was built. */
+    if !env::var("TARGET").unwrap_or_default().contains("aarch64") {
+        println!(
+            "cargo:warning=sprout-ptrace: aarch64-only C artifacts skipped on non-aarch64 target"
+        );
+        return;
+    }
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
     let exe = out_dir.join("sprout-super");
 
