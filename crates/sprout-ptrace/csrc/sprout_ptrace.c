@@ -276,6 +276,9 @@ static long peek_u64(pid_t pid, unsigned long long addr) {
 #define SP_EXEC_MAX_ARGS 256
 #define SP_EXEC_STRING_CAP (SP_EXEC_SCRATCH_BELOW_SP - 4*4096)
 
+static int sp_serve_script_exec(pid_t pid, struct user_pt_regs *r,
+                                int path_argi, const char *guest, const char *host);
+
 static int sp_rewrite_exec_to_loader(tracee_t *t, pid_t pid, struct user_pt_regs *r,
                                      const char *host_prog, const char *guest_prog,
                                      int path_argi, int depth) {
@@ -1096,93 +1099,12 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
             return;
         }
         if (cls == 2) {
-            /* script from a static process: resolve interpreter via guest
-             * PATH (fallback default), build argv [interp, opt?, script,
-             * rest...] and try to chain once more (depth-guarded inside). */
-            char cand[SP_PATH_MAX];
-            int found = 0;
-            if (ibuf[0] == '/' || strchr(ibuf, '/') != NULL) {
-                /* absolute or path-qualified interpreter: use as-is */
-                snprintf(cand, sizeof(cand), "%s", ibuf);
-                char hc0[SP_PATH_MAX];
-                const char *h0 = sp_translate(&g_cfg, cand, hc0) ? hc0 : cand;
-                found = (access(h0, X_OK) == 0);
-            } else {
-                const char *sp_ = getenv("SPROUT_GUEST_PATH");
-                if (!sp_) sp_ = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-                char pbuf[4096];
-                snprintf(pbuf, sizeof(pbuf), "%s", sp_);
-                for (char *d = strtok(pbuf, ":"); d && !found; d = strtok(NULL, ":")) {
-                    char cc[SP_PATH_MAX];
-                    int n = snprintf(cc, sizeof(cc), "%s/%s", *d ? d : ".", ibuf);
-                    if (n < 0 || (size_t)n >= sizeof(cc)) continue;
-                    char hc[SP_PATH_MAX];
-                    const char *h = sp_translate(&g_cfg, cc, hc) ? hc : cc;
-                    if (access(h, X_OK) == 0) { snprintf(cand, sizeof(cand), "%s", cc); found = 1; }
-                }
-            }
-            if (!found) return; /* honest ENOENT for the kernel */
-            char hcan[SP_PATH_MAX];
-            if (!sp_translate(&g_cfg, cand, hcan)) return;
-            char ibuf2[SP_PATH_MAX];
-            int cls2 = classify_host_file(hcan, ibuf2, obuf);
-            if (cls2 == 0) {
-                /* interp is dynamic: rewrite exec with interp as target and
-                 * argv [interp, opt?, script, rest]. We re-use the loader
-                 * rewriter by constructing a synthetic argv in the tracee:
-                 * simpler path: rewrite argv array first (interp, script + rest)
-                 * then let the loader rewriter consume it. */
-                /* build synthetic argv in scratch: strings [interp, script, rest1...] */
-                unsigned long long base = (unsigned long long)rex.sp - SP_EXEC_SCRATCH_BELOW_SP;
-                errno = 0;
-                if (ptrace(PTRACE_PEEKDATA, pid, (void *)base, NULL) == -1 && errno) return;
-                unsigned long long orig_argv = rex.regs[path_argi + 1];
-                long strings_base = (long)(base + (unsigned long long)(SP_EXEC_MAX_ARGS * 8));
-                unsigned long long sc = (unsigned long long)strings_base;
-                unsigned long long end = base + SP_EXEC_SCRATCH_BELOW_SP;
-                unsigned long long arr_ptrs[SP_EXEC_MAX_ARGS];
-                int na = 0;
-                const char *head2[3];
-                int nh = 0;
-                head2[nh++] = cand;             /* interp (guest path) */
-                if (obuf[0]) head2[nh++] = obuf; /* optional shebang arg */
-                head2[nh++] = guest;            /* script path */
-                for (int i = 0; i < nh && na < SP_EXEC_MAX_ARGS - 1; i++) {
-                    size_t sl = strlen(head2[i]);
-                    if (sc + sl + 16 >= end) return;
-                    if (poke_str(pid, sc, head2[i], sl) != 0) return;
-                    arr_ptrs[na++] = sc;
-                    sc += ((unsigned long long)sl + 8) & ~7ULL;
-                }
-                for (int i = 1; na < SP_EXEC_MAX_ARGS - 1; i++) {
-                    unsigned long long pa = (unsigned long long)peek_u64(pid, orig_argv + (unsigned long long)i * 8);
-                    if (pa == 0 || pa == (unsigned long long)-1) break;
-                    char abuf[SP_PATH_MAX];
-                    if (peek_str(pid, pa, abuf, sizeof(abuf)) < 0) break;
-                    size_t sl = strlen(abuf);
-                    if (sc + sl + 16 >= end) break;
-                    if (poke_str(pid, sc, abuf, sl) != 0) break;
-                    arr_ptrs[na++] = sc;
-                    sc += ((unsigned long long)sl + 8) & ~7ULL;
-                }
-                unsigned long long arr = base;
-                for (int i = 0; i <= na; i++)
-                    if (ptrace(PTRACE_POKEDATA, pid, (void *)(arr + (unsigned long long)i * 8),
-                               (void *)(i == na ? 0 : arr_ptrs[i])) == -1) return;
-                rex.regs[path_argi] = arr_ptrs[0];   /* exec target = interp guest path… but kernel needs HOST */
-                /* interp is dynamic: exec target must be the loader, not cand.
-                 * Recurse through the dynamic rewriter with the synthetic argv. */
-                rex.regs[path_argi + 1] = arr;
-                /* pretend the program is the interp: rewriter expects
-                 * host_prog to EXEC, argv[0] = interp */
-                if (sp_rewrite_exec_to_loader(t, pid, &rex, hcan, cand, path_argi, 1))
-                    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovex);
-                return;
-            }
-            /* static INTERP under a static parent: not wired (deepest
-             * corner: scripts whose shebang points at a static binary).
-             * Honest no-op: kernel returns ENOEXEC on the script, which
-             * matches the behavior one gets without translation anyway. */
+            /* H3: script-from-static — single shared serve (the same
+             * composition the stub lane's lazy-attach vehicle uses):
+             * [interp, opt?, script, rest] in scratch, loader chain for
+             * dynamic interps, direct kernel exec for static interps. */
+            if (sp_serve_script_exec(pid, &rex, path_argi, guest, host))
+                ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovex);
             return;
         }
         /* static target (or unknown): plain single-string path translation */
@@ -1623,9 +1545,6 @@ static int sp_link_fallback_copy(const char *src, const char *dst) {
  * actually resumes the (now-rewritten) execve. Attach on a parked-
  * notify task is legal; the request outlives the attach/detach pair.
  * Return 1 on successful rewrite, 0 otherwise. */
-static int sp_notify_lazy_exec_script(pid_t pid, struct user_pt_regs *r,
-                                      const char *guest, const char *host); /* fwd (cls==2) */
-
 static int sp_notify_lazy_exec_rewrite(pid_t pid, const char *guest,
                                        const char *host, int cls) {
     if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) != 0) {
@@ -1651,7 +1570,7 @@ static int sp_notify_lazy_exec_rewrite(pid_t pid, const char *guest,
          * interposer, so native CONT just lands the script on the host
          * kernel's shebang resolution: wrong libc world, observed
          * ENOENT vs the host's /bin/bash wiring). */
-        ok = sp_notify_lazy_exec_script(pid, &r, guest, host);
+        ok = sp_serve_script_exec(pid, &r, 0, guest, host);
     } else if (cls == 0) {
         /* static→dynamic: full loader-chain surgery (peek/poke work now
          * that we're attached). rewrite writes regs; SETREGSET pushes. */
@@ -1675,13 +1594,18 @@ static int sp_notify_lazy_exec_rewrite(pid_t pid, const char *guest,
     return ok;
 }
 
-/* cls==2 (script exec from a static under the stub lane): shebang ->
- * guest interp, compose scratch argv [interp, opt?, script, rest...] and
- * treat the interp as the real exec target (same dance as the legacy
- * lane's execve-at-51 script block). Runs with `pid` already ptrace-
- * attached by the caller and its regs already fetched into *r. */
-static int sp_notify_lazy_exec_script(pid_t pid, struct user_pt_regs *r,
-                                      const char *guest, const char *host) {
+/* H3 (single serve-core): the ONE implementation of "script exec from
+ * a static process". Both supervisors (legacy TRACEME lane at execve-stop
+ * and the stub lane's lazy-attach vehicle) compose the SAME chain:
+ *   argv = [interp-guest, opt?, script-guest, rest...]
+ * then split by interp kind: dynamic -> sp_rewrite_exec_to_loader,
+ * static -> kernel execve of the interp host path directly.
+ * The in-guest parallel lives in sprout_preload.c (chains inside the
+ * victim address space, unavoidable). Requires pid attached + regs
+ * fetched. path_argi: 0=execve, 1=execveat.  Returns: 1 = regs
+ * rewritten (caller SETREGSETs), 0 = honest bail. */
+static int sp_serve_script_exec(pid_t pid, struct user_pt_regs *r,
+                                int path_argi, const char *guest, const char *host) {
     char ibuf[SP_PATH_MAX], obuf[SP_PATH_MAX];
     ibuf[0] = '\0'; obuf[0] = '\0';
     /* own the shebang parse (kernel one-token tail semantics):
@@ -1723,8 +1647,8 @@ static int sp_notify_lazy_exec_script(pid_t pid, struct user_pt_regs *r,
     unsigned long long base = (unsigned long long)r->sp - SP_EXEC_SCRATCH_BELOW_SP;
     errno = 0;
     if (ptrace(PTRACE_PEEKDATA, pid, (void *)base, NULL) == -1 && errno) return 0;
-    unsigned long long orig_argv = r->regs[1];
-    unsigned long long orig_envp = r->regs[2];
+    unsigned long long orig_argv = r->regs[path_argi + 1];
+    unsigned long long orig_envp = r->regs[path_argi + 2];
     unsigned long long sc = base + (unsigned long long)(SP_EXEC_MAX_ARGS * 8);
     unsigned long long end = base + SP_EXEC_SCRATCH_BELOW_SP;
     unsigned long long arr_ptrs[SP_EXEC_MAX_ARGS];
@@ -1756,18 +1680,21 @@ static int sp_notify_lazy_exec_script(pid_t pid, struct user_pt_regs *r,
         if (ptrace(PTRACE_POKEDATA, pid, (void *)(base + (unsigned long long)i * 8),
                    (void *)arr_ptrs[i]) != 0) return 0;
     }
-    r->regs[1] = base;   /* synthetic argv array */
-    r->regs[2] = orig_envp;
+    r->regs[path_argi + 1] = base;   /* synthetic argv array */
+    r->regs[path_argi + 2] = orig_envp;
     if (cls2 == 0) {
         /* dynamic interp -> full loader chain around [interp, ...] */
-        return sp_rewrite_exec_to_loader(NULL, pid, r, hcan, cand, 0, 1);
+        return sp_rewrite_exec_to_loader(NULL, pid, r, hcan, cand, path_argi, 1);
     }
-    /* static interp: point x0 at the interp host path, kernel execs it */
+    /* static interp (legacy lane used to bail here — ENOEXEC matched
+     * proot only in the no-interp case; wiring it is strictly better
+     * than leaving the deepest corner dark): point the pathname arg at
+     * the interp HOST path, kernel execs it natively. */
     size_t hl = strlen(hcan);
     if (sc + hl + 16 >= end) return 0;
     if (poke_str(pid, sc, hcan, hl) != 0) return 0;
-    r->regs[0] = sc;
-    return 1; /* caller: SETREGSET + DETACH + CONTINUE */
+    r->regs[path_argi] = sc;
+    return 1; /* caller: SETREGSET + CONTINUE */
 }
 
 /* ------------------------------------------------------------------ */
