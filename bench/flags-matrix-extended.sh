@@ -91,6 +91,19 @@ T "user-created-home-drop"        "$($S -r $B --user tester /bin/bash -c 'pwd' 2
 T "user-created-whoami"           "$($S -r $B --user tester /usr/bin/whoami 2>/dev/null)" "tester"
 T "apt-as-daemon-runs"           "$(timeout 90 $S -r $B --user daemon apt-get update 2>/dev/null 1>&2; echo rc=$?)" "rc=0"
 
+# --- H7: kernel rt_sigframe ABI self-test (would have caught #74 pre-merge).
+# The stub's SIGSYS emulator prints EMU lines while
+# SPROUT_STUB_CRASHDUMP=1: nr / pc / x8 / sp read from the kernel frame.
+# Assert them: nr=99 with x8=99 and a text pc (0x41xxxx = glibc-static
+# ET_EXEC at 0x400000) + stack-memory sp (0x7*). With the #74 offsets
+# bug this read instead: nr=99 + garbage x8 + stack-address pc.
+emu=$(SPROUT_STUB_CRASHDUMP=1 SPROUT_NOTIFY_STATICS=1 $S -r $B /tmp/step 2>&1 | grep -a '^EMU nr=99' | head -1)
+abi_ok=0
+case "$emu" in
+  "EMU nr=99 pc=0x41"*"x8=0x63"*"sp=0x7"*) abi_ok=1 ;;
+esac
+T "frame-abi-selftest" "$abi_ok" "1"
+
 # --- sanity: supervisor not left running as zombie after each call
 T "no-zombie-sprout"            "$(n=0; for p in $(pgrep -f sprout-super 2>/dev/null); do [ "$(basename $(readlink /proc/$p/exe 2>/dev/null))" = "sprout-super" ] && n=$((n+1)); done; echo $n)" "0"
 
