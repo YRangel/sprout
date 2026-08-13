@@ -2,8 +2,14 @@
 
 ## Status
 
-**Accepted** (T1/T2/T3 implemented, shipped; default ON for kind=1/2
-guests; `SPROUT_NOTIFY_STATICS=0` reverts to the legacy TRACEME lane).
+**Accepted, default FLIPPED (2026-08-12):** the stub lane is now
+**opt-in** (`SPROUT_NOTIFY_STATICS=1`); the legacy TRACEME lane is the
+statics default. Root cause: glibc-static guests (and Go-class statics)
+die pre-`main` under the stub's filter setup (SIGBUS=7 vs bare-kernel
+SIGSYS=31 at the same instruction, startup-syscall mangling inside the
+stub — bisect pending). Raw-asm statics (`sp_asm`, the perf subjects
+this ADR optimized for) survive both lanes. Revert default to ON the
+day the glibc-static startup divergence is fixed. → task #69.
 
 ## Context
 

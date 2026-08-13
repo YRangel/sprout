@@ -306,13 +306,26 @@ static int sp_rewrite_exec_to_loader(tracee_t *t, pid_t pid, struct user_pt_regs
     int envc = 0;
     char *env_strs[SP_EXEC_MAX_ARGS];
     if (orig_envp) {
-        for (; envc < SP_EXEC_MAX_ARGS; envc++) {
-            unsigned long long sp_ = (unsigned long long)peek_u64(pid, orig_envp + (unsigned long long)envc * 8);
+        int skip_n = 0;
+        for (;;) {
+            if (envc + skip_n >= SP_EXEC_MAX_ARGS) break;
+            unsigned long long sp_ = (unsigned long long)peek_u64(pid, orig_envp + (unsigned long long)(envc + skip_n) * 8);
             if (sp_ == 0 || sp_ == (unsigned long long)-1) break;
-            env_strs[envc] = malloc(SP_PATH_MAX);
-            if (!env_strs[envc]) return 0;
-            long nn = peek_str(pid, sp_, env_strs[envc], SP_PATH_MAX);
-            if (nn < 0) { free(env_strs[envc]); break; }
+            char *tmp = malloc(SP_PATH_MAX);
+            if (!tmp) return 0;
+            long nn = peek_str(pid, sp_, tmp, SP_PATH_MAX);
+            if (nn < 0) { free(tmp); break; }
+            /* statics→dynamic: children stay supervisor-translated through
+             * the tree-wide ptrace watch; the inherited LD_PRELOAD /
+             * LD_LIBRARY_PATH strings name HOST paths inside the child and
+             * only print 'cannot be preloaded' noise (and confuse tools
+             * that parse ld.so stderr). Strip sprout-authored entries. */
+            if (strstr(tmp, "libsprout-core") || strstr(tmp, "libc-sanitized")
+                || strstr(tmp, "ldso-sanitized") || strstr(tmp, "musl-shadow-lib")) {
+                free(tmp); skip_n++; continue;
+            }
+            env_strs[envc] = tmp;
+            envc++; (void)skip_n;
         }
     }
 
@@ -325,9 +338,10 @@ int musl = g_libc_kind == SP_LIBC_MUSL;
     int new_argc = fixed_nbase + (argc - 1);
     if (new_argc > SP_EXEC_MAX_ARGS - 1) return 0;
 
-    /* envp append/update set */
-    char ld_preload[SP_PATH_MAX];
-    snprintf(ld_preload, sizeof(ld_preload), "LD_PRELOAD=%s", g_guestpreload ? g_guestpreload : "");
+    /* envp append/update set. NOTE: no LD_PRELOAD/LD_LIBRARY_PATH here:
+     * the new process stays supervisor-translated through the tree-wide
+     * ptrace watch, so the interposer string is pure noise in this lane
+     * (and its host path prints 'cannot be preloaded' in the guest ld.so). */
     char env_loader[SP_PATH_MAX];
     snprintf(env_loader, sizeof(env_loader), "SPROUT_LOADER=%s", g_loader);
     char env_libpath[SP_PATH_MAX];
@@ -339,17 +353,17 @@ int musl = g_libc_kind == SP_LIBC_MUSL;
     const char *inject_env_dbg[6];
     const char **inject_env = NULL;
     if (g_debug) {
-        inject_env_dbg[0] = ld_preload;
-        inject_env_dbg[1] = env_loader;
-        inject_env_dbg[2] = env_libpath;
-        inject_env_dbg[3] = "LD_DEBUG=libs";
-        inject_env_dbg[4] = env_rootfs;
-        inject_env_dbg[5] = env_path;
+        inject_env_dbg[0] = env_loader;
+        inject_env_dbg[1] = env_libpath;
+        inject_env_dbg[2] = "LD_DEBUG=libs";
+        inject_env_dbg[3] = env_rootfs;
+        inject_env_dbg[4] = env_path;
+        inject_env_dbg[5] = "LD_BIND_NOW=1";
         inject_env = inject_env_dbg;
     } else {
         static const char *ie[6] = { NULL };
-        ie[0] = ld_preload; ie[1] = env_loader; ie[2] = env_libpath;
-        ie[3] = env_rootfs; ie[4] = env_path;
+        ie[0] = env_loader; ie[1] = env_libpath; ie[2] = env_rootfs;
+        ie[3] = env_path; ie[4] = "LD_BIND_NOW=1";
         inject_env = ie;
     }
     size_t inject_n = g_debug ? 6 : 5;
@@ -2154,6 +2168,23 @@ static int run_notify_statics(const char *stub, int argc, char **argv) {
                 if (poll(&q, 1, 0) <= 0 || !(q.revents & POLLIN)) break;
                 sp_notify_pump();
             }
+            if (WIFSIGNALED(status) && (g_debug || getenv("SPROUT_DEBUG"))) {
+                /* postmortem: what did the child die doing? (statics lane
+                 * had silent SIGBUS reports from scripts/static execs) */
+                if (ptrace(PTRACE_ATTACH, child, NULL, NULL) == 0) {
+                    int pst;
+                    waitpid(child, &pst, __WALL);
+                    struct user_pt_regs rr;
+                    struct iovec riov = { &rr, sizeof(rr) };
+                    if (ptrace(PTRACE_GETREGSET, child, (void *)NT_PRSTATUS, &riov) == 0)
+                        fprintf(stderr, "[notify] postmortem pid=%d sig=%d pc=0x%llx sp=0x%llx x0=%llu x8=%llu\n",
+                                child, WTERMSIG(status), rr.pc, rr.sp, rr.regs[0], rr.regs[8]);
+                    siginfo_t si;
+                    if (ptrace(PTRACE_GETSIGINFO, child, NULL, &si) == 0)
+                        fprintf(stderr, "[notify] siginfo: addr=%p code=%d\n", si.si_addr, si.si_code);
+                    ptrace(PTRACE_DETACH, child, NULL, NULL);
+                }
+            }
             if (WIFEXITED(status)) return WEXITSTATUS(status);
             if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
             return 1;
@@ -2312,7 +2343,14 @@ int main(int argc, char **argv) {
     {   const char *gk = getenv("SPROUT_GUEST_KIND");
         int gkind = gk ? atoi(gk) : 0;
         const char *nso = getenv("SPROUT_NOTIFY_STATICS");
-        int want_ns = g_notify && (gkind == 1 || gkind == 2) && !(nso && strcmp(nso, "0") == 0);
+        /* 2026-08-12 flip: stub lane has a PRE-MAIN crash for glibc-static
+         * and Go-class statics (S1-write of a static-glibc test binary
+         * never fires; bare kernel hands SIGSYS=31, under-stub SIGBUS=7 —
+         * startup-syscall mangling), only raw-asm statics (sp_asm battery)
+         * survive. Real-world statics must go legacy-ptrace: SPROUT_
+         * NOTIFY_STATICS=1 now OPTS IN to the dev lane while the startup
+         * ABI divergence gets bisected. Default restored: ptrace. */
+        int want_ns = g_notify && (gkind == 1 || gkind == 2) && nso && strcmp(nso, "1") == 0;
         if (g_debug) fprintf(stderr, "[notify] lane-probe: g_notify=%d gkind=%d want=%d\n", g_notify, gkind, want_ns);
         if (want_ns) {
             char stub[SP_PATH_MAX];
