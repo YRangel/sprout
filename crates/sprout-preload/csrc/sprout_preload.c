@@ -2251,6 +2251,40 @@ static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
     return -1;
 }
 
+/* firefox-class LD_LIBRARY_PATH users (lib*naive in LD_PRELOAD, $ORIGIN
+ * DT_NEEDED chains): glibc's ld.so gives the `--library-path` CMDLINE arg
+ * full precedence over the env's LD_LIBRARY_PATH, and our loader chain
+ * always passes the system list on the cmdline — so a guest that
+ * legitimately sets LD_LIBRARY_PATH for its children (firefox-esr: the
+ * stub pushes libmozsandbox.so into its e10s childrens' LD_PRELOAD and
+ * expects $exedir to be searched, user log 2026-08-13) lost those dirs.
+ * Merge guest-supplied entries BEFORE our system fallback. Static buffer
+ * is deliberate: chains run under vfork-shared frames (ADR-0014), malloc
+ * is forbidden here. */
+static const char *sp_chain_libpath(char *envp[]) {
+    const char *sys = getenv("SPROUT_LIBRARY_PATH");
+    const char *cust = NULL;
+    for (int i = 0; envp && envp[i]; i++)
+        if (!strncmp(envp[i], "LD_LIBRARY_PATH=", 16)) { cust = envp[i] + 16; break; }
+    if (!cust || !*cust || !sys || !*sys) return NULL;
+    if (!strcmp(cust, sys)) return NULL;      /* already the system list */
+    /* deep chains re-merge (merged-in-cust + sys tail duplicated): fine,
+     * duplicates only cost a repeat directory walk in ld.so; dropping the
+     * merge would LOSE the dirs after the 2nd exec generation. */
+    static char merged[SP_PATH_MAX * 4];
+    int w = snprintf(merged, sizeof(merged), "%s:%s", cust, sys);
+    if (w < 0 || (size_t)w >= sizeof(merged)) return NULL;
+    /* env-visible row: grandchildren that re-exec through the chain see
+     * the same merged list; the next generation re-merges harmlessly. */
+    static char lp_entry[SP_PATH_MAX * 4 + 32];
+    w = snprintf(lp_entry, sizeof(lp_entry), "LD_LIBRARY_PATH=%s", merged);
+    if (w > 0 && (size_t)w < sizeof(lp_entry)) {
+        for (int i = 0; envp[i]; i++)
+            if (!strncmp(envp[i], "LD_LIBRARY_PATH=", 16)) { envp[i] = lp_entry; break; }
+    }
+    return merged;
+}
+
 /* Build the loader-chain argv for a dynamic guest program:
  *   loader --argv0 <orig> --inhibit-cache --library-path <lp> <hostprog> [args...]
  * into into allocated memory; caller frees with sp_free_argv. */
@@ -2270,11 +2304,11 @@ static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
 #define SP_CHAIN_MAX_ARGS 4096
 static int sp_build_loader_argv(char **v, size_t vmax,
                                 const char *host_prog, char *const argv[],
-                                int extra, int *outc) {
+                                int extra, int *outc, const char *lp_override) {
     int argc = 0;
     while (argv[argc]) argc++;
     const char *loader = getenv("SPROUT_LOADER");
-    const char *lp = getenv("SPROUT_LIBRARY_PATH");
+    const char *lp = lp_override ? lp_override : getenv("SPROUT_LIBRARY_PATH");
     const char *libc_kind = getenv("SPROUT_LIBC"); /* "musl" or "glibc" (default) */
     if (!loader) {
         fprintf(stderr, "[sprout] argv-build fail: SPROUT_LOADER unset (argc=%d)\n", argc);
@@ -2379,7 +2413,27 @@ static char **sp_chain_env(char *const envp[]) {
             for (int j = 0; j < n; j++) {
                 if (strncmp(e2[j], environ[i], kl) == 0 && e2[j][kl] == '=') { have = 1; break; }
             }
-            if (!have) e2[n++] = environ[i];
+            if (have) {
+                /* LD_PRELOAD MERGE CLAUSE: it is the ONE vital key whose
+                 * guest-supplied value must COMBINE with ours instead of
+                 * shadowing it. A guest LD_PRELOAD=libX.so (firefox-esr's
+                 * libmozsandbox for its e10s children, user log 2026-08-13)
+                 * replacing the interposer silently DISABLES exec-chaining
+                 * for that process's descendants: the next exec goes to the
+                 * RAW glibc execve and /proc/self/exe & friends leak loader
+                 * paths again. Keep our entry FIRST (interception lives
+                 * there), the guest's DSO appended after; skip re-merge
+                 * when the interposer is already visible (deep chains). */
+                if (kl == 10 && 0 == strncmp(environ[i], "LD_PRELOAD", kl)) {
+                    for (int j = 0; j < n; j++) {
+                        if (strncmp(e2[j], environ[i], kl) != 0 || e2[j][kl] != '=') continue;
+                        if (strstr(e2[j], "libsprout-core")) continue;
+                        static char mp[SP_PATH_MAX * 4 + 32];
+                        int mw = snprintf(mp, sizeof(mp), "LD_PRELOAD=%s:%s", eq + 1, e2[j] + kl + 1);
+                        if (mw > 0 && (size_t)mw < sizeof(mp)) e2[j] = mp;
+                    }
+                }
+            } else e2[n++] = environ[i];
         }
     }
     e2[n] = NULL;
@@ -2458,7 +2512,8 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
     switch (cls) {
     case SP_ELF_DYNAMIC: {
         char *vstack[SP_CHAIN_MAX_ARGS + 8];
-        int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL);
+        int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL,
+                                     sp_chain_libpath(envp));
         if (b == -2) return sp_chain_fail(path, depth, EIO, "argv-build:no-loader");
         if (b != 0) return sp_chain_fail(path, depth, E2BIG, "argv-build:cap");
         {
@@ -2639,7 +2694,7 @@ int fexecve(int fd, char *const argv[], char *const envp[]) {
     switch (sp_classify_host(host, interp, NULL)) {
     case SP_ELF_DYNAMIC: {
         char *vstack[SP_CHAIN_MAX_ARGS + 8];
-        int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL);
+        int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL, NULL);
         if (b == -2) { errno = EIO; return -1; }
         if (b != 0) { errno = E2BIG; return -1; }
         return sp_real_execve(getenv("SPROUT_LOADER"), vstack, envp);
