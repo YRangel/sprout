@@ -209,7 +209,16 @@ fn run() -> Result<u8, Error> {
                 })
                 .unwrap_or_else(|| interp_host.clone());
             let interp_class = classify(&interp_class_path)?;
-            let script_guest = program_name.clone();
+            /* kernel argv semantics: argv[script-slot] must be a PATH the
+             * interp can open — for a PATH-resolved invocation the user's
+             * bare name ('startxfce4') is NOT openable from the child's cwd,
+             * so plug in the guest-absolute resolution instead
+             * ('/usr/bin/startxfce4'). Explicit / and ./ spellings pass
+             * through unchanged (cwd-relative semantics are the user's). */
+            let script_guest = guest_abs
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| program_name.clone());
             let orig_args: Vec<OsString> = cli.cmd[1..].to_vec();
             let mut rebuilt: Vec<OsString> = vec![interp.clone().into()];
             if let Some(o) = opt {

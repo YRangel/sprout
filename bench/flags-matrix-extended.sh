@@ -60,6 +60,11 @@ T "musl-exit39"                 "$($S -r $A /bin/busybox sh -c 'exit 39' 2>/dev/
 
 # --- script/shebang class
 T "script-smoke"                "$($S -r $B /bin/bash -c 'rm -f /tmp/noob.sh; printf "#!/bin/nonexistent\\n" > /tmp/noob.sh; chmod +x /tmp/noob.sh; /tmp/noob.sh; echo rc=$?; exit 0' 2>&1 | tail -1)" "rc=127"
+
+# CLI-side PATH-resolved shebang script (startxfce4 shape: bare name ->
+# sh must receive the ABSOLUTE guest path, not the typed basename).
+T "script-path-barename"        "$(printf '#!/bin/sh\necho PATH-SCRIPT-OK\n' > $B/usr/bin/pbare.sh; chmod +x $B/usr/bin/pbare.sh; $S -r $B pbare.sh 2>&1)" "PATH-SCRIPT-OK"
+T "script-path-abs"             "$($S -r $B /usr/bin/pbare.sh 2>&1)" "PATH-SCRIPT-OK"
 TR "dry-run-statics-env"         "$($S -r $B --dry-run /tmp/sp_asm 2>&1 | grep -c '^export')" 11 13
 
 # --- command arg edge cases
