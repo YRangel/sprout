@@ -10,8 +10,11 @@
 #   sprout-super      — supervisor (static-binary fallback; v0.5.1 rename,
 #                       legacy `sprout-ptrace` symlinked for compat)
 #
-# Usage: ./install.sh [dest-dir] [source-dir]
+# Usage: ./install.sh [--verify] [dest-dir] [source-dir]
 set -eu
+
+VERIFY=0
+case ${1:-} in --verify) VERIFY=1; shift ;; esac
 
 DEST=${1:-${PREFIX:-$HOME/.local}/bin}
 SRC=${2:-$(cd "$(dirname "$0")" && pwd)}
@@ -22,7 +25,12 @@ pick() {
         bin) if [ -f "$SRC/target/release/$1" ]; then echo "$SRC/target/release/$1"; return; fi
              if [ -f "$SRC/target/debug/$1" ]; then echo "$SRC/target/debug/$1"; return; fi ;;
     esac
-    for d in "$SRC" "$SRC"/target/release/build/*/out "$SRC"/target/debug/build/*/out "$SRC"/target; do
+    # build/*/out accumulates per-source-changes: newest must win
+    # (deploy-discipline law — first-glob can silently downgrade, and did).
+    local newest
+    newest=$(ls -t "$SRC"/target/release/build/*/out/"$1" "$SRC"/target/debug/build/*/out/"$1" 2>/dev/null | head -1)
+    if [ -n "$newest" ]; then echo "$newest"; return; fi
+    for d in "$SRC" "$SRC"/target; do
         if [ -f "$d/$1" ]; then echo "$d/$1"; return; fi
     done
     echo ""
@@ -45,7 +53,27 @@ if [ -n "$missing" ]; then
     exit 1
 fi
 
+verify_pair() { # verify_pair SRC DEST — md5 equality, loud fail
+    local s d; s=$(md5sum "$1" 2>/dev/null | awk '{print $1}')
+    d=$(md5sum "$2" 2>/dev/null | awk '{print $1}')
+    if [ "$s" != "$d" ] || [ -z "$s" ]; then
+        echo "install.sh: HASH MISMATCH $2 (src=$s dst=$d)" >&2; return 1
+    fi
+}
+
 mkdir -p "$DEST"
+if [ $VERIFY -eq 1 ]; then
+    rc=0
+    for pair in "$SP sprout" "$SO libsprout-core.so" "$PX sprout-super"; do
+        set -- $pair; verify_pair "$1" "$DEST/$2" || rc=1
+    done
+    [ -n "$PS" ] && { [ -f "$DEST/sprout-stub" ] && verify_pair "$PS" "$DEST/sprout-stub" || rc=1; }
+    [ -n "$MS" ] && { [ -f "$DEST/libsprout-core-musl.so" ] && verify_pair "$MS" "$DEST/libsprout-core-musl.so" || rc=1; }
+    [ "$(readlink "$DEST/sprout-ptrace" 2>/dev/null)" = "sprout-super" ] || rc=1
+    [ $rc -eq 0 ] && echo "install.sh --verify: ALL artifacts match source ($DEST)"
+    exit $rc
+fi
+
 cp "$SP" "$DEST/sprout"
 cp "$SO" "$DEST/libsprout-core.so"
 cp "$PX" "$DEST/sprout-super"
@@ -53,5 +81,15 @@ ln -sf sprout-super "$DEST/sprout-ptrace"  # legacy name (fastfetch-style comm r
 [ -n "$PS" ] && { cp "$PS" "$DEST/sprout-stub"; chmod 755 "$DEST/sprout-stub"; }
 if [ -n "$MS" ]; then cp "$MS" "$DEST/libsprout-core-musl.so"; fi
 chmod 755 "$DEST/sprout" "$DEST/sprout-super"
-echo "installed sprout + libsprout-core.so + sprout-super ${MS:++ libsprout-core-musl.so} -> $DEST"
+
+# deploy self-check (H5): an install whose hashes diverge from source is a
+# stale-artifact footgun (one violation almost shipped 2026-08-12).
+fails=""
+verify_pair "$SP" "$DEST/sprout"        2>/dev/null || fails="$fails sprout"
+verify_pair "$SO" "$DEST/libsprout-core.so" 2>/dev/null || fails="$fails libsprout-core.so"
+verify_pair "$PX" "$DEST/sprout-super"  2>/dev/null || fails="$fails sprout-super"
+[ -n "$PS" ] && { verify_pair "$PS" "$DEST/sprout-stub" 2>/dev/null || fails="$fails sprout-stub"; }
+[ -n "$MS" ] && { verify_pair "$MS" "$DEST/libsprout-core-musl.so" 2>/dev/null || fails="$fails libsprout-core-musl.so"; }
+if [ -n "$fails" ]; then echo "install.sh: POST-INSTALL HASH CHECK FAILED:$fails" >&2; exit 1; fi
+echo "installed sprout + libsprout-core.so + sprout-super ${MS:++ libsprout-core-musl.so} -> $DEST (hashes verified)"
 echo "verify:  $DEST/sprout --version && $DEST/sprout -r <rootfs> /bin/echo SPROUT-OK"
