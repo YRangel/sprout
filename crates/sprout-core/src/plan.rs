@@ -159,11 +159,7 @@ fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
             if !d.is_empty() {
                 env.push(("DISPLAY".into(), d));
             }
-        } else if rootfs
-            .bindings
-            .iter()
-            .any(|b| b.guest == *"/tmp")
-        {
+        } else if rootfs.bindings.iter().any(|b| b.guest == *"/tmp") {
             env.push(("DISPLAY".into(), ":0".into()));
         }
     }
