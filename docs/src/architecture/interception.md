@@ -13,6 +13,65 @@ Two interception layers cover the full binary spectrum:
 
 The launcher picks the layer per exec: dynamic binaries never see ptrace.
 
+## One-page map
+
+```
+                    sprout (CLI, Rust)
+                          |
+                    elf.rs classify:  ET_DYN+PT_INTERP  /  Go-note  /  ET_EXEC  /  not-ELF
+                          |
+        +-----------------+------------------+-----------------+
+        |                                    |                 |
+   DYNAMIC glibc/musl                   GoDynamic          STATIC (glibc/musl/Go-static)
+        |                               (Go bypasses         |
+        |                                libc: L1 blind)     |
+        v                                    |                 v
+ ============================               v         stub lane (default, kind=1)
+ L1  LD_PRELOAD interposer        supervisor-wrapped    sprout-stub (freestanding, no libc)
+     libsprout-core{,-musl}.so    loader chain            |
+     exec*/posix_spawn/system/    L1 interposer         manual ET_EXEC mapper
+     socket/link/stat wrappers    + L3 notify serve      builds stack+auxv
+        |                                    |           jumps to guest entry
+ L2  sanitized guest libs (cache,             |              |
+     svc->mov x0,xzr @ {99,293})             |     in-guest SIGSYS emu {99,293}
+        |                                    |     (own sigaction, rt_sigreturn)
+ ============================                |              |
+        |                                    |              v
+        v                                    v        ============================
+ L3  seccomp user-notify filter (child installs pre-exec; listener fd stolen via pidfd)
+        |                                    |              |
+        |    +-------------------------------+              |
+        |    v                                                     |
+ ======= sprout-super (supervisor: poll + serve + waitpid loop, NO steady ptrace) =======
+        |    serve set (aarch64 nrs):                                          |
+        |      paths:  56 openat 437 openat2 48 faccessat 34 mkdirat 35 unlinkat
+        |              33 mknodat 88 utimensat 36 link 37 unlink 38 rename 276 renameat2
+        |      stat:   79 newfstatat 291 statx 78 readlinkat ( + nlink spoof, SP_HREG )
+        |      exec:   221 execve (lazy-attach rewrite: loader chain / scratch argv /
+        |                     script [interp,opt?,script,rest])                         |
+        |      unix:   200 bind 203 connect 206 sendmsg 211 sendto (pidfd-dup serving)  |
+        |      fake:   /proc/stat  /proc/loadavg  + normalize-ld-symlink pre-pass        |
+        |    answer  = in-place string edit (host<=guest) + CONTINUE, or direct serve    |
+        |    readmem = process_vm_readv ; writemem = sp_vm_write (same-uid = OK)          |
+        v                                                                                v
+                                     ANDROID KERNEL
+```
+
+**ptrace inventory** (the whole of it, nothing else exists):
+
+| when | what | how often |
+|------|------|-----------|
+| stub-lane execve(221) notify | lazy `ATTACH -> GETREGSET -> rewrite argv/regs -> SETREGSET -> DETACH` while task is seccomp-parked | one attach per exec, never per syscall |
+| `SPROUT_NOTIFY_STATICS=0` | legacy TRACEME lane: per-syscall stop/translate | every syscall (escape hatch, A/B) |
+| `SPROUT_USER_NOTIFY=0` | same TRACEME lane for dynamic guests | every syscall (debug mode) |
+| musl-static / kind=3 corners | ptrace+notify hybrid where stub emu tables don't cover | per-syscall for uncovered ops |
+
+That is the entire ptrace surface: no tracing in the dynamic lane, no
+steady-state tracing in the static lane, `PTRACE_TRACEME` exists only
+behind the two `=0` escape hatches, and the one remaining productive use
+is a *sub-millisecond attach* that detaches before the trapped execve
+retries — the task never pointer-stops outside seccomp's own park.
+
 ## Fast path: `LD_PRELOAD` through the sanitized loader chain
 
 `sprout` execs the guest program through a **sanitized copy of the
