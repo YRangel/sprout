@@ -55,6 +55,22 @@ plugin needed.
 `$PREFIX/bin/proot` → `sprout`; a `$PREFIX/bin/sprout` alias exists too.
 
 
+### Known quirks (proot-identical unless noted)
+
+- **tmux `capture-pane` content for detached sessions is empty on BOTH
+  runtimes.** The pane and its child run fine; the screen-grid read
+  back returns nothing. Workaround (works in sprout AND proot): use
+  `tmux pipe-pane -t <sess> -o 'cat > /tmp/out'` to stream pane output,
+  or drive deterministic output through files. Root cause is tmux's
+  screen-buffer handshake on ptrace-class runtimes; not a sprout gap.
+- **`ls /dev` fails EACCES for any unprivileged uid on Android**
+  (SELinux characteristic; proot shows the same error). Device *nodes*
+  work when accessed directly by name.
+- **pulseaudio's unix socket is unreachable** for fake-id runs (both
+  runtimes): the server authenticates the peer via SO_PEERCRED and
+  distrusts the spoofed uid. proot-distro's TCP default is applied by
+  sprout (`PULSE_SERVER=127.0.0.1` unless you override).
+
 ### Environment hygiene
 
 sprout, like proot-distro, substitutes a guest-sane `PATH` (`/usr/local/sbin:.../sbin:/bin`) unless `SPROUT_GUEST_PATH` overrides it; `--host-path` appends `$PREFIX/bin`. `HOME=/root` by default (proot parity) — `--host-home` carries the host `$HOME` in. `TERM` is inherited from the host (with an `xterm-256color` fallback when the host didn't set any). The supervisor binary is `sprout-super` since v0.5.1 (`sprout-ptrace` stays as a legacy symlink): the name tools like fastfetch report comes straight from the process tree.
