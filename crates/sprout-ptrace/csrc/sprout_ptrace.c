@@ -162,8 +162,10 @@ static const long SP_EMULATE_MUSL_EXTRA[] = {
 static int g_debug = 0;
 #define SP_TRACE(...) do { if (g_debug) fprintf(stderr, "[ptrace] " __VA_ARGS__); } while (0)
 
-/* Ptrace state per tracee. */
-#define SP_MAX_TRACEES 512
+/* Ptrace state per tracee. Firefox+Xfce sessions can transiently exceed
+ * 512 traced PIDs/TIDs (procs + CLONE_THREAD stops); 4096 sits inline with
+ * proot's own ceilings (sizeof(tracee_t) is small). */
+#define SP_MAX_TRACEES 4096
 typedef struct {
     pid_t pid;
     int   sysno;
@@ -2796,7 +2798,16 @@ int main(int argc, char **argv) {
                sig == SIGSTOP ? (void *)0 : (void *)(long)sig);
         continue;
     cont:
-        ptrace(t->shadow ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, 0);
+        /* NULL-t not possible via loop flow (w had an event) EXCEPT the
+         * SP_MAX_TRACEES-exhausted path at 2635 — observed as a SIGSEGV at
+         * NULL+0x44 (si_addr == offsetof(tracee_t, shadow)) taking the
+         * supervisor down and PTRACE_O_EXITKILL mass-killing every guest
+         * (2026-08-13 firefox-session crash). Resume syscall-mode as the
+         * safe default (unclassified tracee must keep its syscall stops for
+         * the entry policy/classification to ever work — CONT would let a
+         * static image execute an untranslated open). A slower extra tracee
+         * beats a dead tree. */
+        ptrace(t && t->shadow ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, 0);
         } /* end drain loop */
         /* outer loop repeats: repoll both sources */
         continue;
