@@ -16,6 +16,10 @@ fn main() {
         println!(
             "cargo:warning=sprout-ptrace: aarch64-only C artifacts skipped on non-aarch64 target"
         );
+        // lib.rs still reads both vars via env! — emit them empty, same as
+        // sprout-preload's glibc gate, so non-aarch64 compiles stay valid.
+        println!("cargo:rustc-env=SPROOT_PTRACE_EXE=");
+        println!("cargo:rustc-env=SPROUT_STUB_EXE=");
         return;
     }
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
