@@ -1394,6 +1394,31 @@ int statvfs64(const char *path, struct statvfs64 *buf) {
     return SP_REAL(statvfs64)(p, buf);
 }
 
+/* statfs/statfs64 — mozilla's nsLocalFile uses STATFS=statfs on LINUX
+ * (nsLocalFileUnix.cpp selects statvfs only when !defined(LINUX)), while
+ * coreutils df(1) rides statvfs — hence the false-parity probe: df(1)
+ * worked, about:support's diskSpaceAvailable silently broke against the
+ * untranslated guest path and returned NS_ERROR_FAILURE (user report,
+ * about:support all-blank, 2026-08-13).
+ * aarch64 glibc: statfs64 = the LFS alias; both exported. */
+#include <sys/vfs.h>
+int statfs(const char *path, struct statfs *buf) {
+    static int (*SP_REAL(statfs))(const char *, struct statfs *) = NULL;
+    SP_RESOLVE(statfs);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("statfs", path, p);
+    return SP_REAL(statfs)(p, buf);
+}
+int statfs64(const char *path, struct statfs64 *buf) {
+    static int (*SP_REAL(statfs64))(const char *, struct statfs64 *) = NULL;
+    SP_RESOLVE(statfs64);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("statfs64", path, p);
+    return SP_REAL(statfs64)(p, buf);
+}
+
 /* stat-at family: GNU coreutils cp/c(LT)-h directives use fstatat; a missing
  * wrapper makes the SOURCE lookup fail with ENOENT on the host tree */
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
