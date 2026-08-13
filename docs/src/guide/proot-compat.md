@@ -116,3 +116,18 @@ proot-distro bind-mounts from its own `sysdata/`).
 | proot bind of host `/dev/*` | `-b /dev/...` | only pseudo files (`/dev/null`, `/dev/urandom`); **real device nodes (kgsl/mali) are SELinux-blocked for ALL unprivileged apps, proot included** |
 | proot's fake `/proc` files | — (not implemented) | sprout passes the host `/proc` variant through; doc'd divergence |
 
+
+### Known quirks (workarounds)
+
+- **`CANNOT LINK EXECUTABLE "sh": library "libc.so" not found` during XFCE
+  startup** (`xrdb -merge`): noise, not fatal — xrdb's rc=0 and the resource
+  merge lands. Proven to be Android's bionic linker (the string lives only in
+  /system/bin/linker64), so somewhere in xrdb's spawn path a host binary is
+  executed where the chain expected a guest one. Timing-sensitive
+  (LD_DEBUG=files hides it). Deferred bisect: the correlation with
+  bionic-linker-in-guest implies pathological DEFAULT search under
+  translation; probable root in the ptrace-side env or a direct kernel exec
+  in xrdb's spawn logic. Cosmetic until proven otherwise.
+- tmux detached `capture-pane` = empty (proot-parity; use `pipe-pane`).
+- PulseAudio unix-socket: use `PULSE_SERVER=127.0.0.1` (auto-set).
+- AT-SPI bus (`org.a11y.Bus exited 1`): cosmetic, proot-parity.
