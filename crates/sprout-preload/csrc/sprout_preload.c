@@ -1419,6 +1419,79 @@ int statfs64(const char *path, struct statfs64 *buf) {
     return SP_REAL(statfs64)(p, buf);
 }
 
+/* xattr family (path-taking members) — python os.listxattr(follow_symlinks=False)
+ * goes through llistxattr, meson's shutil.copy2/copystat dies with ENOENT on
+ * translated guest paths that absolutely exist in the guest ns (message
+ * identically misleading: 'FileNotFoundError [...] /root/mesa/bin/drm-shim.py'
+ * after a SUCCESSFUL copy2 content step, mesa setup fail 2026-08-13). The
+ * The fxattr variants take fd arguments whose kernel meaning is already
+ * host-real: they pass through untouched, untranslated. */
+#include <sys/xattr.h>
+int setxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    static int (*SP_REAL(setxattr))(const char *, const char *, const void *, size_t, int) = NULL;
+    SP_RESOLVE(setxattr);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("setxattr", path, p);
+    return SP_REAL(setxattr)(p, name, value, size, flags);
+}
+int lsetxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    static int (*SP_REAL(lsetxattr))(const char *, const char *, const void *, size_t, int) = NULL;
+    SP_RESOLVE(lsetxattr);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("lsetxattr", path, p);
+    return SP_REAL(lsetxattr)(p, name, value, size, flags);
+}
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size) {
+    static ssize_t (*SP_REAL(getxattr))(const char *, const char *, void *, size_t) = NULL;
+    SP_RESOLVE(getxattr);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("getxattr", path, p);
+    return SP_REAL(getxattr)(p, name, value, size);
+}
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size) {
+    static ssize_t (*SP_REAL(lgetxattr))(const char *, const char *, void *, size_t) = NULL;
+    SP_RESOLVE(lgetxattr);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("lgetxattr", path, p);
+    return SP_REAL(lgetxattr)(p, name, value, size);
+}
+ssize_t listxattr(const char *path, char *list, size_t size) {
+    static ssize_t (*SP_REAL(listxattr))(const char *, char *, size_t) = NULL;
+    SP_RESOLVE(listxattr);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("listxattr", path, p);
+    return SP_REAL(listxattr)(p, list, size);
+}
+ssize_t llistxattr(const char *path, char *list, size_t size) {
+    static ssize_t (*SP_REAL(llistxattr))(const char *, char *, size_t) = NULL;
+    SP_RESOLVE(llistxattr);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("llistxattr", path, p);
+    return SP_REAL(llistxattr)(p, list, size);
+}
+int removexattr(const char *path, const char *name) {
+    static int (*SP_REAL(removexattr))(const char *, const char *) = NULL;
+    SP_RESOLVE(removexattr);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("removexattr", path, p);
+    return SP_REAL(removexattr)(p, name);
+}
+int lremovexattr(const char *path, const char *name) {
+    static int (*SP_REAL(lremovexattr))(const char *, const char *) = NULL;
+    SP_RESOLVE(lremovexattr);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("lremovexattr", path, p);
+    return SP_REAL(lremovexattr)(p, name);
+}
+
 /* stat-at family: GNU coreutils cp/c(LT)-h directives use fstatat; a missing
  * wrapper makes the SOURCE lookup fail with ENOENT on the host tree */
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
