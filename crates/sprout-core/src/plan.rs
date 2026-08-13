@@ -218,6 +218,7 @@ impl LaunchPlan {
                 ("LD_LIBRARY_PATH".into(), library_path.clone()),
                 ("SPROUT_LOADER".into(), loader.display().to_string()),
                 ("SPROUT_LIBRARY_PATH".into(), library_path),
+                ("SPROUT_EXE".into(), guest_prog.display().to_string()),
                 ("SPROUT_LIBC".into(), "musl".into()),
                 // Autoconf-style guests fork/exec hundreds of conftest binaries;
                 // pre-binding every PLT entry on load prevents a class of
@@ -313,6 +314,13 @@ impl LaunchPlan {
             ("LD_LIBRARY_PATH".into(), library_path.clone()),
             ("SPROUT_LOADER".into(), loader.display().to_string()),
             ("SPROUT_LIBRARY_PATH".into(), library_path),
+            /* /proc/self/exe truth: the loader chain exec()s the sanitized
+             * ld.so, so the kernel points self/exe at OUR launcher and any
+             * guest computing its own dir from readlink(/proc/self/exe)
+             * (mozilla "Couldn't load XPCOM") searches the launcher dir.
+             * The preload interposer answers /proc/self/exe with this var;
+             * chains re-stamp it per child exec. */
+            ("SPROUT_EXE".into(), guest_prog.display().to_string()),
             // See musl branch note above: avoids conftest-hang class.
             ("LD_BIND_NOW".into(), "1".into()),
         ];

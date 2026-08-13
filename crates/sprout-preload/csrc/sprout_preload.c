@@ -1557,9 +1557,32 @@ int unlinkat(int dirfd, const char *path, int flags) {
     return SP_REAL(unlinkat)(dirfd, p, flags);
 }
 
+/* answer /proc/self/exe (and the pid-spelled twin) with SPROUT_EXE;
+ * see sp_stamp_exe above for the loader-chain fallout being mended. */
+static int sp_self_exe_answer(const char *path, char *buf, size_t bufsiz) {
+    if (!path) return -1;
+    char m[96];
+    int ok = !strcmp(path, "/proc/self/exe");
+    if (!ok) {
+        snprintf(m, sizeof(m), "/proc/%ld/exe", (long)getpid());
+        ok = !strcmp(path, m);
+    }
+    if (!ok) return -1;
+    const char *e = getenv("SPROUT_EXE");
+    if (!e || !*e) return -1;
+    size_t l = strlen(e);
+    if (l > bufsiz) l = bufsiz;
+    memcpy(buf, e, l);
+    return (int)l;
+}
+
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
     static ssize_t (*SP_REAL(readlinkat))(int, const char *, char *, size_t) = NULL;
     SP_RESOLVE(readlinkat);
+    {
+        int se = sp_self_exe_answer(path, buf, bufsiz);
+        if (se > 0) return se;
+    }
     if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
         return SP_REAL(readlinkat)(dirfd, path, buf, bufsiz);
     if (bufsiz == 0) return SP_REAL(readlinkat)(dirfd, path, buf, bufsiz);
@@ -1574,6 +1597,19 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
     memcpy(buf, target, (size_t)n);
     SP_TRACE("readlinkat", path, target);
     return n;
+}
+
+/* glibc's FORTIFY re-entry of readlink is a distinct PLT symbol and slips
+ * past the plain readlink() wrapper; firefox-esr's stub comes via this
+ * __readlink_chk path, so it needs the same self-exe answer. */
+ssize_t __readlink_chk(const char *path, char *buf, size_t len, size_t max_len) {
+    static ssize_t (*SP_REAL(__readlink_chk))(const char *, char *, size_t, size_t) = NULL;
+    {
+        int se = sp_self_exe_answer(path, buf, len);
+        if (se > 0) return se;
+    }
+    SP_RESOLVE(__readlink_chk);
+    return SP_REAL(__readlink_chk)(path, buf, len, max_len);
 }
 
 int chdir(const char *path) {
@@ -1965,6 +2001,11 @@ ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
     static ssize_t (*SP_REAL(readlink))(const char *, char *, size_t) = NULL;
     SP_RESOLVE(readlink);
     if (bufsiz == 0) return SP_REAL(readlink)(path, buf, bufsiz);
+    {
+        /* /proc/self/exe => SPROUT_EXE (see sp_self_exe_answer) */
+        int se = sp_self_exe_answer(path, buf, bufsiz);
+        if (se > 0) return se;
+    }
     char x[SP_PATH_MAX];
     char target[SP_PATH_MAX];
     const char *p = sp_translate_l(path, x);
@@ -2362,9 +2403,46 @@ static char **sp_chain_env(char *const envp[]) {
     return e2;
 }
 
+/* /proc/self/exe truth (Firefox/Gecko-class bug): under the loader chain,
+ * the kernel maps /proc/self/exe to OUR sanitized ld.so, so anything that
+ * computes its own install dir via readlink(/proc/self/exe) — Mozilla's
+ * stub linker looking for $exedir/libxul.so being the canonical case
+ * ("Couldn't load XPCOM" under sprout, user report 2026-08-13) — searches
+ * ~/.cache/sprout and finds nothing. plan.rs and this chain stamp
+ * SPROUT_EXE=<guest-abs spelling of the current image> into the env and
+ * the readlinkat() interposer below replies with it when asked for the
+ * self-exe symlink. proot never needed this because it exec()s the guest
+ * binary directly; our chain exec()s a launcher. */
+static void sp_stamp_exe(char **env, const char *gabs) {
+    if (!gabs || !*gabs) return;
+    static char exe_entry[SP_PATH_MAX + 12];
+    snprintf(exe_entry, sizeof(exe_entry), "SPROUT_EXE=%s", gabs);
+    int n = 0;
+    for (; env[n]; n++)
+        if (!strncmp(env[n], "SPROUT_EXE=", 11)) { env[n] = exe_entry; return; }
+    if (n < 510) { env[n] = exe_entry; env[n + 1] = NULL; }
+}
+
 static int sp_execve_chain(const char *path, char *const argv[], char *const envp[], int depth) {
     if (depth > 4) return sp_chain_fail(path, depth, ELOOP, "depth");
     envp = (char *const *)sp_chain_env(envp);
+    {
+        char gabs[SP_PATH_MAX];
+        if (path[0] == '/') {
+            snprintf(gabs, sizeof(gabs), "%s", path);
+        } else {
+            char cw[SP_PATH_MAX], gcw[SP_PATH_MAX];
+            ssize_t cn = readlink("/proc/self/cwd", cw, sizeof(cw) - 1);
+            if (cn <= 0 || (size_t)cn >= sizeof(cw)) snprintf(cw, sizeof(cw), "/");
+            else cw[cn] = '\0';
+            sp_reverse(&g_cfg, cw, gcw, sizeof(gcw));
+            snprintf(gabs, sizeof(gabs), "%s/%s", gcw, path);
+        }
+        /* SP_SCRIPT recurses with the interpreter; the recursion deep-stamps
+         * the interpreter's own gabs — matching kernel semantics where
+         * /proc/self/exe of a script is the INTERPRETER binary. */
+        sp_stamp_exe((char **)envp, gabs);
+    }
     char x[SP_PATH_MAX];
     const char *host_raw = sp_translate_x(path, x);
     char hx[SP_PATH_MAX];
