@@ -119,15 +119,15 @@ proot-distro bind-mounts from its own `sysdata/`).
 
 ### Known quirks (workarounds)
 
-- **`CANNOT LINK EXECUTABLE "sh": library "libc.so" not found` during XFCE
-  startup** (`xrdb -merge`): noise, not fatal — xrdb's rc=0 and the resource
-  merge lands. Proven to be Android's bionic linker (the string lives only in
-  /system/bin/linker64), so somewhere in xrdb's spawn path a host binary is
-  executed where the chain expected a guest one. Timing-sensitive
-  (LD_DEBUG=files hides it). Deferred bisect: the correlation with
-  bionic-linker-in-guest implies pathological DEFAULT search under
-  translation; probable root in the ptrace-side env or a direct kernel exec
-  in xrdb's spawn logic. Cosmetic until proven otherwise.
+- ~~`CANNOT LINK EXECUTABLE "sh": library "libc.so" not found` during XFCE
+  startup~~ **FIXED (2026-08-13, commit 88c6ed0)**: glibc's `popen()` execs
+  its `/bin/sh` child through a raw internal syscall, bypassing preload
+  interposition — the child landed on HOST bionic `sh`, whose linker then
+  walked `/system|/odm|/vendor` lib64 through our notify translation and
+  complained about missing bionic `libc.so`. `popen()`/`pclose()` are now
+  interposed (pipe2+fork+chain-exec, same skeleton as our `system()`).
+  Other glibc spawn sinks already covered: `system()`, `posix_spawn`,
+  `execve` family.
 - **XFCE4 desktop session works** (panel, wallpaper, xfwm4, plugins — verified
   on-device 2026-08-13). Launch pattern: `sprout -r $ROOTFS --shared-tmp sh -c
   'eval "$(dbus-launch --sh-syntax --exit-with-session)"; exec xfce4-session'`
