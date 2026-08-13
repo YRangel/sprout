@@ -104,6 +104,26 @@ static const sp_emul_rule SP_EMULATE_BASE[] = {
     { 425, -38 },  /* io_uring_setup    -> -ENOSYS */
     { 426, -38 },  /* io_uring_enter    -> -ENOSYS */
     { 427, -38 },  /* io_uring_register -> -ENOSYS */
+    /* SysV IPC: Android netsys kills the whole family for untrusted apps
+     * (msg*186-189, sem*190/193, shm*194-197). Real IPC can't be faked,
+     * and no proot-distro guest ever had it — surface -ENOSYS so X/MIT-SHM
+     * users (libxcb XShmPixmap) and friends take their no-shm fallback
+     * instead of dying. Observed 2026-08-13: xfce4-session family killed
+     * by SIGSYS nr=194 (shmget) the MOMENT xfwm/panel/desktop came up,
+     * session mapping 0 windows; exact signal consumer = libxcb.
+     * Numbers verified against asm-generic/unistd.h. */
+    { 186, -38 },  /* msgget   */
+    { 187, -38 },  /* msgctl   */
+    { 188, -38 },  /* msgrcv   */
+    { 189, -38 },  /* msgsnd   */
+    { 190, -38 },  /* semget   */
+    { 191, -38 },  /* semctl   */
+    { 192, -38 },  /* semtimedop */
+    { 193, -38 },  /* semop    */
+    { 194, -38 },  /* shmget   */
+    { 195, -38 },  /* shmctl   */
+    { 196, -38 },  /* shmat    */
+    { 197, -38 },  /* shmdt    */
     { 439, -38 },  /* faccessat2 raw callers -> -ENOSYS (libc falls back) */
     { 452, -38 },  /* fchmodat2 (GNU tar >= 1.35) -> -ENOSYS (fallback to fchmodat) */
     /* accept(202) deliberately NOT here: Android policy layers trigger

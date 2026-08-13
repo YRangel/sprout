@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1730,18 +1731,64 @@ ssize_t sendto(int fd, const void *bufv, size_t n, int flags,
     return SP_REAL(sendto)(fd, bufv, n, flags, addr, len);
 }
 
+/* SCM_CREDENTIALS truth: under fake-root the guest believes uid/gid=0 and
+ * claims them in ucred ancillary data; the kernel rejects impersonation of
+ * a uid/gid it never had with EPERM (GDBus clients: "Error sending
+ * credentials: Error sending message: Operation not permitted" — hit by
+ * dbus/glib inside XFCE, 2026-08-13). pid is untouched (no pid-ns lie),
+ * uid/gid are swapped for the REAL ids, then the guest buffer is restored. */
+static void sp_cmsg_creds_truth(struct msghdr *m,
+                                struct ucred old[4], struct ucred *pos[4],
+                                size_t *n) {
+    *n = 0;
+    if (!sp_fakeroot_on() || !m->msg_control ||
+        m->msg_controllen < (socklen_t)CMSG_LEN(sizeof(struct ucred)))
+        return;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(m);
+         c && *n < 4 && c->cmsg_len >= CMSG_LEN(0) &&
+         (char *)c + c->cmsg_len <= (char *)m->msg_control + m->msg_controllen;
+         c = CMSG_NXTHDR(m, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_CREDENTIALS &&
+            c->cmsg_len >= CMSG_LEN(sizeof(struct ucred))) {
+            struct ucred *uc = (struct ucred *)CMSG_DATA(c);
+            old[*n] = *uc;
+            pos[*n] = uc;
+            uc->uid = (uid_t)syscall(SYS_getuid);
+            uc->gid = (gid_t)syscall(SYS_getgid);
+            if (uc->pid == 0 || uc->pid != (pid_t)syscall(SYS_getpid))
+                uc->pid = (pid_t)syscall(SYS_getpid);
+            (*n)++;
+        }
+    }
+}
+
 ssize_t sendmsg(int fd, const struct msghdr *msg, int flags) {
     static ssize_t (*SP_REAL(sendmsg))(int, const struct msghdr *, int) = NULL;
     SP_RESOLVE(sendmsg);
-    if (!msg || !msg->msg_name) return SP_REAL(sendmsg)(fd, msg, flags);
+    if (!msg) return SP_REAL(sendmsg)(fd, msg, flags);
     struct sockaddr_un x;
-    socklen_t xl = sp_addr_fwd_unix((const struct sockaddr *)msg->msg_name,
-                                    (socklen_t)msg->msg_namelen, &x);
-    if (!xl) return SP_REAL(sendmsg)(fd, msg, flags);
-    struct msghdr m = *msg;
-    m.msg_name = &x;
-    m.msg_namelen = xl;
-    return SP_REAL(sendmsg)(fd, &m, flags);
+    struct msghdr m;
+    const struct msghdr *to_send = msg;
+    struct ucred crold[4];
+    struct ucred *crpos[4];
+    size_t ncr = 0;
+    if (msg->msg_name) {
+        socklen_t xl = sp_addr_fwd_unix((const struct sockaddr *)msg->msg_name,
+                                        (socklen_t)msg->msg_namelen, &x);
+        if (xl) {
+            m = *msg;
+            m.msg_name = &x;
+            m.msg_namelen = xl;
+            to_send = &m;
+        }
+    }
+    /* cmsg editing happens on the GUEST'S buffer (either msg->msg_control
+     * or the same pointer copied into `m`); restore it after the send. */
+    if (to_send->msg_control)
+        sp_cmsg_creds_truth((struct msghdr *)to_send, crold, crpos, &ncr);
+    ssize_t r = SP_REAL(sendmsg)(fd, to_send, flags);
+    while (ncr) { ncr--; *crpos[ncr] = crold[ncr]; }
+    return r;
 }
 
 ssize_t recvfrom(int fd, void *bufv, size_t n, int flags,
@@ -2420,9 +2467,22 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
         free(e2); free(v);
         return rc;
     }
-    default:
-        errno = ENOEXEC;
+    default: {
+        /* glibc-parity errno: sp_classify_host() collapses ENOENT and
+         * plain-data into SP_NOT_ELF, but callers MUST see fopen's real
+         * errno for a missing/unreadable path (ENOENT, EACCES...) — with
+         * a blanket ENOEXEC, glib's g_spawn PATH walker takes its
+         * script-fallback branch ("execve returned ENOEXEC => try
+         * /bin/sh <cand>") on candidate #1 (/usr/local/sbin/<name>),
+         * so EVERY command living in a later PATH dir dies as dash's
+         * "/bin/sh: 0: cannot open ..." — observed as xfce4-session
+         * spawning zero components (2026-08-13). */
+        FILE *pe = fopen(host, "rb");
+        if (!pe) return -1;             /* errno already set by fopen */
+        fclose(pe);
+        errno = ENOEXEC;                /* genuine data file */
         return -1;
+    }
     }
 }
 

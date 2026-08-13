@@ -128,6 +128,27 @@ proot-distro bind-mounts from its own `sysdata/`).
   bionic-linker-in-guest implies pathological DEFAULT search under
   translation; probable root in the ptrace-side env or a direct kernel exec
   in xrdb's spawn logic. Cosmetic until proven otherwise.
+- **XFCE4 desktop session works** (panel, wallpaper, xfwm4, plugins — verified
+  on-device 2026-08-13). Launch pattern: `sprout -r $ROOTFS --shared-tmp sh -c
+  'eval "$(dbus-launch --sh-syntax --exit-with-session)"; exec xfce4-session'`
+  (pre-launched dbus; the `--autolaunch` fallback inside components can see a
+  stale `~/.dbus/session-bus` after killed sessions — delete it if components
+  fail with `dbus-launch ... Child process exited with code 2`). Two sprout
+  bugs fixed to reach the desktop: (1) SysV-IPC family (`shmget` et al.,
+  Android always SIGSYS-kills it) now fakes `-ENOSYS` in BOTH lanes so
+  MIT-SHM/libxcb users fall back instead of dying mid-session; (2) sprout's
+  exec chain used to return a blanket `ENOEXEC` for *missing* paths, which
+  silently broke glib's g_spawn PATH walker (`sh cand` dash-fallback →
+  "/bin/sh: 0: cannot open /usr/local/sbin/...") → xfce4-session spawned no
+  components; `ENOENT`/`EACCES` parity restored.
+- D-Bus under fake-root: sprout rewrites guest `SCM_CREDENTIALS` ancillary
+  data to the REAL uid/gid in `sendmsg` (the guest believes uid=0; the
+  kernel would otherwise EPERM the impersonation and every GDBus client died
+  with `Error sending credentials`). `dbus-send` (libdbus, no creds cmsg)
+  was always fine; the GDBus path required this surgery.
+- gdbus CLI quirk (host-independent GLib behavior): `DBUS_SESSION_BUS_ADDRESS`
+  is honored only with an explicit `--session` / `--system` / `--address`
+  — the bare default connects to the STARTER bus. Not sprout's doing.
 - tmux detached `capture-pane` = empty (proot-parity; use `pipe-pane`).
 - PulseAudio unix-socket: use `PULSE_SERVER=127.0.0.1` (auto-set).
 - AT-SPI bus (`org.a11y.Bus exited 1`): cosmetic, proot-parity.

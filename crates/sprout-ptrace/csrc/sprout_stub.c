@@ -355,7 +355,15 @@ static const long g_musl_ok[] = { 48, 143, 144, 145, 146, 147, 148, 149, 150, 15
 /* shared -ENOSYS table (fake success would be a LIE here: callers probe
  * and fall back — io_uring probes; futex_waitv on Android-16 TRAPs and
  * glibc≥2.41/libevent fall back to futex(2) on ENOSYS). */
-static const long g_enosys[] = { 202, 425, 426, 427 };
+/* -ENOSYS table: accept pivot handled separately, io_uring family, and
+ * the whole SysV IPC set (msgget/shmget/shmat & friends 186..197) —
+ * Android SIGSYS-kills them for untrusted apps. NEVER fake-success an
+ * IPC syscall (a fabricated handle is worse than ENOSYS): libxcb and
+ * friends take their no-shm fallback when ENOSYS surfaces. */
+static const long g_enosys[] = {
+    202, 425, 426, 427,
+    186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197,
+};
 
 static int stub_is_ok(long nr, const long *tbl, int n)
 {
