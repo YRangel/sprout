@@ -246,3 +246,21 @@ cloudflared) live on the right-hand column. Superseded by the fuller
 First published release pass: python3 239→41 (5.8×), exec-chain 285→49
 (5.8×), find 214→24 (8.9×). Kept for comparison with the table above
 (post-v0.4 numbers trade exec-chain speed for musl correctness).
+
+## Real-world syscall-dense workload: cloudflared quick tunnel (2026-08-12, Go 1.24 static, 28 MB)
+
+Launch + quick tunnel (`trycloudflare.com` free tier, QUIC + DNS + mux),
+median of 5 for the small-op, single runs for the network-bound one:
+
+| Measurement | proot 6.x | sprout | delta |
+|---|---|---|---|
+| `cloudflared --version` (raw proot binary, no wrapper) | 94 ms | 441 ms | 0.21× (sprout slower) |
+| `cloudflared --version` via proot-distro login | 449 ms | 441 ms | 1.02× |
+| quick tunnel to first URL | 3871 ms | 4571 ms | 0.85× |
+
+Repro: `cloudflared tunnel --no-autoupdate --url http://localhost:1 | head -1`,
+rootfs `/tmp/cloudflared` (upstream `cloudflared-linux-arm64` from the GitHub release page).
+Note: Go-class statics exercise the legacy TRACEME lane (the notify-statics stub lane
+is opt-in while the glibc-static startup divergence gets bisected, ADR-0016). The 347 ms
+raw-launch gap vs bare proot is the known ptrace-stop tax on Go's dense pre-main syscall
+flow; the network-dominated workload measurement is the realistic hit (< 20%).
