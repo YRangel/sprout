@@ -10,3 +10,6 @@
 # in-tree interposer build artifacts (built in-guest, deployed to \/data/data/com.termux/files/usr/bin)
 crates/sprout-preload/csrc/libsprout-core.so
 crates/sprout-preload/csrc/libsprout-core-musl.so
+
+# per-run benchmark artifacts (kept on device, not published blobs)
+bench/results/

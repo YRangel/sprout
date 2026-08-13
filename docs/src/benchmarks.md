@@ -264,3 +264,64 @@ Note: Go-class statics exercise the legacy TRACEME lane (the notify-statics stub
 is opt-in while the glibc-static startup divergence gets bisected, ADR-0016). The 347 ms
 raw-launch gap vs bare proot is the known ptrace-stop tax on Go's dense pre-main syscall
 flow; the network-dominated workload measurement is the realistic hit (< 20%).
+
+## Extensive full-surface sweep (v0.6.x post-#74, 2026-08-12 22:40, median-of-7)
+Host: Xiaomi 25102PCBEG, Android 16, kernel 6.12.23-android16-5, aarch64.
+Commit: `c9a7bc2` (+ bench harness). Baseline: `proot-distro login` (same rootfs in both).
+Harness: `bench/run-extensive.sh 7` (this repo; raw TSV + per-cell medians under
+`bench/results/extensive-20260812-224034/`). Note the harness defaults SPROUT_BIN
+to `$PREFIX/bin/sprout`; the older per-section scripts default to target/debug.
+
+### A. glibc guest (debian, dynamic) — speedup = proot-distro / sprout
+| case | proot-distro | sprout | speedup |
+|---|---|---|---|
+| bash -c true | 210 | 44 | **4.8×** |
+| find /usr/bin -type f | 226 | 38 | **5.9×** |
+| exec-chain 20× true | 259 | 103 | **2.5×** |
+| python3 -c pass | 243 | 52 | **4.7×** |
+| python3 mp Pool(2) | 345 | 90 | **3.8×** |
+| cc -O2 hello.c | 369 | 103 | **3.6×** |
+| dd 64MB fdatasync | 310 | 142 | **2.2×** |
+| dpkg -l \| wc | 245 | 60 | **4.1×** |
+
+### B. statics (debian) — stub lane is the DEFAULT now (ADR-0016, #74 fixed)
+| case | proot-distro | sprout | speedup |
+|---|---|---|---|
+| sp_min (nop static) | 220 | 32 | **6.9×** |
+| sp_statloop | 1967 | 616 | **3.2×** |
+| sp_ioloop | 2509 | 1112 | **2.3×** |
+| glibc-static step | 208 | 38 | **5.5×** |
+| cloudflared --version (28MB Go static) | 326 | 56 | **5.8×** |
+| static→script exec_script | 210 | 32 | **6.6×** |
+
+Stub lane (default) vs legacy ptrace lane (=0), sprout-only:
+| case | stub (notify) | legacy ptrace | ptrace/stub |
+|---|---|---|---|
+| sp_ioloop | 1114 | 4306 | **3.9×** |
+| sp_statloop | 616 | 1735 | **2.8×** |
+
+(The same pre-#74 default lane carried a pre-main SIGBUS crash for
+glibc-statics/Go; those numbers are now reachable AND correct.)
+
+### C. musl guest (alpine)
+| case | proot-distro | sprout | speedup |
+|---|---|---|---|
+| sh -c true (busybox ash) | 216 | 31 | **7.0×** |
+| find /usr/bin -type f | 262 | 35 | **7.5×** |
+| busybox chain 20× | 254 | 90 | **2.8×** |
+| dd 64MB fdatasync | 214 | 37 | **5.8×** |
+
+### Lane A/B (notify-vs-ptrace-forced) and cache effects
+`SPROUT_USER_NOTIFY=0` vs `=1`: difference within ±10–20% at these sizes
+(41/46, 48/47 glibc; 42/39, 43/43 musl) — consistent with the musl-notify
+A/B decision (device noise). `bash-true` cold-cache vs warm: 41 vs 45 —
+sanitized-lib cache cost is below the fork latency itself at this scale
+(cold includes `svc`-site re-sanitization of the guest libc+ld.so).
+
+### Reading it
+- Every section now beats proot-distro end-to-end; the weakest cell
+  (exec-chain, dd) is dominated by kernel work both sides must do.
+- Largest wins sit in syscall-dense statics — exactly the ADR-0016 thesis —
+  and musl baseline forks (the interposer+notify pair costs ~7 ms per launch
+  against ~216 ms proot-distro startup).
+Thermal drift: numbers are point-in-time at 22:40; compare only same-file runs.
