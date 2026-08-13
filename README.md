@@ -26,7 +26,7 @@ ptrace syscall-stop overhead, plus an automatic ptrace fallback for static/Go bi
 $ sprout -r ~/ubuntu -w /root -0 --link2symlink -- /bin/bash -l
 $ sprout -r ~/ubuntu /usr/bin/node server.js
 $ sprout --fallback=ptrace -r ~/ubuntu /usr/local/bin/static-go-server
-$ sprout -r ~/ubuntu --shared-tmp /usr/bin/xterm          # X11 via termux-x11
+$ sprout -r ~/ubuntu --shared-tmp --termux-x11 /usr/bin/xterm  # X11+pulse preset
 ```
 
 `proot` CLI compatibility is a goal: `sprout` accepts `-r -b -q -0 --link2symlink -w`

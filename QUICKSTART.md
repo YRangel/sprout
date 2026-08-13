@@ -17,7 +17,7 @@ A=$PREFIX/var/lib/proot-distro/containers/alpine/rootfs   # or any musl rootfs
 sprout -r $B /bin/echo hello
 sprout -r $B -w /root /bin/bash                    # interactive shell
 sprout -r $B -b $PREFIX/tmp/x:/mnt /bin/cat /mnt/f # binds, proot-style
-sprout -r $B --shared-tmp /usr/bin/xterm           # X11 (termux-x11 :0)
+sprout -r $B --shared-tmp --termux-x11 /usr/bin/xterm # X11+audio preset
 sprout -r $A /bin/busybox sh -c 'ls /etc/apk'      # musl automatic (supervisor)
 sprout -r $B ./static-binary; echo $?              # exit codes pass through
 ```
@@ -42,5 +42,7 @@ Go-static / Go-dynamic binaries, X11 (termux-x11) handshake, cloudflared
 static binary executing. Unsupported host GPU nodes/devices stay
 SELinux-blocked, same as proot-distro.
 
-Semantics match proot (`-r -b -w -0 --link2symlink`) plus `--shared-tmp`
+Semantics match proot (`-r -b -w -0 --link2symlink`) plus `--shared-tmp`,
+`--termux-x11` (DISPLAY/PULSE preset — sprout itself never invents those
+exports; without the flag it only inherits what you set)
 parity with proot-distro login. See docs/src/guide/.

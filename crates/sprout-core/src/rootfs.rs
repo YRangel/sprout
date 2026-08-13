@@ -71,6 +71,10 @@ pub struct Rootfs {
     pub user_name: Option<String>,
     pub user_home: Option<String>,
     pub user_shell: Option<String>,
+    /// `--termux-x11` preset opt-in: inject the Termux-X11/pulse env bundle
+    /// (DISPLAY=:0, PULSE_SERVER=127.0.0.1) into the guest. DEFAULT off:
+    /// env is inherit-only; sprout never invents X11/audio exports.
+    pub termux_x11: bool,
 }
 
 impl Rootfs {
@@ -103,6 +107,7 @@ impl Rootfs {
             user_name: None,
             user_home: None,
             user_shell: None,
+            termux_x11: false,
         })
     }
 

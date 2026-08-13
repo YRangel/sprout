@@ -74,8 +74,9 @@ plugin needed.
   work when accessed directly by name.
 - **pulseaudio's unix socket is unreachable** for fake-id runs (both
   runtimes): the server authenticates the peer via SO_PEERCRED and
-  distrusts the spoofed uid. proot-distro's TCP default is applied by
-  sprout (`PULSE_SERVER=127.0.0.1` unless you override).
+  distrusts the spoofed uid. proot-distro's TCP default is available on
+  request: `--termux-x11` presets `PULSE_SERVER=127.0.0.1` (or export it
+  yourself — sprout never invents it).
 
 ### Environment hygiene
 
@@ -113,6 +114,7 @@ proot-distro bind-mounts from its own `sysdata/`).
 | `-0` (fake root id) | `-0` | exit-code passthrough only |
 | `--link2symlink` | `--link2symlink` | |
 | `proot-distro login --shared-tmp` | `--shared-tmp` | binds `$PREFIX/tmp` → guest `/tmp`; carries X11/Wayland/VirGL sockets |
+| proot-distro login profile's `DISPLAY`/`PULSE_SERVER` exports | `--termux-x11` (opt-in) | presets `DISPLAY=:0` (when a `/tmp` bind exists) + `PULSE_SERVER=127.0.0.1`; without the flag sprout only inherits host-set values |
 | proot bind of host `/dev/*` | `-b /dev/...` | only pseudo files (`/dev/null`, `/dev/urandom`); **real device nodes (kgsl/mali) are SELinux-blocked for ALL unprivileged apps, proot included** |
 | proot's fake `/proc` files | — (not implemented) | sprout passes the host `/proc` variant through; doc'd divergence |
 
@@ -150,5 +152,6 @@ proot-distro bind-mounts from its own `sysdata/`).
   is honored only with an explicit `--session` / `--system` / `--address`
   — the bare default connects to the STARTER bus. Not sprout's doing.
 - tmux detached `capture-pane` = empty (proot-parity; use `pipe-pane`).
-- PulseAudio unix-socket: use `PULSE_SERVER=127.0.0.1` (auto-set).
+- PulseAudio unix-socket: use `PULSE_SERVER=127.0.0.1` (preset by
+  `--termux-x11`; otherwise your own export).
 - AT-SPI bus (`org.a11y.Bus exited 1`): cosmetic, proot-parity.

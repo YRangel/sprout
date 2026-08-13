@@ -112,6 +112,8 @@ T "frame-abi-selftest" "$abi_ok" "1"
 # --- sanity: supervisor not left running as zombie after each call
 T "proc-self-exe-truth" "$(timeout 20 $S -r $B --shared-tmp /bin/sh -c 'ls -la /proc/self/exe 2>/dev/null | awk "{print \$NF}"' 2>/dev/null | tail -1)" "/usr/bin/ls"
 T "execv-missing-is-ENOENT-not-ENOEXEC" "$(timeout 20 $S -r $B --shared-tmp /bin/sh -c 'sh -c /definitely/not/here 2>&1 || true' 2>/dev/null | head -1)" "sh: 1: /definitely/not/here: not found"
+T "termux-x11-preset-injects"      "$(timeout 20 $S -r $B --shared-tmp --termux-x11 /usr/bin/env 2>/dev/null | grep -cE '^(DISPLAY=:0|PULSE_SERVER=127\.0\.0\.1)$')" "2"
+T "env-inherit-only-default"      "$(env -u DISPLAY -u PULSE_SERVER timeout 20 $S -r $B /usr/bin/env 2>/dev/null | grep -cE '^(DISPLAY|PULSE_SERVER)=')" "0"
 T "no-zombie-sprout"            "$(n=0; for p in $(pgrep -f sprout-super 2>/dev/null); do [ "$(basename $(readlink /proc/$p/exe 2>/dev/null))" = "sprout-super" ] && n=$((n+1)); done; echo $n)" "0"
 
 echo "SUMMARY: pass=$pass fail=$fail"

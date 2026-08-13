@@ -53,6 +53,15 @@ struct Cli {
     #[arg(long = "shared-tmp", default_value_t = false)]
     shared_tmp: bool,
 
+    /// Termux-X11/pulse preset: export DISPLAY=:0 and PULSE_SERVER=127.0.0.1
+    /// to the guest. Off by default — sprout never invents X11/audio env; it
+    /// only inherits what the caller set (host DISPLAY passes through).
+    /// Combine with --shared-tmp so the guest can reach the X socket in
+    /// $PREFIX/tmp; without it sprout warns but continues (a DISPLAY with no
+    /// reachable socket is a footgun for clients that don't need it).
+    #[arg(long = "termux-x11", default_value_t = false)]
+    termux_x11: bool,
+
     /// Convert hardlinks to symlinks on guest writes — DEFAULT (proot-distro
     /// parity: SELinux denies hardlinks under /data/data/.../files).
     #[arg(
@@ -162,6 +171,14 @@ fn run() -> Result<u8, Error> {
         rootfs
             .bindings
             .push(Binding::parse(&format!("{}:/tmp", tmp))?);
+    }
+    rootfs.termux_x11 = cli.termux_x11;
+    if cli.termux_x11 && !rootfs.bindings.iter().any(|b| b.guest == *"/tmp") {
+        eprintln!(
+            "sprout: note: --termux-x11 without --shared-tmp: the guest cannot\n\
+             reach the Termux-X11 socket ($PREFIX/tmp/.X11-unix) — X clients\n\
+             will fail unless you provide the socket some other way."
+        );
     }
     // Implicit bind: guest /dev/shm → $ROOTFS/tmp (proot-distro parity;
     // proot-distro binds its rootfs's own /tmp as /dev/shm, giving python's

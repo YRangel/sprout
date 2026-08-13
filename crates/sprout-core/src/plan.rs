@@ -140,26 +140,25 @@ fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
     if !env.iter().any(|(k, _)| k == "OLDPWD") {
         env.push(("OLDPWD".into(), guest_home(rootfs)));
     }
-    // proot-distro audio parity: their login profile exports PULSE_SERVER=
-    // 127.0.0.1 because the unix-socket path authenticates on SO_PEERCRED,
-    // which BOTH proot and sprout spoof under the fake-id anchor (hole: the
-    // host pulse server rightfully distrusts a peer claiming its own uid).
-    // TCP + auth-anonymous sidesteps cred spoofing — proot-distro's exact
-    // answer. User override wins (env check first).
-    if !env.iter().any(|(k, _)| k == "PULSE_SERVER") {
+    // X11/audio env policy (2026-08-13, user decision): INHERIT-ONLY by
+    // default. sprout never invents DISPLAY/PULSE_SERVER — a host-set value
+    // passes through (the user's explicit export), and the --termux-x11
+    // preset flag injects the proot-distro-style bundle on request.
+    // Why PULSE over TCP 127.0.0.1: the unix-socket path authenticates on
+    // SO_PEERCRED, which BOTH proot and sprout spoof under the fake-id
+    // anchor; the host pulse server distrusts a peer claiming its own uid.
+    // TCP + auth-anonymous sidesteps cred spoofing (proot-distro's answer).
+    if rootfs.termux_x11 && !env.iter().any(|(k, _)| k == "PULSE_SERVER") {
         env.push(("PULSE_SERVER".into(), "127.0.0.1".into()));
     }
-    // proot-distro X11 parity: the login profile exports DISPLAY=:0 when the
-    // shared /tmp bind carries the X socket. Inherit the host DISPLAY when
-    // the user set it; otherwise default :0 ONLY when a /tmp bind exists
-    // (a DISPLAY without a reachable socket is a footgun, proot-distro's
-    // --shared-tmp-less runs still fail the same way).
     if !env.iter().any(|(k, _)| k == "DISPLAY") {
         if let Ok(d) = std::env::var("DISPLAY") {
             if !d.is_empty() {
                 env.push(("DISPLAY".into(), d));
             }
-        } else if rootfs.bindings.iter().any(|b| b.guest == *"/tmp") {
+        } else if rootfs.termux_x11 && rootfs.bindings.iter().any(|b| b.guest == *"/tmp") {
+            // preset :0 needs the /tmp bind actually carrying the X socket;
+            // main.rs warns when the flag is set without --shared-tmp.
             env.push(("DISPLAY".into(), ":0".into()));
         }
     }

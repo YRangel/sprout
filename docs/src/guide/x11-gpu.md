@@ -27,8 +27,11 @@ glibc python client ↔ host server at `/tmp/.X11-unix/X0`, musl busybox
 client, Go-static client — byte-exact round-trips each way.
 
 `DISPLAY` env: the X11 socket number is baked into the pathname
-`/tmp/.X11-unix/X<N>`, so `${DISPLAY:-:0}` must match. share-tmp +
-`env DISPLAY=:0 sprout ...` is canonical.
+`/tmp/.X11-unix/X<N>`, so `${DISPLAY:-:0}` must match.
+`--shared-tmp --termux-x11 sprout ...` is canonical (the flag presets
+`DISPLAY=:0` + `PULSE_SERVER=127.0.0.1`); a manual `env DISPLAY=:0`
+export ahead of the call works too — sprout only *inherits* host-set
+DISPLAY, it never invents one.
 
 Abstract sockets (`@\0...`), by Android convention used by some Termux
 wrappers, are **not translated** (kernel-only namespace, no filesystem

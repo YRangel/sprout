@@ -17,8 +17,8 @@ These land in the launch plan *unless a user env already defines them*:
 | `SHELL` | guest `/bin/<basename-of-host-SHELL>` if found, else `/bin/bash`, else `/bin/sh` | host SHELL points at a bionic world; guests exec the WRONG libc otherwise |
 | `TMPDIR` | `/tmp` | host TMPDIR escapes the guest view |
 | `OLDPWD` | (dropped when host-sourced) | `$PWD`-chain confusion |
-| `PULSE_SERVER` | `127.0.0.1` | proot-distro audio parity (see below) |
-| `DISPLAY` | inherit host `DISPLAY`, else `:0` *only when a `/tmp` bind exists* | X11 over `--shared-tmp`, proot-distro parity |
+| `PULSE_SERVER` | inherit host value only — **never invented** | set it yourself, or `--termux-x11` presets `127.0.0.1` (see below) |
+| `DISPLAY` | inherit host `DISPLAY` only — **never invented** | set it yourself, or `--termux-x11` presets `:0` *when a `/tmp` bind carries the X socket* |
 | `LD_PRELOAD` | the active `libsprout-core{,-musl}.so` (always, in preloaded lanes) | interposer's reality |
 | `LD_LIBRARY_PATH` | the sanitized-lib cache + guest lib dirs | loader must reach sanitized libc before anything weird |
 | `SPROOT_*` | launcher control keys (LOADER, ROOTFS, BIND, GUEST_PRELOAD, LIBC, SUPERVISED, SHADOW, FAKEROOT, LINK2SYMLINK, PASSTHROUGH, TRACELOG…) | chain-resident state, not meant for guest apps |
