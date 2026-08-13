@@ -1302,6 +1302,9 @@ static int sp_statx(int dirfd, const char *path, int flags, unsigned int mask, s
 #ifndef SECCOMP_RET_USER_NOTIF
 #define SECCOMP_RET_USER_NOTIF 0x40000000
 #endif
+#ifndef SECCOMP_IOCTL_NOTIF_ID_VALID
+#define SECCOMP_IOCTL_NOTIF_ID_VALID 0x40082102
+#endif
 #ifndef SYS_pidfd_open
 #define SYS_pidfd_open 434
 #endif
@@ -2323,6 +2326,16 @@ static void sp_notify_pump(void) {
     memset(&req, 0, sizeof(req));
     if (ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0) { g_notify_err++; return; }
     g_notify_n++;
+    /* H1 TOCTOU guard #1: between RECV and serve-begin, the traced task
+     * may have exited (or its filter been replaced) — ID_VALID answers
+     * 'is this notification id still outstanding'. A dead id makes every
+     * subsequent process_vm_read + serve decision a no-target lie, and on
+     * SEND the kernel would match a pid-REUSED request. Skip it all. */
+    if (ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &req.id) != 0) {
+        g_notify_err++;
+        SP_OFT("recv id=%llu stale at entry — dropped\n", (unsigned long long)req.id);
+        return;
+    }
     struct seccomp_notif_resp resp;
     memset(&resp, 0, sizeof(resp));
     resp.id = req.id;
@@ -2334,6 +2347,19 @@ static void sp_notify_pump(void) {
            (unsigned long long)req.data.args[2], (unsigned long long)req.data.args[3]);
     sp_notify_serve_one(tid, req.data.nr, req.data.args, req.id, &resp);
     if (resp.flags & SECCOMP_USER_NOTIF_FLAG_CONTINUE) g_notify_cont++; else g_notify_serv++;
+    /* H1 TOCTOU guard #2: serve_one read tracee memory + maybe wrote a
+     * scratch arena; if the task died mid-serve the response now carries
+     * a decoded answer for a vanished request (and SEND could mis-address
+     * a pid reused by the kernel since). Re-validate before SEND. The
+     * remaining CONTINUE-string-mutation window (a sibling thread edits
+     * the pathname between our read and the kernel retry) is inherent to
+     * the CONT-retry model — proot has the identical race; both are
+     * documented, and fd-result serves over ADDFD are unaffected. */
+    if (ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &req.id) != 0) {
+        g_notify_err++;
+        SP_OFT("recv id=%llu stale after serve — response dropped\n", (unsigned long long)req.id);
+        return;
+    }
     ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
 }
 
