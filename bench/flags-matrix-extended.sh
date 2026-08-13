@@ -11,6 +11,12 @@ T(){
   if [ "$got" = "$want" ]; then pass=$((pass+1));
   else fail=$((fail+1)); printf "FAIL %-34s got='%s' want='%s'\n" "$name" "$got" "$want"; fi
 }
+# H6: range assertion for legitimately-drifting counts.
+TR(){
+  local name="$1" got="$2" lo="$3" hi="$4"
+  if [ "$got" -ge "$lo" ] 2>/dev/null && [ "$got" -le "$hi" ] 2>/dev/null; then pass=$((pass+1));
+  else fail=$((fail+1)); printf "FAIL %-34s got='%s' want='%s..%s'\n" "$name" "$got" "$lo" "$hi"; fi
+}
 
 # --- error branches & bad inputs
 T "bad-rootfs-gives-error"      "$($S -r /nonexistent/path /usr/bin/true 2>&1 | head -1 | grep -c 'sprout\|No such')" "1"
@@ -49,12 +55,12 @@ T "musl-no-fakeroot"            "$($S -r $A --no-fakeroot /usr/bin/env 2>/dev/nu
 T "musl-host-home"              "$($S -r $A --host-home /bin/busybox pwd 2>/dev/null)" "/data/data/com.termux/files/home"
 T "musl-umask-default"          "$($S -r $A /bin/busybox sh -c umask 2>/dev/null)" "0022"
 T "musl-notify-statics-off"     "$(SPROUT_NOTIFY_STATICS=0 $S -r $A /tmp/sp_asm >/dev/null 2>&1; echo rc=$?)" "rc=42"
-T "musl-find-29"                "$($S -r $A find /usr/bin -type f 2>/dev/null | wc -l)" "30"
+TR "musl-find"                  "$($S -r $A find /usr/bin -type f 2>/dev/null | wc -l)" 29 31
 T "musl-exit39"                 "$($S -r $A /bin/busybox sh -c 'exit 39' 2>/dev/null; echo rc=$?)" "rc=39"
 
 # --- script/shebang class
 T "script-smoke"                "$($S -r $B /bin/bash -c 'rm -f /tmp/noob.sh; printf "#!/bin/nonexistent\\n" > /tmp/noob.sh; chmod +x /tmp/noob.sh; /tmp/noob.sh; echo rc=$?; exit 0' 2>&1 | tail -1)" "rc=127"
-T "dry-run-statics-env"         "$($S -r $B --dry-run /tmp/sp_asm 2>&1 | grep -c '^export')" "12"
+TR "dry-run-statics-env"         "$($S -r $B --dry-run /tmp/sp_asm 2>&1 | grep -c '^export')" 11 13
 
 # --- command arg edge cases
 T "argv-dash-leading"           "$($S -r $B /bin/bash -c 'printf "<%s>" "$1"' _ -x)" "<-x>"

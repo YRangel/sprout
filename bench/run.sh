@@ -11,7 +11,11 @@ ROOTFS=${1:-/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debi
 N=${2:-5}
 MODE=${MODE:-quick}
 SP=${SP:-$(cd "$(dirname "$0")/.." && pwd)}
-B=${SPROUT_BIN:-$SP/target/debug/sprout}
+# H6: fail-loud. Defaulting to target/debug made stale-dev binaries
+# produce pseudo-regressions mid-bisect (observed 2026-08-12). Set
+# SPROUT_BIN explicitly or install the release build into $PREFIX/bin.
+B=${SPROUT_BIN:-$PREFIX/bin/sprout}
+[ -x "$B" ] || { echo "run.sh: sprout binary not found: $B (set SPROUT_BIN=...)" >&2; exit 1; }
 export SPROUT_PRELOAD_PATH=${SPROUT_PRELOAD_PATH:-$SP/target/libsprout-core.so}
 DISTRO=debian
 case "$ROOTFS" in *alpine*) DISTRO=alpine ;; esac

@@ -5,7 +5,9 @@ set -eu
 ROOTFS=${1:-/data/data/com.termux/files/usr/var/lib/proot-distro/containers/alpine/rootfs}
 N=${2:-5}
 SP=${SP:-$(cd "$(dirname "$0")/.." && pwd)}
-B=${SPROUT_BIN:-$SP/target/debug/sprout}
+# H6: fail-loud (same stale-debug trap as run.sh).
+B=${SPROUT_BIN:-$PREFIX/bin/sprout}
+[ -x "$B" ] || { echo "run-alpine.sh: sprout binary not found: $B (set SPROUT_BIN=...)" >&2; exit 1; }
 export SPROUT_PRELOAD_PATH=${SPROUT_PRELOAD_PATH:-$SP/target/libsprout-core-musl.so}
 
 median() {
