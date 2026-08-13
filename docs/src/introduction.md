@@ -1,31 +1,24 @@
 # sprout
 
-**Rootless glibc Linux userspace for Android. Fast, auditable, open.**
+**Rootless glibc/musl Linux userspace for Android. Fast, auditable, open.**
 
-`sprout` runs full Linux userspaces (Node.js, Python, Git, Chromium) on Android
-without root. It is a drop-in replacement for [proot](https://proot-me.github.io/)
-with an `LD_PRELOAD` fast path that avoids ptrace syscall-stop overhead, plus an
-automatic ptrace fallback for static/Go binaries (v0.3).
+`sprout` runs full Linux userspaces (Node.js, Python, Git, Chromium, X
+applications, desktop sessions) on Android without root. It is a drop-in
+replacement for [proot](https://proot-me.github.io/) with an `LD_PRELOAD` fast
+path that avoids ptrace syscall-stop overhead, plus automatic ptrace fallback
+for static/Go binaries and a pure-notify stub lane for AArch64 statics.
 
 ## Status
 
-**v0.1 in active development.** What works today:
+**Working today on-device (Termux, aarch64):**
 
-- ELF classification → strategy routing (preload vs ptrace)
-- Launch through the guest's own glibc loader (no patching, no root)
-- Proot-compatible CLI surface: `-r -b -w -0 --link2symlink --dry-run`
-- C11 path-translation core with a pure, unit-tested translation layer
-- Full workspace test coverage green on Android (Termux) and glibc CI
-
-What lands next:
-
-| Version | Deliverable |
-|---------|-------------|
-| v0.1    | Direct execve through guest loader, one command at a time |
-| v0.2    | `execve` chaining: shebang scripts, child processes propagating the preload |
-| v0.3    | Automatic ptrace fallback for static/Go binaries |
-
-See [Roadmap](./roadmap.md) and the [ADRs](./adr/template.md).
+- Interactive glibc shells (bash/zsh) with X11 + audio (termux-x11 preset)
+- XFCE4 desktop sessions + Firefox ESR under `--shared-tmp --termux-x11`
+- Package managers: `apt`/`dpkg` and `apk` (musl lane)
+- Toolchains: meson, autotools, gcc, clang — full native-source builds inside
+  the guest (e.g. Mesa built natively for Turnip GPU bring-up)
+- Static and Go binaries (ptrace supervisor, or pure USER_NOTIFY stub lane)
+- Two rootfs flavors: glibc (Debian) and musl (Alpine)
 
 ## Why not proroot?
 
@@ -36,4 +29,12 @@ See [Roadmap](./roadmap.md) and the [ADRs](./adr/template.md).
 - **`.text` binary patching** — modifies guest code pages, fragile across glibc versions
 
 `sprout` is the auditable re-design: MIT/Apache-2.0, every decision in an ADR,
-ci-built binaries, reproducible benchmarks vs proot.
+reproducible benchmarks vs proot, and a testable lanes story (preload / ptrace
+supervisor / notify stub) for every workload class.
+
+## Layout of this book
+
+- **User guide** — install, proot-compat table, environment policy, X11/GPU
+- **Architecture** — interceptor model, translation rules, threat model
+- **ADRs** — numbered decision records, template through shadow-state emulation
+- **Operations** — benchmarks, roadmap, development notes

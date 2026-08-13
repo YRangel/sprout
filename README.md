@@ -1,47 +1,84 @@
 # sprout
 
-**Rootless glibc Linux userspace for Android. Fast, auditable, open.**
+**Rootless glibc/musl Linux userspace for Android. Fast, auditable, open.**
 
-`sprout` runs full Ubuntu-style glibc environments (Node.js, Python, Git, Chromium) on
-Android without root. It is a drop-in replacement for [proot](https://proot-me.github.io/)
-(including the Termux `proot-distro` CLI) with an `LD_PRELOAD` fast path that avoids
-ptrace syscall-stop overhead, plus an automatic ptrace fallback for static/Go binaries.
+`sprout` runs full Linux userspaces — interactive shells, apt/apk, Python, Node,
+toolchains, **XFCE4 desktops and Firefox ESR** — on Android without root. It is a
+drop-in replacement for [proot](https://proot-me.github.io/)/proot-distro with an
+`LD_PRELOAD` fast path that avoids ptrace syscall-stop overhead, plus automatic
+fallback lanes for static/Go binaries (ptrace supervisor, or the pure-notify
+`sprout-stub` when the kernel allows it).
 
-* **Zero-overhead fast path** — path translation happens in-process via `LD_PRELOAD`
-  interposition, not `ptrace` (2 context switches per syscall on proot, 0 here).
-* **Honest coverage** — dynamically-linked glibc binaries take the fast path; static
-  and Go binaries are detected by ELF scan and routed to a ptrace fallback
-  automatically, so they *work* instead of silently breaking.
-* **Auditable** — open source (MIT/Apache-2.0), documented architecture, ADRs for every
-  major decision, reproducible benchmarks. No `.text` binary patching.
+MIT OR Apache-2.0. Every architectural decision documented in ADRs.
 
-> Status: **v0.1 in development.** See [`docs/src/adr/`](docs/src/adr/) for decisions and
-> [`docs/src/`](docs/src/) for the book.
+- **Docs**: `docs/src` (mdBook — `cd docs && mdbook build`)
+- **Benchmarks**: `docs/src/benchmarks.md` (median-of-N + hyperfine crosscheck)
+- **GitHub**: <https://github.com/YRangel/sprout>
 
-**User walkthrough: [QUICKSTART.md](QUICKSTART.md).**
+## Quick start
 
-## Quick reference
+**Prerequisites**: Termux on Android (aarch64), a guest rootfs (e.g.
+`pkg install proot-distro && proot-distro install debian`).
 
-```console
-$ sprout -r ~/ubuntu -w /root -0 --link2symlink -- /bin/bash -l
-$ sprout -r ~/ubuntu /usr/bin/node server.js
-$ sprout --fallback=ptrace -r ~/ubuntu /usr/local/bin/static-go-server
-$ sprout -r ~/ubuntu --shared-tmp --termux-x11 /usr/bin/xterm  # X11+pulse preset
+```sh
+git clone https://github.com/YRangel/sprout.git
+cd sprout
+./install.sh --verify          # places sprout into $PREFIX/bin, verifies hashes
+                                  # (or: cargo build --release && ./install.sh --verify)
 ```
 
-`proot` CLI compatibility is a goal: `sprout` accepts `-r -b -q -0 --link2symlink -w`
-with the same semantics, so `proot-distro login` can be pointed at it.
+Then run anything:
 
-## Layout
+```sh
+# interactive shell in the debian rootfs
+sprout -r $PREFIX/var/lib/proot-distro/containers/debian /bin/sh
+
+# GUI desktop over termux-x11 (DISPLAY/PULSE_SERVER preset)
+sprout -r $PREFIX/var/lib/proot-distro/containers/debian --shared-tmp --termux-x11 startxfce4
+```
+
+Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
+`QUICKSTART.md` and `docs/src/guide/x11-gpu.md`.
+
+## Features
+
+- **Three interception lanes, chosen at launch**: LD_PRELOAD (glibc, fastest),
+  ptrace supervisor (static/Go/mixed trees), pure-notify stub (AArch64 statics).
+- **Zero `.text` patching** of installed files; cached *derivative* ld.so/libc
+  (in `~/.cache/sprout`) carry the Android seccomp workarounds.
+- **proot-compatible CLI**: `-r -b -w -0 --link2symlink --shared-tmp
+  --termux-x11 --kill-on-exit --dry-run`.
+- **Environment policy**: never invents vars; `HOME` defaults guest when you ask
+  to live inside; `--termux-x11` is the explicit preset for GUI sessions.
+- **Reproducible batteries**: `bench/flags-matrix.sh` (25 cells),
+  `bench/flags-matrix-extended.sh` (63), hyperfine benchmark pairs.
+- **Audited surface**: every major decision written down in `docs/src/adr/`.
+
+## Found a bug?
+
+Issues welcome: <https://github.com/YRangel/sprout/issues>. If sprout can be
+observably falsified by a workload that worked under proot, the harness to
+prove it is usually `bench/run-statics.sh` or `bench/run-hyperfine.sh`.
+
+## Project layout
 
 ```
 crates/
-  sprout-cli      — the `sprout` binary (Rust)
-  sprout-core     — rootfs/ELF/strategy library (Rust)
-  sprout-preload  — path-translation .so (C11; LD_PRELOAD interposer)
-docs/             — mdBook (architecture, ADRs, guides)
+  sprout-cli/     CLI + argv0 dispatch (Rust)
+  sprout-core/    ELF classification, strategy, plan builder (Rust)
+  sprout-preload/ C11 LD_PRELOAD interposer + GLIBC ABI capture (Rust + C)
+  sprout-ptrace/  supervisor + statics stub (Rust + C)
+bench/            benchmark suites + guarded matrices
+docs/             mdBook — user guide, architecture, ADRs, benchmarks
+install.sh        install/self-verify (<10 s)
 ```
+
+## Status
+
+Post-v0.1: glibc guest shells, static/Go binaries, musl, apt/apk, X11 desktop
+and Firefox ESR all work on-device; performance beats proot-distro on every
+published cell. See **Roadmap** in `docs/src/roadmap.md` for what's next.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
+Dual-licensed under MIT OR Apache-2.0, at your option.

@@ -5,6 +5,36 @@ Method: wall-clock medians, on-device (Android 16, aarch64, kernel
 `proot-distro v5 ... login` is the incumbent baseline. Reproduce with
 `bench/run.sh [rootfs] [iterations]` (honors `SPROUT_BIN=...`).
 
+## 2026-08-13 — hyperfine crosscheck (independent harness)
+
+Second method on the same host: **hyperfine 1.20.0** (Termux pkg),
+per-cell warmup ≥1 + 5–20 timed runs, host-side wall-clock including
+launcher overhead, identical guest image and command line per pair.
+`A` = sprout (installed `$PREFIX/bin/sprout`), `B` = proot-distro v5.
+Reproduce with `bench/run-hyperfine.sh`; raw JSON/MD exports under
+`bench/results/hyperfine-20260813-160700/`.
+
+| workload                        | sprout (med ms) | proot (med ms) | speedup |
+|---------------------------------|-----------------|----------------|---------|
+| `bash -c true` (glibc)          | 42.2            | 206.0          | **4.88×** |
+| `python3 -c pass`               | 55.5            | 227.0          | **4.09×** |
+| exec-chain (20× `/bin/true`)    | 65.7            | 302.3          | **4.60×** |
+| `find /usr -type f`             | 734.1           | 11768.6        | **16.03×** |
+| `dd if=/dev/zero of=/dev/null bs=1M count=256` | 68.4 | 231.2 | **3.38×** |
+| static `sp_ioloop` (20k open+read+close) | 1582.1 | 3514.9 | **2.22×** |
+| static spawn churn (/tmp/sp_spawner) | 43.5       | 209.5          | **4.82×** |
+| `sh -c true` (musl)             | 22.0            | 204.9          | **9.31×** |
+
+Internal lane A/B: `SPROUT_USER_NOTIFY=0` vs default on `bash -c true`
+— medians 40.3 vs 39.2 ms (tie); means 65.7 vs 37.4 ms, dominated by
+single cold-start outliers. USER_NOTIFY decision holds.
+
+Note on statistics: medians shown (first-run cold-cache outliers skew
+means upward on both sides — e.g. musl-shell max 590 ms vs med 22 ms).
+The **16×** find-walk number exceeds earlier median-of-N runs because
+hyperfine's wall-clock includes both launchers' startup, and proot's
+per-syscall overhead dominates the tree walk.
+
 ## glibc guest — LD_PRELOAD fast path (release build, median-of-5)
 
 Guest: **Debian 13 (trixie, glibc 2.41)** (`proot-distro/containers/debian`).
