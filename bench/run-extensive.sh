@@ -55,12 +55,13 @@ row() { # row SECTION CASE VAL... — one timing value per MD column
 case3() { # section case -- proot-distro-args... ; measures all three lanes relevant
     sec=$1; case_=$2; distro=$3; rootfs=$4; shift 4
     p=$(median "proot-distro $distro  $case_" proot-distro login "$distro" -- "$@")
+    pr=$(median "raw proot           $case_" proot -R "$rootfs" "$@")
     n=$(median "sprout              $case_" "$SPROUT_BIN" -r "$rootfs" "$@")
     if [ -n "$n" ] && [ -n "$p" ]; then
         r=$(echo "$p $n" | awk '{printf "%.2f", $1/$2}')
-        echo "=> $case_ sprout-speedup ${r}x"
+        echo "=> $case_ sprout-speedup(vs distro) ${r}x"
     fi
-    row "$sec" "$case_" "$p" "$n"
+    row "$sec" "$case_" "$p" "$pr" "$n"
 }
 
 ab() { # labelA labelB case: A/B of a lane pair under sprout only
@@ -80,10 +81,10 @@ hdr() { echo; echo "=== $* ===" >&2; }
     echo "# extensive benchmark $(date '+%Y-%m-%d %H:%M')"
     echo "- device: $(uname -m), $(getprop ro.product.model 2>/dev/null || echo unknown), kernel $(uname -r)"
     echo "- sprout: $($SPROUT_BIN --version 2>/dev/null | head -1); commit $(cd "$(dirname "$0")/.." && git rev-parse --short HEAD)"
-    echo "- medians of N=$N; baselines: proot-distro login"
+    echo "- medians of N=$N; baselines: proot-distro login AND raw proot -R (fairness)"
     echo
-    echo "| section | case | ms... |"
-    echo "|---------|------|-------|"
+    echo "| section | case | proot-distro | raw proot | sprout |"
+    echo "|---------|------|--------------|-----------|--------|"
 } > "$MD"
 
 # =========================================================================
