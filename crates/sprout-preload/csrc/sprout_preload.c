@@ -2731,6 +2731,80 @@ int system(const char *command) {
     return st;
 }
 
+/* glibc's popen()/pclose() pair suffers exactly the system() disease:
+ * popen forks + execve's "/bin/sh -c cmd" via glibc's INTERNAL syscall
+ * — the PLT-interposed execve chain NEVER RUNS, so the child lands on the
+ * HOST /bin/sh (BIONIC mksh on Android Termux!) with a guest glibc
+ * LD_LIBRARY_PATH around it. The bionic loader then walks its own default
+ * dirs (system/odm/vendor lib64 — our notify lane translates those to
+ * nonexistent $B/... paths) and prints:
+ *   CANNOT LINK EXECUTABLE "sh": library "libc.so" not found
+ * Observed: ONE such line per startxfce4 boot via xrdb -merge's cpp
+ * preprocessing (xrdb imports popen, user log 2026-08-13-11h). Fix: own
+ * the pair — popen becomes pipe2+fork+sp_execve_chain(/bin/sh) exactly
+ * like system(); pclose pair-tracks pid by fd and waits manually.
+ * (pid-map slots are static: chains under vfork-shared frames forbid
+ * heap in spawn paths — ADR-0014.) */
+#define SP_POPEN_MAX 24
+static struct { int fd; pid_t pid; } sp_popen_map[SP_POPEN_MAX];
+static int sp_popen_initd = 0;
+static void sp_popen_reg(int fd, pid_t pid) {
+    if (!sp_popen_initd) {
+        for (int i = 0; i < SP_POPEN_MAX; i++) sp_popen_map[i].fd = -1;
+        sp_popen_initd = 1;
+    }
+    for (int i = 0; i < SP_POPEN_MAX; i++)
+        if (sp_popen_map[i].fd == -1 || sp_popen_map[i].fd == fd) {
+            sp_popen_map[i].fd = fd; sp_popen_map[i].pid = pid; return;
+        }
+}
+static pid_t sp_popen_lookup(int fd) {
+    if (!sp_popen_initd) return -1;
+    for (int i = 0; i < SP_POPEN_MAX; i++)
+        if (sp_popen_map[i].fd == fd) { pid_t p = sp_popen_map[i].pid; sp_popen_map[i].fd = -1; sp_popen_map[i].pid = -1; return p; }
+    return -1;
+}
+
+FILE *popen(const char *command, const char *type) {
+    static FILE *(*SP_REAL(popen))(const char *, const char *) = NULL;
+    SP_RESOLVE(popen);
+    if (!command || (type[0] != 'r' && type[0] != 'w')) { errno = EINVAL; return NULL; }
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) return NULL;
+    /* child ends on the READ side for 'w', WRITE side for 'r' */
+    int child_fd = (type[0] == 'r') ? 1 : 0;
+    int parent_fd = (type[0] == 'r') ? 0 : 1;
+    FILE *fp = fdopen(fds[parent_fd], type);
+    if (!fp) { close(fds[0]); close(fds[1]); return NULL; }
+    pid_t pid = fork();
+    if (pid == -1) { int e = errno; fclose(fp); close(fds[child_fd]); errno = e; return NULL; }
+    if (pid == 0) {
+        close(fds[parent_fd]);
+        if (dup2(fds[child_fd], child_fd == 1 ? 1 : 0) == -1) _exit(127);
+        close(fds[child_fd]);
+        char *const argv[] = {"sh", "-c", (char *)command, NULL};
+        sp_execve_chain("/bin/sh", argv, environ, 0);
+        _exit(127);
+    }
+    close(fds[child_fd]);
+    sp_popen_reg(fileno(fp), pid);
+    return fp;
+}
+
+int pclose(FILE *stream) {
+    static int (*SP_REAL(pclose))(FILE *) = NULL;
+    SP_RESOLVE(pclose);
+    if (!stream) { errno = EINVAL; return -1; }
+    pid_t pid = sp_popen_lookup(fileno(stream));
+    if (pid == -1) return SP_REAL(pclose)(stream);   /* not one of ours */
+    fclose(stream);
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return WTERMSIG(st);
+    errno = ECHILD; return -1;
+}
+
 /* ------------------------------------------------------------------ */
 /* posix_spawn/posix_spawnp: glibc's fast path calls __execvpe          */
 /* internally, which bypasses PLT interposition entirely. We implement   */
