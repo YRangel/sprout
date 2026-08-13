@@ -138,6 +138,20 @@ fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
     if !env.iter().any(|(k, _)| k == "PULSE_SERVER") {
         env.push(("PULSE_SERVER".into(), "127.0.0.1".into()));
     }
+    // proot-distro X11 parity: the login profile exports DISPLAY=:0 when the
+    // shared /tmp bind carries the X socket. Inherit the host DISPLAY when
+    // the user set it; otherwise default :0 ONLY when a /tmp bind exists
+    // (a DISPLAY without a reachable socket is a footgun, proot-distro's
+    // --shared-tmp-less runs still fail the same way).
+    if !env.iter().any(|(k, _)| k == "DISPLAY") {
+        if let Ok(d) = std::env::var("DISPLAY") {
+            if !d.is_empty() {
+                env.push(("DISPLAY".into(), d));
+            }
+        } else if rootfs.bindings.iter().any(|b| b.guest == PathBuf::from("/tmp")) {
+            env.push(("DISPLAY".into(), ":0".into()));
+        }
+    }
 }
 
 /// Ensure the guest has a working POSIX-shm directory: python's
