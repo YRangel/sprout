@@ -1620,6 +1620,9 @@ static int sp_link_fallback_copy(const char *src, const char *dst) {
  * actually resumes the (now-rewritten) execve. Attach on a parked-
  * notify task is legal; the request outlives the attach/detach pair.
  * Return 1 on successful rewrite, 0 otherwise. */
+static int sp_notify_lazy_exec_script(pid_t pid, struct user_pt_regs *r,
+                                      const char *guest, const char *host); /* fwd (cls==2) */
+
 static int sp_notify_lazy_exec_rewrite(pid_t pid, const char *guest,
                                        const char *host, int cls) {
     if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) != 0) {
@@ -1638,7 +1641,15 @@ static int sp_notify_lazy_exec_rewrite(pid_t pid, const char *guest,
         return 0;
     }
     int ok = 0;
-    if (cls == 0) {
+    if (cls == 2) {
+        /* cls==2 (script): compose [interp, opt?, script, rest] and route
+         * through the same loader chain — mirrors the legacy lane's
+         * block at the execve-at-51 site (the stub lane has no
+         * interposer, so native CONT just lands the script on the host
+         * kernel's shebang resolution: wrong libc world, observed
+         * ENOENT vs the host's /bin/bash wiring). */
+        ok = sp_notify_lazy_exec_script(pid, &r, guest, host);
+    } else if (cls == 0) {
         /* static→dynamic: full loader-chain surgery (peek/poke work now
          * that we're attached). rewrite writes regs; SETREGSET pushes. */
         ok = sp_rewrite_exec_to_loader(NULL, pid, &r, host, guest, /*path_argi=*/0, /*depth=*/0);
@@ -1659,6 +1670,101 @@ static int sp_notify_lazy_exec_rewrite(pid_t pid, const char *guest,
     if (g_debug) SP_TRACE("[notify] lazy-attach %d cls=%d rewrite=%s host=%s\n",
                           pid, cls, ok ? "OK" : "fail", host);
     return ok;
+}
+
+/* cls==2 (script exec from a static under the stub lane): shebang ->
+ * guest interp, compose scratch argv [interp, opt?, script, rest...] and
+ * treat the interp as the real exec target (same dance as the legacy
+ * lane's execve-at-51 script block). Runs with `pid` already ptrace-
+ * attached by the caller and its regs already fetched into *r. */
+static int sp_notify_lazy_exec_script(pid_t pid, struct user_pt_regs *r,
+                                      const char *guest, const char *host) {
+    char ibuf[SP_PATH_MAX], obuf[SP_PATH_MAX];
+    ibuf[0] = '\0'; obuf[0] = '\0';
+    /* own the shebang parse (kernel one-token tail semantics):
+     * classify_host_file(host, interp, opt) fills guest-spelled heads. */
+    (void)classify_host_file(host, ibuf, obuf);
+    if (!ibuf[0]) return 0; /* not a shebang after all */
+
+    /* resolve the interpreter (guest spelling); absolute straight, else
+     * walk SPROUT_GUEST_PATH (same rule set as the legacy lane). */
+    char cand[SP_PATH_MAX];
+    int found = 0;
+    if (ibuf[0] == '/' || strchr(ibuf, '/') != NULL) {
+        snprintf(cand, sizeof(cand), "%s", ibuf);
+        char hc0[SP_PATH_MAX];
+        const char *h0 = sp_translate(&g_cfg, cand, hc0) ? hc0 : cand;
+        found = (access(h0, X_OK) == 0);
+    } else {
+        const char *gp = getenv("SPROUT_GUEST_PATH");
+        if (!gp) gp = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        char pbuf[4096];
+        snprintf(pbuf, sizeof(pbuf), "%s", gp);
+        for (char *d = strtok(pbuf, ":"); d && !found; d = strtok(NULL, ":")) {
+            char cc[SP_PATH_MAX];
+            int n = snprintf(cc, sizeof(cc), "%s/%s", *d ? d : ".", ibuf);
+            if (n < 0 || (size_t)n >= sizeof(cc)) continue;
+            char hc[SP_PATH_MAX];
+            const char *h = sp_translate(&g_cfg, cc, hc) ? hc : cc;
+            if (access(h, X_OK) == 0) { snprintf(cand, sizeof(cand), "%s", cc); found = 1; }
+        }
+    }
+    if (!found) return 0;
+    char hcan[SP_PATH_MAX];
+    if (!sp_translate(&g_cfg, cand, hcan)) return 0;
+    char ib2[SP_PATH_MAX], ob2[SP_PATH_MAX]; ib2[0] = '\0'; ob2[0] = '\0';
+    int cls2 = classify_host_file(hcan, ib2, ob2);
+    if (cls2 == 2) return 0; /* nested scripts: depth-honest bail */
+
+    /* compose scratch: [arr pointers][strings]: [cand, opt?, guest, rest..] */
+    unsigned long long base = (unsigned long long)r->sp - SP_EXEC_SCRATCH_BELOW_SP;
+    errno = 0;
+    if (ptrace(PTRACE_PEEKDATA, pid, (void *)base, NULL) == -1 && errno) return 0;
+    unsigned long long orig_argv = r->regs[1];
+    unsigned long long orig_envp = r->regs[2];
+    unsigned long long sc = base + (unsigned long long)(SP_EXEC_MAX_ARGS * 8);
+    unsigned long long end = base + SP_EXEC_SCRATCH_BELOW_SP;
+    unsigned long long arr_ptrs[SP_EXEC_MAX_ARGS];
+    int na = 0;
+    const char *head[3]; int nh = 0;
+    head[nh++] = cand;
+    if (obuf[0]) head[nh++] = obuf;
+    head[nh++] = guest;
+    for (int i = 0; i < nh && na < SP_EXEC_MAX_ARGS - 1; i++) {
+        size_t sl = strlen(head[i]);
+        if (sc + sl + 16 >= end) return 0;
+        if (poke_str(pid, sc, head[i], sl) != 0) return 0;
+        arr_ptrs[na++] = sc;
+        sc += ((unsigned long long)sl + 8) & ~7ULL;
+    }
+    for (int i = 1; na < SP_EXEC_MAX_ARGS - 1; i++) {
+        unsigned long long pa = (unsigned long long)peek_u64(pid, orig_argv + (unsigned long long)i * 8);
+        if (pa == 0 || pa == (unsigned long long)-1) break;
+        char abuf[SP_PATH_MAX];
+        if (peek_str(pid, pa, abuf, sizeof(abuf)) < 0) break;
+        size_t sl = strlen(abuf);
+        if (sc + sl + 16 >= end) break;
+        if (poke_str(pid, sc, abuf, sl) != 0) break;
+        arr_ptrs[na++] = sc;
+        sc += ((unsigned long long)sl + 8) & ~7ULL;
+    }
+    arr_ptrs[na] = 0;
+    for (int i = 0; i <= na; i++) {
+        if (ptrace(PTRACE_POKEDATA, pid, (void *)(base + (unsigned long long)i * 8),
+                   (void *)arr_ptrs[i]) != 0) return 0;
+    }
+    r->regs[1] = base;   /* synthetic argv array */
+    r->regs[2] = orig_envp;
+    if (cls2 == 0) {
+        /* dynamic interp -> full loader chain around [interp, ...] */
+        return sp_rewrite_exec_to_loader(NULL, pid, r, hcan, cand, 0, 1);
+    }
+    /* static interp: point x0 at the interp host path, kernel execs it */
+    size_t hl = strlen(hcan);
+    if (sc + hl + 16 >= end) return 0;
+    if (poke_str(pid, sc, hcan, hl) != 0) return 0;
+    r->regs[0] = sc;
+    return 1; /* caller: SETREGSET + DETACH + CONTINUE */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1762,9 +1868,16 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
              * that would start an ungoverned loader. */
             resp->error = -ENOSYS; resp->flags = 0; resp->val = 0; return;
         }
-        /* cls==2 (script) / -1 (unknown): native CONT — the pre-existing
-         * supervisor-side exec rewrite in the ptrace lane covers scripts;
-         * notify-statics assets stay ELF-only for now. */
+        if (cls == 2) {
+            /* script: same rewrite machinery via the lazy-attach vehicle
+             * (stub lane has no interposer — native CONT would land the
+             * shebang on the host kernel: wrong libc world / ENOENT). */
+            if (sp_notify_lazy_exec_rewrite(pid, guest, host, cls) == 1) {
+                sp_notify_continue(resp); return;
+            }
+            resp->error = -ENOENT; resp->flags = 0; resp->val = 0; return;
+        }
+        /* -1 (unknown): native CONT. */
         sp_notify_continue(resp);
         return;
     }
@@ -2343,14 +2456,18 @@ int main(int argc, char **argv) {
     {   const char *gk = getenv("SPROUT_GUEST_KIND");
         int gkind = gk ? atoi(gk) : 0;
         const char *nso = getenv("SPROUT_NOTIFY_STATICS");
-        /* 2026-08-12 flip: stub lane has a PRE-MAIN crash for glibc-static
-         * and Go-class statics (S1-write of a static-glibc test binary
-         * never fires; bare kernel hands SIGSYS=31, under-stub SIGBUS=7 —
-         * startup-syscall mangling), only raw-asm statics (sp_asm battery)
-         * survive. Real-world statics must go legacy-ptrace: SPROUT_
-         * NOTIFY_STATICS=1 now OPTS IN to the dev lane while the startup
-         * ABI divergence gets bisected. Default restored: ptrace. */
-        int want_ns = g_notify && (gkind == 1 || gkind == 2) && nso && strcmp(nso, "1") == 0;
+        /* 2026-08-12-L: stub lane RE-ENABLED as default. #74 root-caused
+         * + fixed: the in-stub SIGSYS emulator used glibc-userland
+         * ucontext offsets (sigset 128), 8 bytes early vs the kernel's
+         * rt_sigframe (sigset 8) — the fake-success path did SP+=4
+         * instead of PC+=4, returning threads with a misaligned sp;
+         * glibc-statics then SIGBUS'd mid-__tls_init_tp (fa==pc in
+         * the RW-anon stack). Fixed offsets measured empirically on
+         * Android-16's frame; verified: step/onecall/exec_script/
+         * sp_asm + 28MB Go-static cloudflared + both batteries 81/81
+         * green under SPROUT_NOTIFY_STATICS=1. =0 forces the classic
+         * ptrace lane (kept as the escape hatch). */
+        int want_ns = g_notify && (gkind == 1 || gkind == 2) && !(nso && strcmp(nso, "0") == 0);
         if (g_debug) fprintf(stderr, "[notify] lane-probe: g_notify=%d gkind=%d want=%d\n", g_notify, gkind, want_ns);
         if (want_ns) {
             char stub[SP_PATH_MAX];

@@ -2,14 +2,27 @@
 
 ## Status
 
-**Accepted, default FLIPPED (2026-08-12):** the stub lane is now
-**opt-in** (`SPROUT_NOTIFY_STATICS=1`); the legacy TRACEME lane is the
-statics default. Root cause: glibc-static guests (and Go-class statics)
-die pre-`main` under the stub's filter setup (SIGBUS=7 vs bare-kernel
-SIGSYS=31 at the same instruction, startup-syscall mangling inside the
-stub — bisect pending). Raw-asm statics (`sp_asm`, the perf subjects
-this ADR optimized for) survive both lanes. Revert default to ON the
-day the glibc-static startup divergence is fixed. → task #69.
+**Accepted, default ON (2026-08-12-L, #74 closed):** the stub lane is
+the statics default again; `SPROUT_NOTIFY_STATICS=0` remains as the
+legacy-lane escape hatch.
+
+Interlude (same day): default was briefly flipped to opt-in after
+glibc-static guests died pre-`main` under the stub (SIGBUS=7, fa==pc
+in the RW-anon stack, mid-`__tls_init_tp`). Root-cause via an in-stub
+crashdump handler (`SPROUT_STUB_CRASHDUMP=1`): the stub's SIGSYS
+emulator used offsets computed from glibc's *userland* `ucontext_t`
+(128-byte `uc_sigmask`), while the kernel's `rt_sigframe` carries an
+8-byte sigset — every sigcontext offset was 8 bytes early. The
+fake-success path for `set_robust_list`(99) then wrote x0 into
+fault_address (harmless) **and advanced sp instead of pc** (offset 432
+is SP, not PC). `rt_sigreturn` restored a 4-byte-misaligned sp; the
+next `stp`/`ldp` pairs byte-shifted every register until the thread
+fetched instructions from inside its own stack. Fixed offsets were
+verified against a raw cu-window dump (x8=99 at +248, pc text-address
+at +440). Verified fixed: statics battery, `exec_script` (through the
+new stub-lane script rewrite, see T3 note), 28-MB Go-static
+cloudflared, alpine musl lane, flags matrices 81/81 — incl. the 4.4×
+static→dynamic python3 win as default.
 
 ## Context
 

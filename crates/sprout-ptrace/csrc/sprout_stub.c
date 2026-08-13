@@ -322,16 +322,30 @@ static unsigned long load_guest(const char *path, unsigned long *phdr_out)
 /* SIGSYS emulation (ADR-0016 in-guest table)                          */
 /* ------------------------------------------------------------------ */
 
-/* kernel uapi offsets (aarch64, from arch/arm64/include/uapi):
- *   ucontext: flags(8) + uc_link(8) + stack_t(24) + sigset(128) => sigcontext @168
- *   sigcontext: fault_address@0, regs[31]@8, sp@8+31*8, pc@+8
- *   => regs[0](x0) @168+8, pc @168+8+32*8
- *   siginfo._sigsys: signo/errno/code(12)+pad(4) => call_addr@16, syscall@24, arch@28
+/* kernel rt_sigframe uapi offsets (aarch64) — KERNEL layout, NOT glibc's
+ * userland ucontext_t (whose sigset_t is 128 bytes):
+ *   siginfo(128) then ucontext{ uc_flags(8) uc_link(8) uc_stack(24)
+ *   uc_sigmask(8) } => sigcontext @ 176.
+ *   sigcontext: fault_address@0, regs[31](x0..x30)@8, sp@8+31*8=256,
+ *   pc@264, pstate@272.  siginfo._sigsys: call_addr@16, syscall@24, arch@28.
+ * Empirically verified 2026-08 on Android 16 (HyperOS GKI) with a raw
+ * dump of svc-99's frame: x8=99 at +248, x1=0x18 at +192,
+ * pc=0x41351c(text) at +440, sp at +432 — all kernel-ABI-stable since
+ * arm64's introduction (rt_sigreturn consumers pin this layout).
+ *
+ * ROOT CAUSE of issue #74 (glibc-static SIGBUS under the stub lane):
+ * the previous constants assumed glibc's 128-byte sigset (ucontext @ 168,
+ * 8 bytes early). Fake-success then wrote x0=0 into the fault_address
+ * field (harmless) and — the killer — did SP+=4 instead of PC+=4
+ * (offset 432 is SP at the correct layout). rt_sigreturn reinstated a
+ * 4-byte-misaligned sp; the next stp/ldp pairs byte-shifted register
+ * contents until the thread fetched instructions from inside its own
+ * RW-anon stack (SIGBUS, fa==pc, high anon address).
  */
-#define UC_X0_OFF 176
-#define UC_X3_OFF 200
-#define UC_X8_OFF 240
-#define UC_PC_OFF 432
+#define UC_X0_OFF 184
+#define UC_X3_OFF 208
+#define UC_X8_OFF 248
+#define UC_PC_OFF 440
 #define SI_SYSCALL_OFF 24
 
 /* glibc table: set_robust_list, rseq */
@@ -351,6 +365,9 @@ static int stub_is_ok(long nr, const long *tbl, int n)
 
 static const char *g_stub_env_musl = "SPROUT_LIBC=musl";
 static int g_stub_flavor_musl = 0;
+
+static int stub_crashdump(void);
+static int stub_hex(char *db, int n, unsigned long long v);
 
 static void stub_sigsys_handler(int sig __attribute__((unused)),
                                 void *vinfo, void *vuctx)
@@ -388,11 +405,103 @@ static void stub_sigsys_handler(int sig __attribute__((unused)),
         (void)sc3(SYS_write, 2, (long)db, n);
         return; /* let default action kill: honest */
     }
+    if (stub_crashdump()) {
+        static volatile long cd_n;
+        if (cd_n == 0) {
+            /* raw ucontext window: locate x8/pc/sp empirically (#74) */
+            char rb[4096]; int rn = 0;
+            for (int off = 136; off <= 448; off += 4) {
+                if (((off - 136) % 8) == 0) { rb[rn++]='\n'; rb[rn++]='@'; rn = stub_hex(rb, rn, (unsigned long long)off); rb[rn++]=':'; }
+                rb[rn++]=' ';
+                rn = stub_hex(rb, rn, *(unsigned int *)((char *)vuctx + off));
+            }
+            rb[rn++]='\n';
+            (void)sc3(SYS_write, 2, (long)rb, rn);
+        }
+        if (cd_n < 4) {
+            cd_n++;
+            char eb[96]; int en = 0;
+            const char *t = "EMU nr="; for (const char *c = t; *c; c++) eb[en++] = *c;
+            long m2 = nr; if (m2 < 0) { eb[en++]='-'; m2=-m2; }
+            char rd[12]; int m = 0; long tt = m2;
+            do { rd[m++] = (char)('0' + tt % 10); tt /= 10; } while (tt);
+            while (m > 0) eb[en++] = rd[--m];
+            const char *pc = " pc="; for (const char *c = pc; *c; c++) eb[en++] = *c;
+            en = stub_hex(eb, en, uc[UC_PC_OFF / 8]);
+            const char *x8 = " x8="; for (const char *c = x8; *c; c++) eb[en++] = *c;
+            en = stub_hex(eb, en, uc[UC_X8_OFF / 8]);
+            const char *sp = " sp="; for (const char *c = sp; *c; c++) eb[en++] = *c;
+            en = stub_hex(eb, en, uc[(UC_PC_OFF - 8) / 8]);
+            eb[en++] = '\n';
+            (void)sc3(SYS_write, 2, (long)eb, en);
+        }
+    }
     uc[UC_X0_OFF / 8] = 0;          /* fake success */
     uc[UC_PC_OFF / 8] += 4;         /* step over the svc */
 }
 
 extern void stub_restorer(void);
+
+/* #74 bisect dump: glibc-statics die BEFORE first write under the stub,
+ * SIGBUS(7) where the bare kernel raises SIGSYS(31). Dump the faulting
+ * pc + si_addr from ucontext so the death instruction gets named.
+ * Gated: only when SPROUT_STUB_CRASHDUMP=1 (guest sigsegv semantics stay
+ * kernel-default otherwise). */
+static int stub_crashdump(void)
+{
+    extern char **stub_environ;
+    const char *pfx = "SPROUT_STUB_CRASHDUMP=1";
+    for (char **e = stub_environ; e && *e; e++) {
+        const char *s = *e; unsigned long i = 0;
+        while (pfx[i] && s[i] == pfx[i]) i++;
+        if (pfx[i] == '\0' && s[i] == '\0') return 1;
+    }
+    return 0;
+}
+static int stub_hex(char *db, int n, unsigned long long v)
+{
+    db[n++]='0'; db[n++]='x';
+    int started = 0;
+    for (int s = 60; s >= 0; s -= 4) {
+        int d = (int)((v >> s) & 0xf);
+        if (d || started || s == 0) { db[n++] = (char)(d < 10 ? '0'+d : 'a'+d-10); started = 1; }
+    }
+    return n;
+}
+static void stub_crash_handler(int sig, void *vinfo, void *vuctx)
+{
+    u64 *uc = (u64 *)vuctx;
+    unsigned long long fa = 0;
+    if (vinfo) fa = ((unsigned long long *)vinfo)[2]; /* si_addr @ off 16 */
+    char db[160]; int n = 0;
+    const char *h = "CRASHDUMP sig"; for (const char *c = h; *c; c++) db[n++]=*c;
+    db[n++]='='; if (sig > 9) { db[n++]=(char)('0'+sig/10); db[n++]=(char)('0'+sig%10); } else db[n++]=(char)('0'+sig); db[n++]=' ';
+    db[n++]='p'; db[n++]='c'; db[n++]='='; n = stub_hex(db, n, uc[UC_PC_OFF/8]); db[n++]=' ';
+    db[n++]='f'; db[n++]='a'; db[n++]='='; n = stub_hex(db, n, fa); db[n++]=' ';
+    db[n++]='s'; db[n++]='p'; db[n++]='='; n = stub_hex(db, n, uc[(UC_PC_OFF-8)/8]); /* sp @ pc-8 */
+    /* sigcontext regs[31]=x0..x30 @ 168+8.. then fp=x29 lr=x30, plus
+     * si_code and a small window around fa (mapped R/W anon -> readable;
+     * we print raw words so the frame content gets named). */
+    db[n++]=' '; db[n++]='c'; db[n++]='=';
+    if (vinfo) db[n++] = (char)('0' + (((u32 *)vinfo)[2] & 0xf));
+    db[n++]=' '; db[n++]='f'; db[n++]='p'; db[n++]='=';
+    n = stub_hex(db, n, uc[(UC_X0_OFF + 29*8)/8]);   /* x29 */
+    db[n++]=' '; db[n++]='l'; db[n++]='r'; db[n++]='=';
+    n = stub_hex(db, n, uc[(UC_X0_OFF + 30*8)/8]);   /* x30 */
+    db[n++]='\n';
+    (void)sc3(SYS_write, 2, (long)db, n);
+    if (fa >= 0x1000) {
+        /* dump as little-endian u32 words so aarch64 instructions decode */
+        char w[256]; int wn = 0;
+        for (long long off = -32; off <= 24; off += 4) {
+            w[wn++]=' ';
+            wn = stub_hex(w, wn, *(unsigned int *)(fa + off));
+        }
+        w[wn++]='\n';
+        (void)sc3(SYS_write, 2, (long)w, wn);
+    }
+    sc1(SYS_exit_group, 128 + sig);
+}
 
 static void install_emulation(void)
 {
@@ -585,7 +694,22 @@ void stub_main(void *sp0)
     }
 
     install_emulation();
-    
+
+    /* #74 bisect: env-gated crash dump before any of the real work. */
+    if (stub_crashdump()) {
+        sp_kernel_sigaction_t sa;
+        st_zero(&sa, sizeof(sa));
+        sa.handler = stub_crash_handler;
+        sa.flags = SA_SIGINFO | SA_RESTORER;
+        sa.restorer = stub_restorer;
+        long r1 = sc4(SYS_rt_sigaction, 11 /*SEGV*/, (long)&sa, 0, 8);
+        long r2 = sc4(SYS_rt_sigaction, 7  /*BUS*/,  (long)&sa, 0, 8);
+        long r3 = sc4(SYS_rt_sigaction, 4  /*ILL*/,  (long)&sa, 0, 8);
+        const char *ok = "CRASHDUMP armed\n";
+        if (!r1 && !r2 && !r3) (void)sc3(SYS_write, 2, (long)ok, 17);
+        else { const char *no = "CRASHDUMP arm-FAIL\n"; (void)sc3(SYS_write, 2, (long)no, 19); }
+    }
+
     /* LOAD FIRST: our own loader phase (open/read/lseek/mmap) must run
      * filter-free — no listener consumer exists until the supervisor
      * pidfd-getfd's it AFTER the handshake, so trapping ourselves here
@@ -620,14 +744,31 @@ void stub_main(void *sp0)
     u64 *guest_sp = build_stack(stack_top, argc0, argv, envp, auxv,
                                 entry, phdr_addr, g_eh.e_phnum);
 
-    /* jump: fresh sp + entry, no libc shutdown */
+    if (stub_crashdump()) {
+        char jb[196]; int jn = 0;
+        const char *j = "JUMP entry="; for (const char *c = j; *c; c++) jb[jn++] = *c;
+        jn = stub_hex(jb, jn, (unsigned long long)entry); jb[jn++] = ' ';
+        const char *s2 = "sp="; for (const char *c = s2; *c; c++) jb[jn++] = *c;
+        jn = stub_hex(jb, jn, (unsigned long long)guest_sp); jb[jn++] = ' ';
+        const char *p2 = "phdr="; for (const char *c = p2; *c; c++) jb[jn++] = *c;
+        jn = stub_hex(jb, jn, (unsigned long long)phdr_addr);
+        jb[jn++] = '\n';
+        (void)sc3(SYS_write, 2, (long)jb, jn);
+    }
+    /* jump: fresh sp + entry, no libc shutdown. REGISTER ORDER MATTERS:
+     * entry must leave the compiler's hands BEFORE sp is clobbered — a
+     * spill-reload of %1 after `mov sp` would read the *guest* stack
+     * (fresh zeros/garbage) and branch into a non-exec anon mapping
+     * (observed: glibc-static SIGBUS, fa==pc, high anon-stack address).
+     * x9 scratch + clobber pins the entry in a known register first. */
     __asm__ volatile(
+        "mov x9, %1\n"
         "mov sp, %0\n"
         "mov x29, #0\n"
         "mov x30, #0\n"
-        "br %1\n"
+        "br x9\n"
         :
         : "r"(guest_sp), "r"(entry)
-        : "memory");
+        : "memory", "x9");
     __builtin_unreachable();
 }
