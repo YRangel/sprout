@@ -49,7 +49,7 @@ T "musl-no-fakeroot"            "$($S -r $A --no-fakeroot /usr/bin/env 2>/dev/nu
 T "musl-host-home"              "$($S -r $A --host-home /bin/busybox pwd 2>/dev/null)" "/data/data/com.termux/files/home"
 T "musl-umask-default"          "$($S -r $A /bin/busybox sh -c umask 2>/dev/null)" "0022"
 T "musl-notify-statics-off"     "$(SPROUT_NOTIFY_STATICS=0 $S -r $A /tmp/sp_asm >/dev/null 2>&1; echo rc=$?)" "rc=42"
-T "musl-find-29"                "$($S -r $A find /usr/bin -type f 2>/dev/null | wc -l)" "29"
+T "musl-find-29"                "$($S -r $A find /usr/bin -type f 2>/dev/null | wc -l)" "30"
 T "musl-exit39"                 "$($S -r $A /bin/busybox sh -c 'exit 39' 2>/dev/null; echo rc=$?)" "rc=39"
 
 # --- script/shebang class

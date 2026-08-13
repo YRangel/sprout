@@ -2068,13 +2068,16 @@ static void sp_resolve_absolute_symlink(char host[SP_PATH_MAX]) {
 /* Minimal ELF64 inspection: classify host path as dynamic ELF (writes the
  * PT_INTERP string into interp) / static ELF / script. Only reads header + a
  * few hundred bytes. */
-static int sp_classify_host(const char *host, char interp[SP_PATH_MAX]) {
+/* opt (shebang trailing arg, e.g. "sh" in "#!/bin/busybox sh") may be NULL
+ * for callers that don't chain scripts. */
+static int sp_classify_host(const char *host, char interp[SP_PATH_MAX], char opt[SP_PATH_MAX]) {
+    if (opt) opt[0] = '\0';
     FILE *f = fopen(host, "rb");
     if (!f) return SP_NOT_ELF;
     unsigned char head[256];
     size_t n = fread(head, 1, sizeof(head), f);
     if (n >= 2 && head[0] == '#' && head[1] == '!') {
-        /* script: copy the interpreter word into interp */
+        /* script: copy the interpreter word into interp, trailing arg into opt */
         size_t i = 2;
         while (i < n && (head[i] == ' ' || head[i] == '\t')) i++;
         size_t j = 0;
@@ -2083,6 +2086,17 @@ static int sp_classify_host(const char *host, char interp[SP_PATH_MAX]) {
             interp[j++] = (char)head[i++];
         }
         interp[j] = '\0';
+        if (opt) {
+            /* Linux-style: everything after the interp word up to newline
+             * becomes ONE argv token for the interpreter. */
+            while (i < n && (head[i] == ' ' || head[i] == '\t')) i++;
+            size_t k = 0;
+            while (i < n && k < SP_PATH_MAX - 1 && head[i] != '\n' && head[i] != '\r') {
+                opt[k++] = (char)head[i++];
+            }
+            while (k > 0 && (opt[k - 1] == ' ' || opt[k - 1] == '\t')) k--;
+            opt[k] = '\0';
+        }
         fclose(f);
         return SP_SCRIPT;
     }
@@ -2222,12 +2236,88 @@ static int sp_chain_fail(const char *path, int depth, int err, const char *why) 
                       getenv("SPROUT_LOADER") ? getenv("SPROUT_LOADER") : "(null)");
     if (el > (int)sizeof eb) el = (int)sizeof eb;
     (void)!write(2, eb, (size_t)el);
+    /* ALSO the flight recorder: spawn children get their stderr dup2'ed
+     * into the parent's pipe (apk does exactly this for script-trigger
+     * runs), which swallowed every chain-fail line and hid the apk-127
+     * root cause for days. */
+    const char *logf = getenv("SPROUT_TRACELOG");
+    if (logf && *logf) {
+        int fd = (int)syscall(SP_SYS_openat, AT_FDCWD, logf,
+                              O_WRONLY | O_APPEND | O_CREAT, 0600);
+        if (fd >= 0) {
+            (void)!write(fd, eb, (size_t)el);
+            extern char **environ;
+            char kb[2048]; int kn = 0;
+            kn = snprintf(kb, sizeof(kb), "TRENV pid=%d", (int)getpid());
+            for (int i = 0; environ && environ[i] && i < 40 && kn < (int)sizeof(kb) - 80; i++) {
+                if (strncmp(environ[i], "SPROUT", 6) && strncmp(environ[i], "LD_", 3)) continue;
+                kn += snprintf(kb + kn, sizeof(kb) - (size_t)kn, " |%.60s", environ[i]);
+            }
+            kb[kn++] = '\n';
+            (void)!write(fd, kb, (size_t)kn);
+            close(fd);
+        }
+    }
     errno = err;
     return -1;
 }
 
+/* apk (without --preserve-env) spawns script-triggers with env =
+ * exactly one PATH entry — LD_PRELOAD and every SPROUT_* key get
+ * stripped. The spawn-child then boots WITHOUT the interposer, and the
+ * script's inner execve('/bin/busybox') becomes raw-kernel: ENOENT,
+ * sh reports 127. proot is immune (ptrace translates at the syscall
+ * boundary, env-independent). Mirror that immunity at the chain level:
+ * when the caller's envp is missing a key the PARENT process carries,
+ * re-inject it. Only LD_/SPROUT_ prefixed keys are copied (the caller's deliberate
+ * env like APK_SCRIPT='install' stays authoritative). */
+extern char **environ;
+static char **sp_chain_env(char *const envp[]) {
+    static char *e2[512];
+    const char *vital[] = {"LD_", "SPROUT_"};
+    int n = 0;
+    if (envp) {
+        for (; envp[n] && n < 400; n++) e2[n] = envp[n];
+    }
+    for (int vi = 0; vi < 2; vi++) {
+        const char *pfx = vital[vi];
+        size_t pl = strlen(pfx);
+        for (int i = 0; environ[i] && n < 500; i++) {
+            if (strncmp(environ[i], pfx, pl) != 0) continue;
+            const char *eq = strchr(environ[i], '=');
+            if (!eq) continue;
+            size_t kl = (size_t)(eq - environ[i]);
+            int have = 0;
+            for (int j = 0; j < n; j++) {
+                if (strncmp(e2[j], environ[i], kl) == 0 && e2[j][kl] == '=') { have = 1; break; }
+            }
+            if (!have) e2[n++] = environ[i];
+        }
+    }
+    e2[n] = NULL;
+    {
+        const char *logf = getenv("SPROUT_TRACELOG");
+        if (logf && *logf) {
+            int fd = (int)syscall(SP_SYS_openat, AT_FDCWD, logf, O_WRONLY | O_APPEND | O_CREAT, 0600);
+            if (fd >= 0) {
+                char kb[1500]; int kn = 0;
+                int spr=0, ld=0, en=0; for (int i=0; environ && environ[i]; i++) { en++; if (!strncmp(environ[i],"SPROUT",6)) spr++; if (!strncmp(environ[i],"LD_",3)) ld++; }
+                kn = snprintf(kb, sizeof(kb), "TRINJ pid=%d n=%d env=%d spr=%d ld=%d", (int)getpid(), n, en, spr, ld);
+                for (int j = 0; j < n && kn < (int)sizeof(kb) - 100; j++)
+                    if (!strncmp(e2[j], "SPROUT", 6) || !strncmp(e2[j], "LD_", 3))
+                        kn += snprintf(kb + kn, sizeof(kb) - (size_t)kn, " |%.40s", e2[j]);
+                kb[kn++] = '\n';
+                (void)!write(fd, kb, (size_t)kn);
+                close(fd);
+            }
+        }
+    }
+    return e2;
+}
+
 static int sp_execve_chain(const char *path, char *const argv[], char *const envp[], int depth) {
     if (depth > 4) return sp_chain_fail(path, depth, ELOOP, "depth");
+    envp = (char *const *)sp_chain_env(envp);
     char x[SP_PATH_MAX];
     const char *host_raw = sp_translate_x(path, x);
     char hx[SP_PATH_MAX];
@@ -2235,8 +2325,8 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
     sp_resolve_absolute_symlink(hx);
     const char *host = hx;
 
-    char interp[SP_PATH_MAX];
-    int cls = sp_classify_host(host, interp);
+    char interp[SP_PATH_MAX], sopt[SP_PATH_MAX];
+    int cls = sp_classify_host(host, interp, sopt);
     if (g_cfg.debug)
         fprintf(stderr, "[sprout] execve('%s') host='%s' class=%d\n", path, host, cls);
     sp_trace_exec(path, argv, cls);
@@ -2246,6 +2336,25 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
         int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL);
         if (b == -2) return sp_chain_fail(path, depth, EIO, "argv-build:no-loader");
         if (b != 0) return sp_chain_fail(path, depth, E2BIG, "argv-build:cap");
+        {
+            /* flight-recorder: what the loader exec is about to run.
+             * apk's script pipes swallow stderr; only the tracelog sees. */
+            const char *logf = getenv("SPROUT_TRACELOG");
+            if (logf && *logf) {
+                int fd = (int)syscall(SP_SYS_openat, AT_FDCWD, logf, O_WRONLY | O_APPEND | O_CREAT, 0600);
+                if (fd >= 0) {
+                    char buf[4096]; int n = 0;
+                    n = snprintf(buf + n, sizeof(buf) - (size_t)n,
+                                 "TREXEC pid=%d loader='%s' b=%d", (int)getpid(),
+                                 getenv("SPROUT_LOADER") ? getenv("SPROUT_LOADER") : "(null)", b);
+                    for (int i = 0; vstack[i] && i < 12 && n < (int)sizeof(buf) - 96; i++)
+                        n += snprintf(buf + n, sizeof(buf) - (size_t)n, " |%s", vstack[i]);
+                    buf[n++] = '\n';
+                    (void)!write(fd, buf, (size_t)n);
+                    close(fd);
+                }
+            }
+        }
         int rc = sp_real_execve(getenv("SPROUT_LOADER"), vstack, envp);
         if (rc < 0) return sp_chain_fail(path, depth, errno, "loader-execve");
         return rc;
@@ -2255,15 +2364,22 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
          * append script path (guest spelling) + remaining argv */
         char ires[SP_PATH_MAX];
         if (sp_guest_path_search(interp, ires) != 0) { errno = ENOENT; return -1; }
-        /* build argv: [interp, script, argv+1...] */
+        /* build argv: [interp, opt?, script, argv+1...]
+         * (Linux: the whole shebang tail after the interp word is ONE
+         * token; apk's busybox trigger '#!/bin/busybox sh' proves it —
+         * without the arg, busybox tried to run the script PATH as an
+         * APPLET and exited 127. proot-equivalent chain omits nothing. */
         int argc = 0;
         while (argv[argc]) argc++;
-        if (argc + 2 > SP_CHAIN_MAX_ARGS + 8) { errno = ENOMEM; return -1; }
+        int has_opt = sopt[0] != '\0';
+        if (argc + 2 + has_opt > SP_CHAIN_MAX_ARGS + 8) { errno = ENOMEM; return -1; }
         char *vchain[SP_CHAIN_MAX_ARGS + 8];
         vchain[0] = ires;
-        vchain[1] = (char *)path;
-        for (int k = 1; k < argc; k++) vchain[1 + k] = argv[k];
-        vchain[1 + argc] = NULL;
+        int slot = 1;
+        if (has_opt) vchain[slot++] = sopt;
+        vchain[slot] = (char *)path;
+        for (int k = 1; k < argc; k++) vchain[slot + k] = argv[k];
+        vchain[slot + argc] = NULL;
         return sp_execve_chain(ires, vchain, envp, depth + 1);
     }
     case SP_ELF_STATIC: {
@@ -2382,7 +2498,7 @@ int fexecve(int fd, char *const argv[], char *const envp[]) {
     if (n <= 0) { errno = ENOENT; return -1; }
     host[n] = '\0';
     char interp[SP_PATH_MAX];
-    switch (sp_classify_host(host, interp)) {
+    switch (sp_classify_host(host, interp, NULL)) {
     case SP_ELF_DYNAMIC: {
         char *vstack[SP_CHAIN_MAX_ARGS + 8];
         int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL);
