@@ -73,6 +73,13 @@ jobs:
           # Park the pin for this step only.
           mv rust-toolchain.toml rust-toolchain.toml.pinned
           trap 'mv rust-toolchain.toml.pinned rust-toolchain.toml' EXIT
+          # The container is x86_64-under-qemu; a nested rustup call sees the
+          # EMULATED HOST's aarch64 uname and refuses x86_64 toolchain
+          # installs ('may not be able to run on this system'). qemu-user
+          # spoofs uname when QEMU_SET_UNAME=1 is visible in the emulated
+          # process environment; cross forwards it via this passthrough list.
+          export CROSS_CONTAINER_ENV_PASSTHROUGH=QEMU_SET_UNAME
+          export QEMU_SET_UNAME=1
           cross build --release --workspace --target "$ANDROID_TARGET"
 
       - name: collect artifacts (android launcher/supervisor + glibc interposer + musl interposer)
