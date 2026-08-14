@@ -32,7 +32,17 @@ jobs:
 
       # Smoke: the usual linux-gnu workspace build (keeps this workflow a
       # CI lane too, and produces the GUEST-side glibc interposer .so).
-      - run: cargo build --release --workspace
+      # DIAG: on arm this keeps failing with bare exit 101 and no readable
+      # logs for unauthenticated viewers, so the failing lines are mirrored
+      # into check-run annotations via ::error::.
+      - name: cargo build --release --workspace (fail-loud diag)
+        run: |
+          if ! cargo build --release --workspace 2>/tmp/cb.err; then
+            rc=$?
+            echo "::error::cargo build exit=$rc — stderr tail:"
+            tail -n 14 /tmp/cb.err | while IFS= read -r l; do echo "::error::| $l"; done
+            exit 101
+          fi
 
       # Termux-host artifacts must be linked against **bionic**, so we cross
       # to aarch64-linux-android with cargo-zigbuild (zig's bundled clang is
