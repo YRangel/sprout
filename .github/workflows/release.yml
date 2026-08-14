@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -10,28 +11,61 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
+    env:
+      ANDROID_TARGET: aarch64-linux-android.28
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # Smoke: the usual linux-gnu workspace build (keeps this workflow a
+      # CI lane too, and produces the GUEST-side glibc interposer .so).
       - run: cargo build --release --workspace
-      - name: collect
+
+      # Termux-host artifacts must be linked against **bionic**, so we cross
+      # to aarch64-linux-android with cargo-zigbuild (zig's bundled clang is
+      # also our musl toolchain for the alpine-guest interposer).
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+
+      - name: android-target workspace build (sprout + sprout-super for bionic hosts)
+        run: cargo zigbuild --release --workspace --target "$ANDROID_TARGET"
+
+      - name: collect artifacts (android launcher/supervisor + glibc interposer + musl interposer)
         run: |
           mkdir -p dist
-          cp target/release/sprout dist/
+          cp target/$ANDROID_TARGET/release/sprout dist/sprout
+          sup=$(find target/$ANDROID_TARGET/release/build/sprout-ptrace-*/out -name sprout-super | head -1)
+          test -n "$sup" && cp "$sup" dist/sprout-super
           so=$(find target/release/build/sprout-preload-*/out -name libsprout-core.so | head -1)
-          test -n "$so" && cp "$so" dist/
-          px=$(find target/release/build/sprout-ptrace-*/out -name sprout-super | head -1)
-          test -n "$px" && cp "$px" dist/
-          # musl interposer: optional (built in-guest with musl-gcc when present)
-          mso=$(find target -name libsprout-core-musl.so 2>/dev/null | head -1)
-          if [ -n "$mso" ]; then cp "$mso" dist/; else echo "::warning:: musl interposer artifact not built (needs musl toolchain); see development.md"; fi
-          strip dist/sprout dist/libsprout-core.so dist/sprout-super dist/libsprout-core-musl.so 2>/dev/null || true
-          sha256sum dist/* > dist/SHA256SUMS
+          test -n "$so" && cp "$so" dist/libsprout-core.so
+          # musl guest interposer: zig cc against alpine-linux-musl
+          zig cc -target aarch64-linux-musl \
+            -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE \
+            -fPIC -shared -DSPROUT_INTERPOSE \
+            -o dist/libsprout-core-musl.so \
+            crates/sprout-preload/csrc/sprout_preload.c -ldl
+          chmod 0755 dist/* || true
+          tar -C dist -cJf dist/sprout-aarch64-termux.tar.xz \
+            sprout sprout-super libsprout-core.so libsprout-core-musl.so
+          cd dist && sha256sum sprout sprout-super libsprout-core.so libsprout-core-musl.so sprout-aarch64-termux.tar.xz > SHA256SUMS
+
       - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: dist/*
           generate_release_notes: true
+
+      - uses: actions/upload-artifact@v5
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: sprout-aarch64-termux
+          path: dist/*
+          retention-days: 30
 
   docs:
     runs-on: ubuntu-latest

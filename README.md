@@ -23,9 +23,28 @@ MIT OR Apache-2.0. Every architectural decision documented in ADRs.
 ```sh
 git clone https://github.com/YRangel/sprout.git
 cd sprout
+cargo build --release          # needs: pkg install rust (pinned toolchain)
 ./install.sh --verify          # places sprout into $PREFIX/bin, verifies hashes
-                                  # (or: cargo build --release && ./install.sh --verify)
 ```
+
+### No Rust toolchain? Use the prebuilt binaries
+
+Tagged releases ship Termux-ready aarch64 binaries (built by the release CI
+with cargo-zigbuild against bionic; musl flavor compiled with zig cc):
+
+```sh
+cd $PREFIX/tmp
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-super
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/libsprout-core.so
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/libsprout-core-musl.so
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+chmod +x sprout sprout-super
+cp sprout sprout-super libsprout-core.so libsprout-core-musl.so $PREFIX/bin/
+```
+
+(one tarball also available as `sprout-aarch64-termux.tar.xz`)
 
 Then run anything:
 
