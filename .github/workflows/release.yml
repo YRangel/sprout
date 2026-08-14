@@ -39,8 +39,10 @@ jobs:
         run: |
           if ! cargo build --release --workspace 2>/tmp/cb.err; then
             rc=$?
-            echo "::error::cargo build exit=$rc — stderr tail:"
-            tail -n 14 /tmp/cb.err | while IFS= read -r l; do echo "::error::| $l"; done
+            echo "::error::cargo build exit=$rc — error-grep:"
+            grep -E "error|panic" /tmp/cb.err | tail -n 6 | while IFS= read -r l; do echo "::error::E| $l"; done
+            echo "::error::stderr tail:"
+            tail -n 5 /tmp/cb.err | while IFS= read -r l; do echo "::error::T| $l"; done
             exit 101
           fi
 
