@@ -60,12 +60,28 @@ fn main() {
         .arg("-nostdlib")
         .arg("-nostartfiles")
         .arg("-Os")
-        .arg("-fno-stack-protector")
-        .arg("-Wl,--image-base=0x70000000")
-        .arg("-Wl,--no-dynamic-linker")
-        .arg("-o")
-        .arg(&stub)
-        .arg("csrc/sprout_stub.c");
+        .arg("-fno-stack-protector");
+    /* Image-base flag portability: modern lld REJECTS `-Ttext-segment`
+     * ("Use --image-base"), and GNU ld >=2.44 rejects/lacks `--image-base`
+     * (ubuntu-24.04-arm ships binutils 2.42). Probe the actual linker and
+     * pick whichever spelling it accepts. */
+    let base = if linker_flag_ok(&cc_tool, "-Wl,--image-base=0x70000000") {
+        "-Wl,--image-base=0x70000000"
+    } else if linker_flag_ok(&cc_tool, "-Wl,-Ttext-segment=0x70000000") {
+        "-Wl,-Ttext-segment=0x70000000"
+    } else {
+        // No flag accepted: default base, warn loudly (ADR-0016 collision
+        // expectations relax to best-effort).
+        println!("cargo:warning=sprout-ptrace: neither --image-base nor -Ttext-segment accepted; stub at default base");
+        ""
+    };
+    if !base.is_empty() {
+        scmd.arg(base);
+    }
+    if linker_flag_ok(&cc_tool, "-Wl,--no-dynamic-linker") {
+        scmd.arg("-Wl,--no-dynamic-linker");
+    }
+    scmd.arg("-o").arg(&stub).arg("csrc/sprout_stub.c");
     let sstatus = scmd
         .status()
         .unwrap_or_else(|e| panic!("failed to spawn stub compiler: {e}"));
@@ -75,4 +91,31 @@ fn main() {
 
     println!("cargo:rustc-env=SPROOT_PTRACE_EXE={}", exe.display());
     println!("cargo:rustc-env=SPROUT_STUB_EXE={}", stub.display());
+}
+
+/// Compile a minimal freestanding blob with the candidate -Wl flag and
+/// accept if the link succeeds. Probes the LINKER, not just the cc driver
+/// (clang/lld vs gcc/binutils disagree on --image-base vs -Ttext-segment).
+fn linker_flag_ok(cc_tool: &cc::Tool, flag: &str) -> bool {
+    let probe_dir = std::env::temp_dir().join(format!("sprout-ldprobe-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&probe_dir);
+    let probe_c = probe_dir.join("probe.c");
+    let probe_o = probe_dir.join("probe");
+    if std::fs::write(&probe_c, "void _start(void) {}\n").is_err() {
+        return false;
+    }
+    let mut cmd = cc_tool.to_command();
+    cmd.arg("-static")
+        .arg("-nostdlib")
+        .arg("-nostartfiles")
+        .arg("-Os")
+        .arg(flag)
+        .arg("-o")
+        .arg(&probe_o)
+        .arg(&probe_c)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+    let _ = std::fs::remove_dir_all(&probe_dir);
+    ok
 }
