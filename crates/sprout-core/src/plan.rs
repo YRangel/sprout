@@ -83,6 +83,16 @@ fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
     if !env.iter().any(|(k, _)| k == "HOME") {
         env.push(("HOME".into(), guest_home(rootfs)));
     }
+    /* ADR-0018 binfmt adapter env tuple: the `-q` path feeds both arches
+     * (box64's integrated box32 handles i386 as well as x86_64). */
+    if let Some(qemu) = &rootfs.qemu {
+        if !env.iter().any(|(k, _)| k == "SPROUT_BINFMT_X86_64") {
+            env.push(("SPROUT_BINFMT_X86_64".into(), qemu.clone()));
+        }
+        if !env.iter().any(|(k, _)| k == "SPROUT_BINFMT_I386") {
+            env.push(("SPROUT_BINFMT_I386".into(), qemu.clone()));
+        }
+    }
     if !env.iter().any(|(k, _)| k == "TERM") {
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
         env.push(("TERM".into(), term));

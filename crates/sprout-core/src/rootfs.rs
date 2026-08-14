@@ -71,6 +71,9 @@ pub struct Rootfs {
     pub user_name: Option<String>,
     pub user_home: Option<String>,
     pub user_shell: Option<String>,
+    /// `-q`/`--qemu` (proot-compat): x86/x86_64 emulator guest path
+    /// (ADR-0018 userspace binfmt adapter; default /usr/local/bin/box64).
+    pub qemu: Option<String>,
     /// `--termux-x11` preset opt-in: inject the Termux-X11/pulse env bundle
     /// (DISPLAY=:0, PULSE_SERVER=127.0.0.1) into the guest. DEFAULT off:
     /// env is inherit-only; sprout never invents X11/audio exports.
@@ -108,6 +111,7 @@ impl Rootfs {
             user_home: None,
             user_shell: None,
             termux_x11: false,
+            qemu: None,
         })
     }
 

@@ -116,4 +116,16 @@ T "termux-x11-preset-injects"      "$(timeout 20 $S -r $B --shared-tmp --termux-
 T "env-inherit-only-default"      "$(env -u DISPLAY -u PULSE_SERVER timeout 20 $S -r $B /usr/bin/env 2>/dev/null | grep -cE '^(DISPLAY|PULSE_SERVER)=')" "0"
 T "no-zombie-sprout"            "$(n=0; for p in $(pgrep -f sprout-super 2>/dev/null); do [ "$(basename $(readlink /proc/$p/exe 2>/dev/null))" = "sprout-super" ] && n=$((n+1)); done; echo $n)" "0"
 
+# --- ADR-0018 userspace binfmt adapter (proot -q parity)
+T "binfmt-x86-direct-default-emu" "$(timeout 30 $S -r $B /usr/local/bin/box64-bash -c 'uname -m' 2>/dev/null | tail -1)" "x86_64"
+T "binfmt-q-flag-accepts"         "$(timeout 30 $S -r $B -q /usr/local/bin/box64 /usr/local/bin/box64-bash -c 'uname -m' 2>/dev/null | tail -1)" "x86_64"
+T "binfmt-env-var-pasid" "$(env SPROUT_BINFMT_X86_64=/usr/local/bin/box64 timeout 30 $S -r $B /usr/local/bin/box64-bash -c 'uname -m' 2>/dev/null | tail -1)" "x86_64"
+T "binfmt-q-env-tunnel"           "$(timeout 30 $S -r $B -q /usr/local/bin/box64 /bin/bash -c 'echo $SPROUT_BINFMT_X86_64 $SPROUT_BINFMT_I386' 2>/dev/null | tail -1)" "/usr/local/bin/box64 /usr/local/bin/box64"
+T "binfmt-always-wraps-native-echo" "$(env SPROUT_BINFMT_ALWAYS=1 SPROUT_BINFMT_X86_64=/bin/echo timeout 20 $S -r $B /usr/bin/true 2>/dev/null | tail -1)" "/usr/bin/true"
+T "binfmt-no-emu-error"           "$(env SPROUT_BINFMT_X86_64=/nonexistent timeout 20 $S -r $B /usr/local/bin/box64-bash -c true 2>&1 | grep -c 'binfmt: no emulator')" "1"
+T "binfmt-owned-rc-missing-emu"   "$(env SPROUT_BINFMT_X86_64=/nonexistent timeout 20 $S -r $B /usr/local/bin/box64-bash -c true 2>/dev/null; echo rc=$?)" "rc=1"
+T "binfmt-x86-rc"                  "$(timeout 30 $S -r $B /usr/local/bin/box64-bash -c 'exit 7' 2>/dev/null; echo rc=$?)" "rc=7"
+T "binfmt-native-nontarget-clean" "$(timeout 20 $S -r $B /usr/bin/uname -m 2>/dev/null | tail -1)" "aarch64"
+T "env-no-emu-keys-default"       "$(env -u SPROUT_BINFMT_X86_64 -u SPROUT_BINFMT_I386 timeout 20 $S -r $B /usr/bin/env 2>/dev/null | grep -c '^SPROUT_BINFMT_')" "0"
+
 echo "SUMMARY: pass=$pass fail=$fail"

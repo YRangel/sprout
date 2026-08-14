@@ -15,6 +15,11 @@ These land in the launch plan *unless a user env already defines them*:
 | `TERM` | host `$TERM`, fallback `xterm-256color` | colors behave |
 | `USER`/`LOGNAME` | anchor user (or the `--user` account) | tools diff `$USER` |
 | `SHELL` | guest `/bin/<basename-of-host-SHELL>` if found, else `/bin/bash`, else `/bin/sh` | host SHELL points at a bionic world; guests exec the WRONG libc otherwise |
+| `SPROUT_BINFMT_X86_64` | (unset ⇒ default `/usr/local/bin/box64`) | guest path of the x86_64 emulator used when sprout's binfmt adapter sniffs a foreign-arch ELF (ADR-0017) |
+| `SPROUT_BINFMT_I386` | (unset ⇒ falls through to `SPROUT_BINFMT_X86_64`, then `/usr/local/bin/box64`) | per-arch override for the i386 emulator (box64's built-in box32 covers it, so one binary is normal) |
+| `SPROUT_BINFMT_ALWAYS` | unset | `=1` wraps even native aarch64 ELFs into the emulator (proot `-q` parity for whole-rootfs x86 usage) |
+| `BOX64_LD_LIBRARY_PATH` | (unset ⇒ box defaults injected when routing x86_64) | overrides the box64 runtime library search path |
+| `BOX32_LD_LIBRARY_PATH` | (unset ⇒ box defaults injected when routing i386) | overrides the box32 runtime library search path |
 | `TMPDIR` | `/tmp` | host TMPDIR escapes the guest view |
 | `OLDPWD` | (dropped when host-sourced) | `$PWD`-chain confusion |
 | `PULSE_SERVER` | inherit host value only — **never invented** | set it yourself, or `--termux-x11` presets `127.0.0.1` (see below) |

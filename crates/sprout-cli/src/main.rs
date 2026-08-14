@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use sprout_core::{classify, Binding, Error, GuestClass, LaunchPlan, LibcFlavor, Rootfs, Strategy};
+use sprout_core::{
+    classify, elf_meta, Binding, Error, GuestClass, LaunchPlan, LibcFlavor, Rootfs, Strategy,
+};
 
 /// Rootless glibc Linux userspace for Android (proot-compatible CLI).
 ///
@@ -99,6 +101,15 @@ struct Cli {
     #[arg(long = "host-path")]
     host_path: bool,
 
+    /// proot `-q`/`--qemu` parity: x86_64 (and i386 via box32) execs are
+    /// rewritten to run through the given guest-side emulator binary
+    /// (ADR-0018 userspace binfmt adapter). Default: /usr/local/bin/box64.
+    /// Override per-arch via SPROUT_BINFMT_X86_64 / SPROUT_BINFMT_I386;
+    /// SPROUT_BINFMT_ALWAYS=1 wraps even native aarch64 ELFs (proot -q's
+    /// wrap-everything semantics for whole-rootfs usage).
+    #[arg(short = 'q', long = "qemu", value_name = "PATH")]
+    qemu: Option<String>,
+
     /// Force interception strategy (auto detects from guest ELF).
     #[arg(
         long = "fallback",
@@ -149,6 +160,7 @@ fn run() -> Result<u8, Error> {
     rootfs.link2symlink = cli.link2symlink && !cli.no_link2symlink;
     rootfs.host_home = cli.host_home;
     rootfs.host_path = cli.host_path;
+    rootfs.qemu = cli.qemu;
     if let Some(spec) = &cli.user {
         let (uid, gid, name, home, shell) = rootfs.resolve_user(spec)?;
         /* `--user` implies the fake-id machinery at a non-root anchor
@@ -270,6 +282,60 @@ fn run() -> Result<u8, Error> {
             program_host = interp_host;
             program_name = interp;
             class = interp_class;
+        }
+    }
+    // ---- ADR-0018: launcher-side binfmt wrap (proot -q parity at program 0) ----
+    // The preload-lane gate (sprout_preload.c) only reaches CHILD execve's
+    // from already-interposed processes; the very first exec issued by the
+    // CLI sits outside its reach. Same sniffing contract here, using the
+    // final resolved class + host path.
+    {
+        let emu64_cfg = || {
+            std::env::var("SPROUT_BINFMT_X86_64")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| rootfs.qemu.clone())
+                .unwrap_or_else(|| "/usr/local/bin/box64".to_string())
+        };
+        let always = std::env::var("SPROUT_BINFMT_ALWAYS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let wrap_emu = match elf_meta(&classify_path)? {
+            Some((2, 62)) => Some(emu64_cfg()),
+            Some((1, 3)) => Some(
+                std::env::var("SPROUT_BINFMT_I386")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(emu64_cfg),
+            ),
+            Some((_, 183)) if always => Some(emu64_cfg()),
+            _ => None,
+        };
+        if let Some(emu) = wrap_emu {
+            /* Never wrap the emulator's own exec (it re-surfaces here with
+             * the rewritten argv): compare resolved host paths. */
+            let emu_host = rootfs
+                .find_program(&emu)
+                .unwrap_or_else(|_| rootfs.to_host(std::path::Path::new(&emu)));
+            if emu_host != classify_path {
+                if !emu_host.is_file() {
+                    return Err(Error::BinfmtNoEmulator {
+                        program: program_name.clone(),
+                        emu: emu.clone(),
+                    });
+                }
+                let orig_args: Vec<OsString> = full_cmd[1..].to_vec();
+                let target_guest = guest_abs
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| program_name.clone());
+                let mut rebuilt: Vec<OsString> = vec![emu.clone().into(), target_guest.into()];
+                rebuilt.extend(orig_args);
+                full_cmd = rebuilt;
+                program_host = emu_host.clone();
+                program_name = emu;
+                class = classify(&emu_host)?;
+            }
         }
     }
     let strategy = match cli.fallback.as_str() {

@@ -31,6 +31,11 @@ pub enum Error {
     #[error("guest loader not found: tried {tried:?} inside rootfs")]
     LoaderMissing { tried: Vec<String> },
 
+    #[error(
+        "binfmt: no emulator for foreign-arch target '{program}' (set SPROUT_BINFMT_X86_64/SPROUT_BINFMT_I386 or install box64 at {emu})"
+    )]
+    BinfmtNoEmulator { program: String, emu: String },
+
     #[error("libsprout-core.so not found. Either set SPROUT_PRELOAD_PATH=/path/to/libsprout-core.so, install it beside the `sprout` binary, or build it on a glibc host (docs/src/development.md).")]
     PreloadNotFound,
 

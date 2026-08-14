@@ -36,6 +36,7 @@
 - [0014: vfork-safe exec chain](./adr/0014-vfork-safe-exec-chain.md)
 - [0015: relative path semantics (cwd + dirfd)](./adr/0015-relative-path-semantics.md)
 - [0016: pure-notify statics lane (sprout-stub)](./adr/0016-pure-notify-statics-lane.md)
+- [0017: userspace binfmt adapter (proot -q parity)](./adr/0017-userspace-binfmt-adapter.md)
 
 # Operations
 

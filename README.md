@@ -48,10 +48,15 @@ Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
   (in `~/.cache/sprout`) carry the Android seccomp workarounds.
 - **proot-compatible CLI**: `-r -b -w -0 --link2symlink --shared-tmp
   --termux-x11 --kill-on-exit --dry-run`.
+- **-q / x86 emulation without root**: userspace binfmt adapter (ADR-0017)
+  sniffs x86_64/i386 ELFs at exec and routes them through a guest emulator
+  (`/usr/local/bin/box64` by default; set `SPROUT_BINFMT_X86_64` /
+  `SPROUT_BINFMT_I386`, or `-q PATH`); `SPROUT_BINFMT_ALWAYS=1` wraps every
+  exec proot-`-q`-style for whole-rootfs emulation.
 - **Environment policy**: never invents vars; `HOME` defaults guest when you ask
   to live inside; `--termux-x11` is the explicit preset for GUI sessions.
 - **Reproducible batteries**: `bench/flags-matrix.sh` (25 cells),
-  `bench/flags-matrix-extended.sh` (63), hyperfine benchmark pairs.
+  `bench/flags-matrix-extended.sh` (73), hyperfine benchmark pairs.
 - **Audited surface**: every major decision written down in `docs/src/adr/`.
 
 ## Found a bug?

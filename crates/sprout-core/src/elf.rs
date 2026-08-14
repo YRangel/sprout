@@ -54,6 +54,20 @@ fn read_range(path: &Path, offset: u64, len: usize) -> std::io::Result<Vec<u8>> 
     Ok(buf)
 }
 
+/// Raw (EI_CLASS, e_machine) of a file (ADR-0018 launcher-side binfmt
+/// sniff). Differs from classify() in that it keeps only the machine word
+/// and doesn't need PT_INTERP/symtab pass — used to decide whether the
+/// *launcher* wraps the guest program through an x86 executor (box64).
+pub fn elf_meta(path: &Path) -> Result<Option<(u8, u16)>, ElfError> {
+    let name = path.display().to_string();
+    let head = read_range(path, 0, 20).map_err(|e| ElfError::Read(name.clone(), e))?;
+    if head.len() < 20 || head[0] != 0x7f || &head[1..4] != b"ELF" {
+        return Ok(None); // scripts etc. — NotElf path handles
+    }
+    let e_machine = u16::from_le_bytes([head[18], head[19]]);
+    Ok(Some((head[4], e_machine)))
+}
+
 /// Classify an ELF file by header + program headers. Reads only the header
 /// pages plus the PT_INTERP string — never the whole file.
 pub fn classify(path: &Path) -> Result<GuestClass, ElfError> {

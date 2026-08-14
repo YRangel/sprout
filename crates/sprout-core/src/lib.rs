@@ -13,7 +13,7 @@ mod strategy;
 
 pub mod sanitize;
 
-pub use elf::{classify, ElfError, GuestClass};
+pub use elf::{classify, elf_meta, ElfError, GuestClass};
 pub use error::Error;
 pub use plan::LaunchPlan;
 pub use rootfs::{Binding, LibcFlavor, Rootfs};

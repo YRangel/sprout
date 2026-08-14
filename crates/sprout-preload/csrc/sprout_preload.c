@@ -2575,6 +2575,141 @@ static void sp_stamp_exe(char **env, const char *gabs) {
     if (n < 510) { env[n] = exe_entry; env[n + 1] = NULL; }
 }
 
+/* ------- ADR-0018: userspace binfmt adapter -------
+ * Kernel binfmt_misc is unusable rootless (CAP_SYS_ADMIN + /proc/sys
+ * writes are SELinux-blocked), so foreign-arch ELFs (x86_64, i386) are
+ * sniffed at THE exec-gate here in the preload lane and rewritten to an
+ * emulator (default /usr/local/bin/box64) via argv manipulation, the same
+ * interception spine the shebang-chain already uses.
+ * Config: SPROUT_BINFMT_X86_64 / SPROUT_BINFMT_I386 (emulator guest path),
+ * SPROUT_BINFMT_ALWAYS=1 for proot -q parity (wrap every native exec).
+ * Costs: ONE extra 20-byte read per exec on top of the (already required)
+ * classify open; zero per-syscall. The supervisor lane CANNOT consume a
+ * foreign-arch image: tracee execve classification is arch-tied, so the
+ * preload gate is the only interception point — documented in ADR-0018. */
+#define EM_386     3
+#define EM_X86_64  62
+#define EM_AARCH64 183
+
+static int sp_execve_chain(const char *path, char *const argv[], char *const envp[], int depth);
+
+static int sp_binfmt_always(void) {
+    static int v = -1;
+    if (v < 0)
+        v = (getenv("SPROUT_BINFMT_ALWAYS") && getenv("SPROUT_BINFMT_ALWAYS")[0] == '1') ? 1 : 0;
+    return v;
+}
+
+/* Sniff ELF identity from the already-translated host path. Fills e_class
+ * + e_machine when it IS an ELF (any arch/class). Returns 1 when ELF, 0
+ * otherwise (scripts keep the regular chain, which re-enters the gate for
+ * their interpreter). */
+static int sp_elf_meta(const char *host, unsigned char *e_class_out, unsigned short *e_machine_out) {
+    FILE *f = fopen(host, "rb");
+    if (!f) return 0;
+    unsigned char head[20];
+    size_t n = fread(head, 1, sizeof(head), f);
+    fclose(f);
+    if (n < sizeof(head) || head[0] != 0x7f || head[1] != 'E' || head[2] != 'L' || head[3] != 'F')
+        return 0;
+    *e_class_out  = head[4];  /* 1=32 2=64 */
+    *e_machine_out = (unsigned short)(head[18] | ((unsigned short)head[19] << 8));
+    return 1;
+}
+
+/* Rewrites the incoming exec to an emulator when the target is a foreign
+ * (or ALWAYS-wrapped native) ELF. Returns: 1 = recursion issued (caller
+ * propagates rc), 0 = not relevant — proceed with the regular chain;
+ * -1 = foreign ELF but no usable emulator (caller emits chain_fail with
+ * ENOEXEC). */
+static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
+                                char *const argv[], char *const merged_envp[], int depth) {
+    unsigned char e_class = 0;
+    unsigned short e_machine = 0;
+    int is_elf = sp_elf_meta(host_abs, &e_class, &e_machine);
+    if (!is_elf) return 0; /* scripts etc. — ordinary chain */
+
+    const char *emu = NULL, *libenv = NULL, *libdef = NULL;
+    if (e_class == 2 && e_machine == EM_X86_64) {
+        emu = getenv("SPROUT_BINFMT_X86_64");
+        if (!emu || !*emu) emu = "/usr/local/bin/box64";
+        libenv = "BOX64_LD_LIBRARY_PATH";
+        libdef = "/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/usr/x86_64-linux-gnu";
+    } else if (e_class == 1 && e_machine == EM_386) {
+        emu = getenv("SPROUT_BINFMT_I386");
+        if ((!emu || !*emu) && getenv("SPROUT_BINFMT_X86_64") && *getenv("SPROUT_BINFMT_X86_64"))
+            emu = getenv("SPROUT_BINFMT_X86_64"); /* box64's integrated box32 */
+        if (!emu || !*emu) emu = "/usr/local/bin/box64";
+        libenv = "BOX32_LD_LIBRARY_PATH";
+        libdef = "/usr/lib/i386-linux-gnu:/lib/i386-linux-gnu:/usr/lib32";
+    } else if (e_machine == EM_AARCH64) {
+        if (!sp_binfmt_always()) return 0;
+        emu = getenv("SPROUT_BINFMT_X86_64");
+        if (!emu || !*emu) emu = "/usr/local/bin/box64";
+        libenv = "BOX64_LD_LIBRARY_PATH";
+        libdef = "/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/usr/x86_64-linux-gnu";
+    } else {
+        return 0; /* other architectures: native-path failure (unchanged) */
+    }
+
+    /* never wrap the emulator ITSELF (self-recursion guard: with ALWAYS=1
+     * box64's own exec resurfaces here) */
+    {
+        char ex[SP_PATH_MAX];
+        const char *eraw = sp_translate_x(emu, ex);
+        char ehost[SP_PATH_MAX];
+        snprintf(ehost, sizeof(ehost), "%s", eraw);
+        sp_resolve_absolute_symlink(ehost);
+        if (strcmp(ehost, host_abs) == 0) return 0;
+        if (access(ehost, X_OK) != 0) {
+            fprintf(stderr,
+                "sprout: binfmt: no emulator for EI_CLASS=%u e_machine=%u target %s "
+                "(set SPROUT_BINFMT_X86_64/SPROUT_BINFMT_I386 or install box64)\n",
+                (unsigned)e_class, (unsigned)e_machine, guest_path);
+            return -1;
+        }
+    }
+
+    /* argv: [emu, guest_path, argv[1], argv[2], ... NULL] — guest_path stays
+     * guest-spelled: box64's own open() rides the preload translation. */
+    int ac = 0;
+    while (argv[ac]) ac++;
+    char **nv = malloc(((size_t)ac + 2) * sizeof(char *));
+    if (!nv) { errno = ENOMEM; return -1; }
+    nv[0] = (char *)emu;
+    nv[1] = (char *)guest_path;
+    for (int i = 1; argv[i]; i++) nv[1 + i] = argv[i];
+    nv[1 + ac] = NULL;
+
+    /* env: append the loader library path default iff absent (copy of the
+     * already-chain-merged envp; recursion re-merges our chain vars, that's
+     * cheap and safe). */
+    int ec = 0;
+    while (merged_envp[ec]) ec++;
+    char **nev = malloc(((size_t)ec + 2) * sizeof(char *));
+    if (!nev) { free(nv); errno = ENOMEM; return -1; }
+    int have_lib = 0;
+    size_t le = strlen(libenv);
+    for (int i = 0; i < ec; i++) {
+        nev[i] = merged_envp[i];
+        if (!have_lib && strncmp(nev[i], libenv, le) == 0 && nev[i][le] == '=') have_lib = 1;
+    }
+    if (!have_lib) {
+        nev[ec] = malloc(le + 1 + strlen(libdef) + 1);
+        if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
+        sprintf(nev[ec], "%s=%s", libenv, libdef);
+        ec++;
+    }
+    nev[ec] = NULL;
+
+    int rc = sp_execve_chain(emu, nv, nev, depth + 1);
+    /* only reached on exec FAILURE through the recursion (prints already) */
+    free(nev);
+    free(nv);
+    (void)rc;
+    return 1;
+}
+
 static int sp_execve_chain(const char *path, char *const argv[], char *const envp[], int depth) {
     if (depth > 4) return sp_chain_fail(path, depth, ELOOP, "depth");
     envp = (char *const *)sp_chain_env(envp);
@@ -2601,6 +2736,12 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
     snprintf(hx, sizeof(hx), "%s", host_raw);
     sp_resolve_absolute_symlink(hx);
     const char *host = hx;
+
+    {
+        int brc = sp_binfmt_maybe_exec(path, host, argv, envp, depth);
+        if (brc < 0) return sp_chain_fail(path, depth, ENOEXEC, "binfmt:no-emu");
+        if (brc > 0) return -1; /* recursion already ran + reported */
+    }
 
     char interp[SP_PATH_MAX], sopt[SP_PATH_MAX];
     int cls = sp_classify_host(host, interp, sopt);
