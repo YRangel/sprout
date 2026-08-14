@@ -400,23 +400,81 @@ static int sv_semop_step(int fd, const struct sembuf *b, uint32_t nseg, int *blo
     return 0;
 }
 
+/* Per-thread open-addressing cache of sem/shm backing fds. Each entry
+ * owns one fd already opened via the guest-visible path; LOCK_EX / LOCK_UN
+ * on it never interferes with other threads (flock is scoped to the open
+ * file description, not the inode) -> no in-shim cross-thread lock needed,
+ * only per-PROCESS cross-process flock stays. 8 slots is generous: steam
+ * tier0 uses 1-2 ids. Stale-after-RMID is safe: pread under flock still
+ * sees destroy=1 before the unlink can bite, so stale fds fail the op
+ * with EIDRM and the caller re-runs create if it wants to. Thread-exit
+ * close is NOT hooked (documented gap: worst case leaks up to 8 fds per
+ * thread; steam's mean usage is well under that). */
+#define SV_FD_CAP 8
+typedef struct { uint64_t key_id; int fd; } sv_fdc_slot;
+static _Thread_local sv_fdc_slot sv_fdc[SV_FD_CAP];
+
+static uint64_t sv_fd_key(uint32_t itype, int32_t id) {
+    return ((uint64_t)itype << 32) | (uint32_t)id;
+}
+static int sv_fd_cache_find(uint32_t itype, int32_t id) {
+    uint64_t k = sv_fd_key(itype, id);
+    for (int i = 0; i < SV_FD_CAP; i++) {
+        if (sv_fdc[i].key_id == k) return i;
+        if (sv_fdc[i].key_id == 0) break;
+    }
+    return -1;
+}
+static void sv_fd_cache_evict(uint32_t itype, int32_t id) {
+    uint64_t k = sv_fd_key(itype, id);
+    for (int i = 0; i < SV_FD_CAP; i++) {
+        if (sv_fdc[i].key_id == k) {
+            close(sv_fdc[i].fd);
+            sv_fdc[i].key_id = 0;
+            sv_fdc[i].fd = -1;
+            return;
+        }
+        if (sv_fdc[i].key_id == 0) break;
+    }
+}
+/* fd lookup-or-open: hot for every semop/semctl. Miss cost is exactly
+ * one sv_obj_open; hit cost is the scan alone. */
+static int sv_fd_get(uint32_t itype, int32_t id) {
+    int i = sv_fd_cache_find(itype, id);
+    if (i >= 0) return sv_fdc[i].fd;
+    sv_obj o;
+    if (sv_obj_by_id(&o, (int32_t)id) != 0) return -1;
+    int fd = o.fd;
+    /* first free slot wins; full-cache fallback: evict slot 0 (steam's
+     * working set is tiny so even slot-0-reuse-day is nearly free). */
+    int idx = -1;
+    for (int j = 0; j < SV_FD_CAP; j++) {
+        if (sv_fdc[j].key_id == 0) { idx = j; break; }
+    }
+    if (idx < 0) { idx = 0; close(sv_fdc[0].fd); }
+    sv_fdc[idx].key_id = sv_fd_key(itype, (int32_t)id);
+    sv_fdc[idx].fd = fd;
+    return fd;
+}
+
 int semop(int semid, struct sembuf *sops, size_t nsops) {
     if (!sops) { errno = EFAULT; return -1; }
-    sv_obj o;
-    if (sv_obj_by_id(&o, semid) != 0) return -1;
-    /* range check nsems once up front so out-of-bounds slices fail fast */
+    int fdfd = sv_fd_get(/*itype=*/1, semid);
+    if (fdfd < 0) return -1;
+    /* range check nsems once: out-of-bounds slices fail fast up front. read
+     * the header under flock EX so the destroy=1 + unlink race stays
+     * observable on the pread view (always-per-op re-verify). */
     sv_hdr h;
-    (void)flock(o.fd, LOCK_EX);
-    if (sv_pread_full(o.fd, &h, SV_HDR_SIZE, 0) < 0 || h.magic != SV_MAGIC || h.destroy) {
-        (void)flock(o.fd, LOCK_UN);
-        sv_obj_close(&o);
+    (void)flock(fdfd, LOCK_EX);
+    if (sv_pread_full(fdfd, &h, SV_HDR_SIZE, 0) < 0 || h.magic != SV_MAGIC || h.destroy) {
+        (void)flock(fdfd, LOCK_UN);
+        sv_fd_cache_evict(1, semid);
         errno = EIDRM;
         return -1;
     }
-    (void)flock(o.fd, LOCK_UN);
+    (void)flock(fdfd, LOCK_UN);
     for (size_t i = 0; i < nsops; i++) {
         if ((uint32_t)sops[i].sem_num >= h.nsems) {
-            sv_obj_close(&o);
             errno = EFBIG;
             return -1;
         }
@@ -426,12 +484,12 @@ int semop(int semid, struct sembuf *sops, size_t nsops) {
     struct timespec ts = { 0, 20000L };
     for (;;) {
         int blocked = -1;
-        (void)flock(o.fd, LOCK_EX);
-        int rc = sv_semop_step(o.fd, sops, (uint32_t)nsops, &blocked);
-        (void)flock(o.fd, LOCK_UN);
-        if (rc < 0) { sv_obj_close(&o); return -1; }
-        if (rc == 0) { sv_obj_close(&o); return 0; }
-        if (sops[blocked].sem_flg & IPC_NOWAIT) { sv_obj_close(&o); errno = EAGAIN; return -1; }
+        (void)flock(fdfd, LOCK_EX);
+        int rc = sv_semop_step(fdfd, sops, (uint32_t)nsops, &blocked);
+        (void)flock(fdfd, LOCK_UN);
+        if (rc < 0) return -1;
+        if (rc == 0) return 0;
+        if (sops[blocked].sem_flg & IPC_NOWAIT) { errno = EAGAIN; return -1; }
         if (++spins < 100) continue;
         nanosleep(&ts, NULL);
     }
@@ -451,36 +509,37 @@ int semctl(int semid, int semnum, int cmd, ...) {
         va_end(ap);
     }
 
-    sv_obj o;
-    if (sv_obj_by_id(&o, semid) != 0) return -1;
-    (void)flock(o.fd, LOCK_EX);
+    int cdfd = sv_fd_get(/*itype=*/1, semid);
+    if (cdfd < 0) return -1;
+    (void)flock(cdfd, LOCK_EX);
 
     sv_hdr h;
-    if (sv_pread_full(o.fd, &h, SV_HDR_SIZE, 0) < 0 || h.magic != SV_MAGIC || h.destroy) {
-        (void)flock(o.fd, LOCK_UN);
-        sv_obj_close(&o);
+    if (sv_pread_full(cdfd, &h, SV_HDR_SIZE, 0) < 0 || h.magic != SV_MAGIC || h.destroy) {
+        (void)flock(cdfd, LOCK_UN);
+        sv_fd_cache_evict(1, semid);
         errno = EIDRM;
         return -1;
     }
-    if (h.itype != 1) { (void)flock(o.fd, LOCK_UN); sv_obj_close(&o); errno = EINVAL; return -1; }
+    if (h.itype != 1) { (void)flock(cdfd, LOCK_UN); errno = EINVAL; return -1; }
     uint32_t nsems = h.nsems;
     int rc = 0;
 
     switch (cmd) {
     case IPC_RMID:
         h.destroy = 1;
-        (void)pwrite_retry(o.fd, &h, SV_HDR_SIZE, 0);
+        (void)pwrite_retry(cdfd, &h, SV_HDR_SIZE, 0);
+        sv_fd_cache_evict(1, semid);
         rc = 0;
         break;
     case SETVAL:
         if ((uint32_t)semnum >= nsems) { errno = EFBIG; rc = -1; goto out; }
-        (void)pwrite_retry(o.fd, &u.val, 4,
+        (void)pwrite_retry(cdfd, &u.val, 4,
                            (off_t)(SV_HDR_SIZE + (uint32_t)semnum * SV_SEM_STRIDE));
         rc = 0;
         break;
     case GETVAL:
         if ((uint32_t)semnum >= nsems) { errno = EFBIG; rc = -1; goto out; }
-        rc = (int)sv_sem_getval_locked(o.fd, (uint32_t)semnum);
+        rc = (int)sv_sem_getval_locked(cdfd, (uint32_t)semnum);
         break;
     case SETALL: {
         if (!u.array) { errno = EFAULT; rc = -1; goto out; }
@@ -488,7 +547,7 @@ int semctl(int semid, int semnum, int cmd, ...) {
         uint32_t n = nsems > 64 ? 64 : nsems;
         for (uint32_t i = 0; i < n; i++) vs[i] = u.array[i];
         for (uint32_t i = 0; i < n; i++)
-            (void)pwrite_retry(o.fd, &vs[i], 4, (off_t)(SV_HDR_SIZE + i * SV_SEM_STRIDE));
+            (void)pwrite_retry(cdfd, &vs[i], 4, (off_t)(SV_HDR_SIZE + i * SV_SEM_STRIDE));
         rc = 0;
         break;
     }
@@ -496,7 +555,7 @@ int semctl(int semid, int semnum, int cmd, ...) {
         if (!u.array) { errno = EFAULT; rc = -1; goto out; }
         uint32_t n = nsems > 64 ? 64 : nsems;
         for (uint32_t i = 0; i < n; i++)
-            u.array[i] = (unsigned short)sv_sem_getval_locked(o.fd, i);
+            u.array[i] = (unsigned short)sv_sem_getval_locked(cdfd, i);
         rc = 0;
         break;
     }
@@ -507,8 +566,7 @@ int semctl(int semid, int semnum, int cmd, ...) {
     }
 
 out:
-    (void)flock(o.fd, LOCK_UN);
-    sv_obj_close(&o);
+    (void)flock(cdfd, LOCK_UN);
     return rc;
 }
 

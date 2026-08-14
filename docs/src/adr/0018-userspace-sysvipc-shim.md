@@ -54,6 +54,17 @@ fresh opener resolves `semctl(id, GETVAL)` without a central registry.
 counter file (flock-protected increment); the private file path names
 itself by the slot, so later openers resolve identically.
 
+## Perf follow-up (2026-08-14 afternoon): per-thread fd cache
+
+After the shim shipped, code revision showed the top syscall overhead
+was open+close per semop (7 syscalls/op dominated by open+close).
+Fix is in-shim: an 8-slot open-addressing TLS fd cache, evict-only-on-
+RMID, with the pre-op header pread re-verified per-op (stale reads
+impossible: IPC_RMID marks destroy=1 BEFORE unlink, and every op holds
+LOCK_EX). flock(2) on the cached fd is per-open-file-description so
+thread-locality is safe by construction. Bench: 100k semops (50k P/V
+pairs) under box64 x86_64: 3.35s -> 0.31s wall (~10.6x).
+
 ## Consequences
 
 - Steam's tier0 semaphore-creation assertion is gone; steam now reaches
