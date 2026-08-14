@@ -305,7 +305,8 @@ fn run() -> Result<u8, Error> {
         let always = std::env::var("SPROUT_BINFMT_ALWAYS")
             .map(|v| v == "1")
             .unwrap_or(false);
-        let wrap_emu = match elf_meta(&sniff_target)? {
+        let wrap_meta = elf_meta(&sniff_target)?;
+        let wrap_emu = match wrap_meta {
             Some((2, 62)) => Some(emu64_cfg()),
             Some((1, 3)) => Some(
                 std::env::var("SPROUT_BINFMT_I386")
@@ -332,6 +333,24 @@ fn run() -> Result<u8, Error> {
                 /* Kernel argv semantics preserved: prepend the emulator to
                  * the ALREADY-resolved argv — [emu, interp?, script?, args]
                  * for scripts, [emu, target, args] for direct ELFs. */
+                /* ADR-0018: inject sysvipc shim for the killed-syscall
+                 * family (semget/shmget ENOSYS on Android stock GKI). Guest-
+                 * arch .so lives inside the rootfs so *every* wrapping box64
+                 * process in any session maps the same backing dir.
+                 * Empirical box64 v0.4.3: BOX64_LD_PRELOAD applies to x86_64
+                 * guests AND to the box32 persona of i386 guests (there is no
+                 * BOX32_LD_PRELOAD in this build); pick the shim matching the
+                 * sniffed machine. */
+                let shim = if wrap_meta.map(|(_, m)| m) == Some(3) {
+                    "/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so"
+                } else {
+                    "/usr/lib/sprout-sysvipc/x86_64/libsprout-sysvipc.so"
+                };
+                if std::env::var_os("BOX64_LD_PRELOAD").is_none()
+                    && rootfs.guest_real(std::path::Path::new(shim)).is_some()
+                {
+                    std::env::set_var("BOX64_LD_PRELOAD", shim);
+                }
                 let mut rebuilt: Vec<OsString> = vec![emu.clone().into()];
                 rebuilt.extend(full_cmd.iter().cloned());
                 full_cmd = rebuilt;

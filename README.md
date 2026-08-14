@@ -53,6 +53,11 @@ Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
   (`/usr/local/bin/box64` by default; set `SPROUT_BINFMT_X86_64` /
   `SPROUT_BINFMT_I386`, or `-q PATH`); `SPROUT_BINFMT_ALWAYS=1` wraps every
   exec proot-`-q`-style for whole-rootfs emulation.
+- **SysV IPC for x86+binfmt guests** (steam's live runtime): guest-ABI
+  `libsprout-sysvipc.so` is injected into `BOX64_LD_PRELOAD` of every wrapped
+  exec, emulating `semget/semop/semctl/shm*` in userspace against a shared
+  `/tmp/sprout-sysvipc` backing dir (ADR-0018). Needed because stock Android
+  GKI ships `CONFIG_SYSVIPC=n`; disable with `SPROUT_SYSVIPC_OFF=1`.
 - **Environment policy**: never invents vars; `HOME` defaults guest when you ask
   to live inside; `--termux-x11` is the explicit preset for GUI sessions.
 - **Reproducible batteries**: `bench/flags-matrix.sh` (25 cells),

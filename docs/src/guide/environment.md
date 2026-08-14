@@ -18,6 +18,8 @@ These land in the launch plan *unless a user env already defines them*:
 | `SPROUT_BINFMT_X86_64` | (unset ⇒ default `/usr/local/bin/box64`) | guest path of the x86_64 emulator used when sprout's binfmt adapter sniffs a foreign-arch ELF (ADR-0017) |
 | `SPROUT_BINFMT_I386` | (unset ⇒ falls through to `SPROUT_BINFMT_X86_64`, then `/usr/local/bin/box64`) | per-arch override for the i386 emulator (box64's built-in box32 covers it, so one binary is normal) |
 | `SPROUT_BINFMT_ALWAYS` | unset | `=1` wraps even native aarch64 ELFs into the emulator (proot `-q` parity for whole-rootfs x86 usage) |
+| `SPROUT_SYSVIPC_OFF` | unset | `=1` prevents the sysvipc shim DSO (`/usr/lib/sprout-sysvipc/{i386,x86_64}/libsprout-sysvipc.so`) from being injected into `BOX64_LD_PRELOAD` of wrapped x86 guests (ADR-0018; required for steam's startup semaphores) |
+| `SPROUT_SYSVIPC_DIR` | `/tmp/sprout-sysvipc` | guest-path directory backing the emulated SysV objects (must be reachable by EVERY wrapped process — keep it the Termux-shared `/tmp` bind for cross-session reach) |
 | `BOX64_LD_LIBRARY_PATH` | (unset ⇒ box defaults injected when routing x86_64) | overrides the box64 runtime library search path |
 | `BOX32_LD_LIBRARY_PATH` | (unset ⇒ box defaults injected when routing i386) | overrides the box32 runtime library search path |
 | `TMPDIR` | `/tmp` | host TMPDIR escapes the guest view |

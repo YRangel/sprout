@@ -37,6 +37,7 @@
 - [0015: relative path semantics (cwd + dirfd)](./adr/0015-relative-path-semantics.md)
 - [0016: pure-notify statics lane (sprout-stub)](./adr/0016-pure-notify-statics-lane.md)
 - [0017: userspace binfmt adapter (proot -q parity)](./adr/0017-userspace-binfmt-adapter.md)
+- [0018: userspace SysV IPC emulation for box64/box32 guests](./adr/0018-userspace-sysvipc-shim.md)
 
 # Operations
 

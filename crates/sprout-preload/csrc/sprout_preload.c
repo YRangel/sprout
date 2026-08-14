@@ -2686,13 +2686,33 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
      * cheap and safe). */
     int ec = 0;
     while (merged_envp[ec]) ec++;
-    char **nev = malloc(((size_t)ec + 2) * sizeof(char *));
+    char **nev = malloc(((size_t)ec + 3) * sizeof(char *));
     if (!nev) { free(nv); errno = ENOMEM; return -1; }
-    int have_lib = 0;
+    int have_lib = 0, have_pre = 0;
     size_t le = strlen(libenv);
     for (int i = 0; i < ec; i++) {
         nev[i] = merged_envp[i];
         if (!have_lib && strncmp(nev[i], libenv, le) == 0 && nev[i][le] == '=') have_lib = 1;
+        if (!have_pre && strncmp(nev[i], "BOX64_LD_PRELOAD=", 17) == 0) have_pre = 1;
+    }
+    /* ADR-0018 sysvipc shim: box64's PLT resolution is the ONLY lane the
+     * emulated guest's SysV libc calls traverse — preload interception via
+     * BOX64_LD_PRELOAD works for BOTH 64-bit and box32 children. The shim
+     * runs entirely in the emulated guest (x86 or i386 ELF); its kernel-ABI
+     * calls (int80/syscall) are translated by box64. */
+    if (!have_pre && e_machine == EM_X86_64 && !getenv("SPROUT_SYSVIPC_OFF")
+        && access("/usr/lib/sprout-sysvipc/x86_64/libsprout-sysvipc.so", R_OK) == 0) {
+        nev[ec] = malloc(strlen("BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/x86_64/libsprout-sysvipc.so") + 1);
+        if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
+        sprintf(nev[ec], "BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/x86_64/libsprout-sysvipc.so");
+        ec++;
+    }
+    if (!have_pre && e_machine == EM_386 && !getenv("SPROUT_SYSVIPC_OFF")
+        && access("/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so", R_OK) == 0) {
+        nev[ec] = malloc(strlen("BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so") + 1);
+        if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
+        sprintf(nev[ec], "BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so");
+        ec++;
     }
     if (!have_lib) {
         nev[ec] = malloc(le + 1 + strlen(libdef) + 1);
