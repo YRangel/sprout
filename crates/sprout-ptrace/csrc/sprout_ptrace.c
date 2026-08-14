@@ -38,6 +38,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+/* gnu-libc (ubuntu-24.04-arm CI runner) does NOT pull `struct user_pt_regs`
+ * through <sys/ptrace.h> on aarch64 — bionic does, which is why this buried
+ * glibc-only compile failure survived until release automation (`storage
+ * size of 'rr' isn't known` at 5 sites). <asm/ptrace.h> carries the type
+ * on gnu-libc and is absent-only on unusual libc sets, hence __has_include. */
+#if defined(__aarch64__) && defined(__has_include)
+#  if __has_include(<asm/ptrace.h>)
+#    include <asm/ptrace.h>
+#  endif
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
