@@ -65,7 +65,15 @@ jobs:
         run: cargo binstall -y cross
 
       - name: android-target workspace build (sprout + sprout-super for bionic hosts)
-        run: cross build --release --workspace --target "$ANDROID_TARGET"
+        run: |
+          # cross images are x86_64 containers (run under binfmt-qemu on the
+          # arm runner and ship their own stable toolchain); our
+          # rust-toolchain.toml pin (1.97.1) makes the in-container rustup
+          # try to fetch 1.97.1-x86_64-* and the qemu host check refuses.
+          # Park the pin for this step only.
+          mv rust-toolchain.toml rust-toolchain.toml.pinned
+          trap 'mv rust-toolchain.toml.pinned rust-toolchain.toml' EXIT
+          cross build --release --workspace --target "$ANDROID_TARGET"
 
       - name: collect artifacts (android launcher/supervisor + glibc interposer + musl interposer)
         run: |
