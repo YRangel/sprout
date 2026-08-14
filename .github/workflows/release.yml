@@ -55,28 +55,17 @@ jobs:
         with:
           version: 0.14.1
 
-      - uses: android-actions/setup-android@v3
+      # cross-rs: the aarch64-linux-android container image already carries
+      # the NDK + sane API-level default; no sdkmanager roulette (breaks on
+      # cmdline-tools 16.0: "Dependant package with key emulator not found").
+      - name: install cargo-binstall
+        run: cargo install --locked cargo-binstall
 
-      - name: ensure NDK + configure android linker
-        run: |
-          set -eu
-          # newest NDK: prefer a preinstalled one; else sdkmanager to newest listed
-          ND=$(ls -d "$ANDROID_HOME"/ndk/*/toolchains/llvm/prebuilt/linux-aarch64/bin 2>/dev/null | tail -1 || true)
-          if [ -z "$ND" ]; then
-            CANDID=$(sdkmanager --list 2>/dev/null | grep -oE 'ndk;[0-9]+\.[0-9]+\.[0-9]+' | sort -u | tail -1)
-            test -n "$CANDID" || { echo "::error::sdkmanager lists no NDK"; exit 1; }
-            yes | sdkmanager --install "$CANDID" >/dev/null
-            ND=$(ls -d "$ANDROID_HOME"/ndk/*/toolchains/llvm/prebuilt/linux-aarch64/bin 2>/dev/null | tail -1)
-          fi
-          CLANG="$ND/aarch64-linux-android28-clang"
-          test -x "$CLANG" || { echo "::error::missing $CLANG"; exit 1; }
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG" >> "$GITHUB_ENV"
-          echo "CC_aarch64_linux_android=$CLANG" >> "$GITHUB_ENV"
+      - name: install cross (NDK-in-container android toolchain)
+        run: cargo binstall -y cross
 
       - name: android-target workspace build (sprout + sprout-super for bionic hosts)
-        run: |
-          rustup target add aarch64-linux-android
-          cargo build --release --workspace --target "$ANDROID_TARGET"
+        run: cross build --release --workspace --target "$ANDROID_TARGET"
 
       - name: collect artifacts (android launcher/supervisor + glibc interposer + musl interposer)
         run: |
