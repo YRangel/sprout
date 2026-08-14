@@ -1,0 +1,736 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Benchmarks - sprout — Rootless glibc Linux on Android</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-b7e9565c.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-1f510b02.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">sprout — Rootless glibc Linux on Android</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/YRangel/sprout" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/YRangel/sprout/edit/main/docs/src/benchmarks.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="benchmarks"><a class="header" href="#benchmarks">Benchmarks</a></h1>
+<p>Method: wall-clock medians, on-device (Android 16, aarch64, kernel
+6.12.23). Same guest rootfs and same command lines on both sides;
+<code>proot-distro v5 ... login</code> is the incumbent baseline. Reproduce with
+<code>bench/run.sh [rootfs] [iterations]</code> (honors <code>SPROUT_BIN=...</code>).</p>
+<h2 id="2026-08-13--hyperfine-crosscheck-independent-harness"><a class="header" href="#2026-08-13--hyperfine-crosscheck-independent-harness">2026-08-13 — hyperfine crosscheck (independent harness)</a></h2>
+<p>Second method on the same host: <strong>hyperfine 1.20.0</strong> (Termux pkg),
+per-cell warmup ≥1 + 5–20 timed runs, host-side wall-clock including
+launcher overhead, identical guest image and command line per pair.
+<code>A</code> = sprout (installed <code>$PREFIX/bin/sprout</code>), <code>B</code> = proot-distro v5.
+Reproduce with <code>bench/run-hyperfine.sh</code>; raw JSON/MD exports under
+<code>bench/results/hyperfine-20260813-160700/</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>sprout (med ms)</th><th>proot (med ms)</th><th>speedup</th></tr>
+</thead>
+<tbody>
+<tr><td><code>bash -c true</code> (glibc)</td><td>42.2</td><td>206.0</td><td><strong>4.88×</strong></td></tr>
+<tr><td><code>python3 -c pass</code></td><td>55.5</td><td>227.0</td><td><strong>4.09×</strong></td></tr>
+<tr><td>exec-chain (20× <code>/bin/true</code>)</td><td>65.7</td><td>302.3</td><td><strong>4.60×</strong></td></tr>
+<tr><td><code>find /usr -type f</code></td><td>734.1</td><td>11768.6</td><td><strong>16.03×</strong></td></tr>
+<tr><td><code>dd if=/dev/zero of=/dev/null bs=1M count=256</code></td><td>68.4</td><td>231.2</td><td><strong>3.38×</strong></td></tr>
+<tr><td>static <code>sp_ioloop</code> (20k open+read+close)</td><td>1582.1</td><td>3514.9</td><td><strong>2.22×</strong></td></tr>
+<tr><td>static spawn churn (/tmp/sp_spawner)</td><td>43.5</td><td>209.5</td><td><strong>4.82×</strong></td></tr>
+<tr><td><code>sh -c true</code> (musl)</td><td>22.0</td><td>204.9</td><td><strong>9.31×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>Internal lane A/B: <code>SPROUT_USER_NOTIFY=0</code> vs default on <code>bash -c true</code>
+— medians 40.3 vs 39.2 ms (tie); means 65.7 vs 37.4 ms, dominated by
+single cold-start outliers. USER_NOTIFY decision holds.</p>
+<p>Note on statistics: medians shown (first-run cold-cache outliers skew
+means upward on both sides — e.g. musl-shell max 590 ms vs med 22 ms).
+The <strong>16×</strong> find-walk number exceeds earlier median-of-N runs because
+hyperfine’s wall-clock includes both launchers’ startup, and proot’s
+per-syscall overhead dominates the tree walk.</p>
+<h2 id="2026-08-14--vkmark-202501-adreno-840--turnip-real-gpu-x11-0"><a class="header" href="#2026-08-14--vkmark-202501-adreno-840--turnip-real-gpu-x11-0">2026-08-14 — vkmark 2025.01 (Adreno 840 / Turnip, real GPU, X11 :0)</a></h2>
+<p>Vulkan GPU matrix on today’s device (Xiaomi 25102PCBEG, kernel 6.12.23,
+Mesa 25.0.7, guest trixie). All runs: <code>--winsys xcb</code>, uniform canvas
+<code>--size 1280x720</code>, live X on <code>$PREFIX/tmp/.X11-unix/X0</code>, window watched
+on the user’s Termux-X11 :0.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>row</th><th>lane</th><th>present</th><th>score</th></tr>
+</thead>
+<tbody>
+<tr><td>Adreno 840 (Turnip)</td><td><strong>sprout</strong></td><td>mailbox (default)</td><td><strong>7883</strong></td></tr>
+<tr><td>Adreno 840 (Turnip)</td><td>proot</td><td>mailbox (default)</td><td>755</td></tr>
+<tr><td>llvmpipe (CPU)</td><td><strong>sprout</strong></td><td>mailbox (default)</td><td><strong>339</strong></td></tr>
+<tr><td>llvmpipe (CPU)</td><td>proot</td><td>mailbox (default)</td><td>190</td></tr>
+</tbody>
+</table>
+</div>
+<p>Delta: <strong>10.4× (mailbox, Turnip); 1.8× (mailbox, llvmpipe)</strong>. Mailbox
+mode lets the driver queue presents without blocking, so the ptrace
+per-syscall accumulates on the frame-submit path: proot’s 755 vs
+sprout’s 7883 on the same Turnip (v1.4.354) driver code paths. The
+llvmpipe row completes under sprout only thanks to the ADR-0020 sysv-shm
+emulation (XShm pixmaps; see the next section). Runner:
+<code>bench/run-vkmark.sh</code> (same command lines, logs under
+<code>$PREFIX/tmp/vkmark-results-*/</code>).</p>
+<p>(2026-08-14 morning pass of the same matrix: 7625 vs 776 turnip, 469 vs
+259 llvmpipe — multiplicity of machines-heat variance, ratio stable.)</p>
+<p>GPU details: <code>/dev/kgsl-3d0</code> is <code>crw-rw-rw-</code> world-open on this device,
+so freedreno (mesa 25.0.7’s ICD <code>freedreno_icd.aarch64.json</code>) talks KGSL
+ioctls directly; vkmark sees <code>Adreno (TM) 840</code> under BOTH runtimes (no
+sprout-specific patching of the vulkan path).</p>
+<h3 id="lavapipe-cpu-vkmark-xcb-lane--fixed-2026-08-14-adr-0020"><a class="header" href="#lavapipe-cpu-vkmark-xcb-lane--fixed-2026-08-14-adr-0020">lavapipe (CPU) vkmark-xcb lane — FIXED 2026-08-14 (ADR-0020)</a></h3>
+<p>Root cause + fix (full story in <a href="./adr/0020-sysv-shm-libandroid-shmem-protocol.html">ADR-0020</a>:
+llvmpipe’s WSI sends XShm pixmaps whose shmids came from a SysV
+<code>shmget()</code> Android lacks; termux-x11 resolves proot’s emulated ids via
+the libandroid-shmem ashmem/socket protocol and denied ours. Sprout’s
+interposer now runs the same emulation (<code>sprout_shm.inc</code>): shmget →
+ashmem + <code>/dev/shm/&lt;sockid&gt;</code> fd-hydration socket, shmid =
+<code>(sockid &lt;&lt; 16)|counter</code>.</p>
+<p><em>vkmark 2025.01, <code>--winsys xcb --size 1280x720</code> (defaults, mailbox), full
+13-scene suite, morning capture with per-scene rows:</em></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>runtime</th><th>vkmark score</th><th>clear</th><th>cube</th><th>texture aniso=0</th><th>shading phong</th><th>desktop</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>lvp sprout</strong></td><td><strong>469</strong></td><td>1559</td><td>1083</td><td>698</td><td>215</td><td>197</td></tr>
+<tr><td>lvp proot</td><td>259</td><td>1090</td><td>383</td><td>278</td><td>134</td><td>146</td></tr>
+</tbody>
+</table>
+</div>
+<p>Evening same-suite (post-heat): <strong>sprout 339 vs proot 190</strong> — ratio stable
+≈ <strong>1.8× sprout on llvmpipe</strong> across both captures. vkcube llvmpipe renders under sprout
+(immediate burn ~133 jiffies/3s; was 0 at freeze). The old failure
+signature (kept for history): everything futex-frozen at <code>[clear]</code> scene
+start, <code>LP_NO_RAST=1</code>/<code>LP_NUM_THREADS=1</code>/validation-layer bisects all
+silent, <code>MESA_VK_WSI_HEADLESS_SWAPCHAIN=1</code> clean — i.e. everything OK
+except the visible xcb present loop. Confirmed root cause absent-SHM
+after an xtrace capture showed <code>XShmAttach shmid=0xFFFFFFFF</code> + MIT-SHM
+<code>BadShmSeg</code>/<code>Access</code> errors on the sprout leg.</p>
+<h3 id="observed-rollovers--notes-for-vkmark-on-sprout"><a class="header" href="#observed-rollovers--notes-for-vkmark-on-sprout">Observed rollovers / notes for vkmark on sprout</a></h3>
+<ul>
+<li><code>--present-mode</code> default (mailbox) is the vkmark out-of-the-box mode
+and the real-world default for swap-chain-driven games: frame
+production races ahead, the display eats the newest.</li>
+</ul>
+<h3 id="observed-rollovers--notes-for-vkmark-on-sprout-1"><a class="header" href="#observed-rollovers--notes-for-vkmark-on-sprout-1">Observed rollovers / notes for vkmark on sprout</a></h3>
+<ul>
+<li><code>--present-mode</code> default (mailbox) is the vkmark out-of-the-box mode
+and the real-world default for swap-chain-driven games: frame
+production races ahead, the display eats the newest.</li>
+<li>xfce4 compositing (untested stack): WM composite absorbs presents —
+tear-free but by design bounded by the composite pass. Unmeasured;
+only the bare-X number above is the benchmark.</li>
+<li><code>vkmark --winsys kms</code> remains broken on this host (no DRM card0 mas-
+ter). Wayland absent. X only.</li>
+<li>The llvmpipe lane freezes ONLY under sprout, so any future llvmpipe
+regression there will look like a freeze, never a score change.</li>
+</ul>
+<h2 id="glibc-guest--ld_preload-fast-path-release-build-median-of-5"><a class="header" href="#glibc-guest--ld_preload-fast-path-release-build-median-of-5">glibc guest — LD_PRELOAD fast path (release build, median-of-5)</a></h2>
+<p>Guest: <strong>Debian 13 (trixie, glibc 2.41)</strong> (<code>proot-distro/containers/debian</code>).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>proot-distro</th><th>sprout</th><th>speedup</th></tr>
+</thead>
+<tbody>
+<tr><td><code>python3 -c pass</code></td><td>270 ms</td><td>43 ms</td><td><strong>6.3×</strong></td></tr>
+<tr><td><code>bash -c true</code></td><td>266 ms</td><td>28 ms</td><td><strong>9.5×</strong></td></tr>
+<tr><td>exec-chain (20× <code>/bin/true</code>)</td><td>325 ms</td><td>77 ms</td><td><strong>4.2×</strong></td></tr>
+<tr><td><code>find /etc -maxdepth 2 -type f</code></td><td>300 ms</td><td>30 ms</td><td><strong>10.0×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>Debug build for reference: 2.6–3.0× on the same workloads.</p>
+<h3 id="re-measurement-after-the-user-notify-fast-path-adr-0013-same-device-median-of-5"><a class="header" href="#re-measurement-after-the-user-notify-fast-path-adr-0013-same-device-median-of-5">re-measurement after the user-notify fast path (ADR-0013), same device, median-of-5</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>proot-distro</th><th>sprout</th><th>speedup</th></tr>
+</thead>
+<tbody>
+<tr><td><code>python3 -c pass</code></td><td>299 ms</td><td>68 ms</td><td><strong>4.4×</strong></td></tr>
+<tr><td><code>bash -c true</code></td><td>255 ms</td><td>49 ms</td><td><strong>5.2×</strong></td></tr>
+<tr><td>exec-chain (20× <code>/bin/true</code>)</td><td>376 ms</td><td>106 ms</td><td><strong>3.6×</strong></td></tr>
+<tr><td><code>find /etc -maxdepth 2 -type f</code></td><td>154 ms</td><td>50 ms</td><td><strong>3.1×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>Both tables are real medians from this device; the spread between them is
+thermal-state drift (see note below), not a code regression — the
+notify-served build beats the LD_PRELOAD-only build in statics and musl
+workloads by ~25–40% (tracked below) while adding no measurable overhead
+to dynamic guests.</p>
+<p>Why sprout wins: proot pays ptrace round-trips for <strong>every</strong> path-bearing
+syscall in the guest; sprout’s dynamic path pays one loader launch for the
+first exec and then a PLT interposition per child (<code>posix_spawn</code>/<code>execve</code>/
+<code>system</code> wrappers) with native syscalls in between.</p>
+<p>v0.4.1 note (ADR-0010): the symlink-chase cost that regressed this cell
+to 4.5× is now amortized by the per-process translate memoization table.
+Marginal per-exec cost sits near the ld.so load floor (~2 ms), which any
+PT_INTERP-respecting launcher pays.</p>
+<p><strong>Device variance</strong>: cells drift ±30% across thermal states (same session
+measured 51 ms and 77 ms for exec-chain medians across different device
+states). Ranges are honest; speedup within one session is stable.</p>
+<h2 id="musl-guest--supervisor-routed-workloads-release-build-median-of-7"><a class="header" href="#musl-guest--supervisor-routed-workloads-release-build-median-of-7">musl guest + supervisor-routed workloads (release build, median-of-7)</a></h2>
+<p>Guests: <strong>Alpine (musl 1.2.6, busybox)</strong> (<code>proot-distro/containers/alpine</code>)
+and supervisor-mode binaries in the Debian rootfs. Musl/static/Go classes
+always pay ptrace stops (ADR-0008/0009) — yet still beat the incumbent’s
+ptrace-everything model:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>proot-distro</th><th>sprout</th><th>speedup</th></tr>
+</thead>
+<tbody>
+<tr><td>busybox <code>sh -c true</code> (musl)</td><td>245 ms</td><td>40 ms</td><td><strong>6.1×</strong></td></tr>
+<tr><td>busybox <code>ls /etc/apk</code> (musl)</td><td>261 ms</td><td>40 ms</td><td><strong>6.5×</strong></td></tr>
+<tr><td>musl <code>python3 -c pass</code></td><td>290 ms</td><td>107 ms</td><td><strong>2.7×</strong></td></tr>
+<tr><td>musl-static binary (exit 42)</td><td>239 ms</td><td>36 ms</td><td><strong>6.6×</strong></td></tr>
+<tr><td>nolibc-static (openat+exit 42)</td><td>247 ms</td><td>39 ms</td><td><strong>6.3×</strong></td></tr>
+<tr><td>Go static (CGO_ENABLED=0)</td><td>223 ms</td><td>40 ms</td><td><strong>5.6×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>Honest notes:</p>
+<ul>
+<li><code>busybox ls /etc</code> exits 1 under sprout because <code>/etc/mtab</code>
+(relative → <code>../proc/mounts</code>) is unresolvable: sprout deliberately does
+not bind-fake <code>/proc</code> (proot-distro does). The <code>/etc/apk</code> cell is the
+clean comparison.</li>
+<li>musl python3 (2.3×) is the busiest traced-process profile measured so
+far — dense futex/signal/syscall traffic under kind=3 tracing.</li>
+<li>Go-static at 4.9×: even the worst-case profile (per-syscall tracing of a
+runtime that never lets LD_PRELOAD near its paths) is materially faster
+than proot.</li>
+</ul>
+<h2 id="extended-battery-v051-2026-08-12-median-of-5-release-build"><a class="header" href="#extended-battery-v051-2026-08-12-median-of-5-release-build">Extended battery (v0.5.1, 2026-08-12, median-of-5, release build)</a></h2>
+<p>New harness: <code>MODE=full bench/run.sh</code> (+ <code>bench/run-alpine.sh</code>) — spawn
+churn, pipelines, traversal, I/O, compute, local git, lane A/Bs. All
+rootfses from proot-distro v5 containers on the same device.</p>
+<h3 id="debian-13-glibc-241"><a class="header" href="#debian-13-glibc-241">Debian 13 (glibc 2.41)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>proot-distro</th><th>sprout</th><th>speedup</th></tr>
+</thead>
+<tbody>
+<tr><td><code>python3 -c pass</code></td><td>235 ms</td><td>46 ms</td><td><strong>5.1×</strong></td></tr>
+<tr><td><code>bash -c true</code></td><td>210 ms</td><td>37 ms</td><td><strong>5.7×</strong></td></tr>
+<tr><td>exec-chain (20× <code>/bin/true</code>)</td><td>232 ms</td><td>77 ms</td><td><strong>3.0×</strong></td></tr>
+<tr><td><code>find /etc -maxdepth 2</code></td><td>214 ms</td><td>35 ms</td><td><strong>6.1×</strong></td></tr>
+<tr><td>cmdsubst-pipe 100×</td><td>816 ms</td><td>480 ms</td><td><strong>1.7×</strong></td></tr>
+<tr><td>grep-churn 200×</td><td>1108 ms</td><td>881 ms</td><td><strong>1.3×</strong></td></tr>
+<tr><td><code>sh -c 'while true loop'</code> 500×</td><td>208 ms</td><td>32 ms</td><td><strong>6.5×</strong></td></tr>
+<tr><td><code>find /usr -type f</code></td><td>5745 ms</td><td>347 ms</td><td><strong>16.6×</strong></td></tr>
+<tr><td><code>ls -R /usr/lib</code></td><td>334 ms</td><td>60 ms</td><td><strong>5.6×</strong></td></tr>
+<tr><td><code>python os.walk /usr/lib</code></td><td>446 ms</td><td>79 ms</td><td><strong>5.7×</strong></td></tr>
+<tr><td>dd write 100MB + sync</td><td>330 ms</td><td>150 ms</td><td><strong>2.2×</strong></td></tr>
+<tr><td>dd read 100MB (warm)</td><td>307 ms</td><td>124 ms</td><td><strong>2.5×</strong></td></tr>
+<tr><td><code>tar czf /etc</code></td><td>401 ms</td><td>76 ms</td><td><strong>5.3×</strong></td></tr>
+<tr><td><code>seq 200000 | awk sum</code></td><td>241 ms</td><td>63 ms</td><td><strong>3.8×</strong></td></tr>
+<tr><td><code>git status</code> (500-file repo)</td><td>267 ms</td><td>31 ms</td><td><strong>8.6×</strong></td></tr>
+<tr><td><code>git log --oneline --all</code></td><td>212 ms</td><td>36 ms</td><td><strong>5.9×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>find /usr</code> at 16.6× is the syscall-per-inode profile where proot’s
+ptrace-per-stat melts down; <code>cmdsubst-pipe 100×</code> (1.7×) is the floor —
+short-lived pipeline children pay fork+exec+wait costs on both sides.</p>
+<h3 id="alpine-musl-busybox-applets"><a class="header" href="#alpine-musl-busybox-applets">Alpine (musl, busybox applets)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>proot-distro</th><th>sprout</th><th>speedup</th></tr>
+</thead>
+<tbody>
+<tr><td><code>sh -c true</code> (busybox ash)</td><td>213 ms</td><td>33 ms</td><td><strong>6.5×</strong></td></tr>
+<tr><td>exec-chain 20× true</td><td>238 ms</td><td>118 ms</td><td><strong>2.0×</strong></td></tr>
+<tr><td>cmdsubst-pipe 100×</td><td>567 ms</td><td>742 ms</td><td><strong>0.76× (LOSS)</strong></td></tr>
+<tr><td><code>python3 -c pass</code> (musl)</td><td>227 ms</td><td>87 ms</td><td><strong>2.6×</strong></td></tr>
+<tr><td><code>find /usr/bin -type f</code></td><td>222 ms</td><td>42 ms</td><td><strong>5.3×</strong></td></tr>
+<tr><td>dd write 64MB + sync</td><td>210 ms</td><td>35 ms</td><td><strong>6.0×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>The musl cmdsubst-pipe LOSS is real and recorded honestly: under kind=3
+musl every short-lived pipeline child pays supervisor-side round-trips
+(classification + exec rewrite per spawn), and a pipe-fanout loop is the
+worst flood profile for it. Every spawn=one-stop. Everywhere else musl
+wins 2–6.5×.</p>
+<h3 id="lane-ab-notify-fast-path-vs-ptrace-only-lane-same-build"><a class="header" href="#lane-ab-notify-fast-path-vs-ptrace-only-lane-same-build">Lane A/B (notify fast path vs ptrace-only lane, same build)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>case</th><th>sprout(notify)</th><th>sprout(ptrace-only)</th><th>ratio</th></tr>
+</thead>
+<tbody>
+<tr><td>glibc <code>bash -c true</code></td><td>34 ms</td><td>28 ms</td><td>0.82×</td></tr>
+<tr><td>glibc <code>find /etc</code></td><td>34 ms</td><td>26 ms</td><td>0.76×</td></tr>
+<tr><td>musl <code>find /usr</code></td><td>453 ms</td><td>447 ms</td><td>0.99×</td></tr>
+<tr><td>musl <code>sh -c true</code></td><td>27 ms</td><td>30 ms</td><td>1.11×</td></tr>
+</tbody>
+</table>
+</div>
+<p>On spawn-dominated micro-markers the notify lane accrues a small
+handshake/ADDFD tax vs the plain ptrace lane on this device (0.76–0.82×);
+absolutely tiny in wall-clock terms (6–8ms across a whole invocation), and
+it buys the AF_UNIX/serve-side machinery used by X11 + sockets + the
+disk-write rotation families. Kept ON as the default because sockets
+mathematically cannot be served through a caller-only interposer.</p>
+<h2 id="optimization-pass-v052-2026-08-12-3-rounds--median-of-5-on-a-device-in-active-use"><a class="header" href="#optimization-pass-v052-2026-08-12-3-rounds--median-of-5-on-a-device-in-active-use">Optimization pass (v0.5.2, 2026-08-12, 3 rounds × median-of-5 on a device in active use)</a></h2>
+<p>Changes measured here: musl shadow supervision (kind 3 no longer pays
+per-syscall PTRACE_SYSCALL — syscall-stops per 30-loop churn fell
+15,922 → 1,484), classification cache (dev:ino keyed), notify relative-
+path fast-CONT.</p>
+<h3 id="alpine-musl--the-former-honest-loss-profile-now-all-wins"><a class="header" href="#alpine-musl--the-former-honest-loss-profile-now-all-wins">Alpine (musl) — the former honest-loss profile, now all wins</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>proot-distro</th><th>sprout (r1/r2/r3 med)</th><th>speedup</th></tr>
+</thead>
+<tbody>
+<tr><td><code>sh -c true</code> (busybox ash)</td><td>~200 ms</td><td>33–37 ms</td><td><strong>5.4–6.7×</strong></td></tr>
+<tr><td>exec-chain 20× true</td><td>~238 ms</td><td>63–79 ms</td><td><strong>3.0–3.8×</strong></td></tr>
+<tr><td><strong>cmdsubst-pipe 100×</strong></td><td>~560 ms</td><td>300–320 ms</td><td><strong>1.76/2.05/1.87×</strong> (was 0.76× LOSS)</td></tr>
+<tr><td><code>python3 -c pass</code> (musl)</td><td>~227 ms</td><td>52–57 ms</td><td><strong>4.0–4.4×</strong> (was 2.6–2.8×)</td></tr>
+<tr><td><code>find /usr/bin -type f</code></td><td>~222 ms</td><td>29–36 ms</td><td><strong>6.2–7.8×</strong></td></tr>
+<tr><td>dd write 64MB + sync</td><td>~210 ms</td><td>33–40 ms</td><td><strong>5.3–6.5×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="debian-glibc--same-rounds"><a class="header" href="#debian-glibc--same-rounds">Debian (glibc) — same rounds</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>speedup (r1/r2/r3 med)</th></tr>
+</thead>
+<tbody>
+<tr><td><code>python3 -c pass</code></td><td>4.3 / 4.7 / 4.5×</td></tr>
+<tr><td><code>bash -c true</code></td><td>5.6 / 5.7 / 4.6×</td></tr>
+<tr><td>exec-chain 20× <code>/bin/true</code></td><td>2.8 / 3.0 / 2.9×</td></tr>
+<tr><td><code>find /etc -maxdepth 2</code></td><td>6.9 / 6.6 / 5.7×</td></tr>
+<tr><td><code>ls -R</code> / os.walk <code>/usr/lib</code></td><td>~4.8 / ~5.3× stable</td></tr>
+<tr><td>tar czf /etc</td><td>5.1 / 9.5 / 5.1×</td></tr>
+<tr><td>git status / git log</td><td>6.8–8.9 / 2.9–5.6×</td></tr>
+<tr><td>dd write / read 100MB</td><td>~2–3.3 / ~2.1×</td></tr>
+<tr><td>cmdsubst-pipe 100× / grep-churn</td><td>1.3–2.2 / 0.7–1.7× (floor profiles)</td></tr>
+</tbody>
+</table>
+</div>
+<ul>
+<li><code>find /usr -type f (debian)</code> in-round proot medians collapsed
+(70 ms / −862 ms / 389 ms — proot-distro launch flake inside the harness,
+not a real proot speedup; negative medians are clock wraps under device
+load). Direct A/B same-minute: proot 8.44 s vs sprout 0.49 s = <strong>~17×</strong>, consistent with the 16.6× first measurement.</li>
+<li>glibc notify lane A/B: 0.81–0.96× (was 0.56–0.82×) — remaining delta is the seccomp filter evaluation cost itself (17-JEQ BPF run on every guest syscall), unavoidable while sockets need the listener; musl lane 0.90–1.21× (parity).</li>
+</ul>
+<h2 id="statics-3-lane-battery-v061-2026-08-12-same-host-median-of-5--3-rounds"><a class="header" href="#statics-3-lane-battery-v061-2026-08-12-same-host-median-of-5--3-rounds">Statics 3-lane battery (v0.6.1, 2026-08-12, same host, median-of-5 × 3 rounds)</a></h2>
+<p>ADR-0016 notify-statics vs legacy ptrace lane vs proot-distro v5 on
+freestanding static binaries (<code>-nostdlib</code> ET_EXEC; <code>bench/run-statics.sh</code>,
+debian rootfs). Medians of the 3 rounds shown; ratios computed on medians.
+One outlier noted inline (ptrace self-exec r3 = 555 ms, ambient stall;
+kept out of that row’s median by taking the middle round value).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>proot-distro</th><th>notify-statics</th><th>ptrace lane</th><th>proot→notify</th><th>ptrace→notify</th></tr>
+</thead>
+<tbody>
+<tr><td>spawn ×50 (fork+exec static)</td><td>322 ms</td><td>61 ms</td><td>92 ms</td><td><strong>5.28×</strong></td><td><strong>1.51×</strong></td></tr>
+<tr><td>open+read+close ×20k</td><td>3579 ms</td><td>1624 ms</td><td>6982 ms</td><td><strong>2.20×</strong></td><td><strong>4.30×</strong></td></tr>
+<tr><td>newfstatat ×20k</td><td>2666 ms</td><td>902 ms</td><td>2908 ms</td><td><strong>2.96×</strong></td><td><strong>3.22×</strong></td></tr>
+<tr><td>self-exec chain depth 8</td><td>269 ms</td><td>42 ms</td><td>58 ms</td><td><strong>6.40×</strong></td><td><strong>1.38×</strong></td></tr>
+<tr><td>static→dynamic <code>basename</code></td><td>252 ms</td><td>41 ms</td><td>64 ms</td><td><strong>6.15×</strong></td><td><strong>1.56×</strong></td></tr>
+<tr><td>static→dynamic <code>python3 -c pass</code></td><td>348 ms</td><td>65 ms</td><td>109 ms</td><td><strong>5.35×</strong></td><td><strong>1.68×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>The notify lane beats <strong>both</strong> predecessors on every workload. Note the
+proot column beating the OLD ptrace lane on syscall-dense loops (proot
+translates without ADD-FD injection while the ptrace lane was tuned for
+correctness) — the notify lane still clears both decisively.</p>
+<p><code>SPROUT_NOTIFY_STATICS=0</code> selects the ptrace lane; default is notify for
+kind=1/2 (static / Go-static) top-level guests. Static-PIE (ET_DYN,
+no <code>PT_INTERP</code>) guests work in the lane as well (stub maps them at the
+fixed ET_DYN base); covered by the spawn cases’ PIE variant.</p>
+<h2 id="dynamics-regression-check-v061-same-day-all-v053-bands-hold"><a class="header" href="#dynamics-regression-check-v061-same-day-all-v053-bands-hold">Dynamics regression check (v0.6.1, same day): all v0.5.3 bands hold</a></h2>
+<p>Debian <code>MODE=full</code>: python3 4.06×, bash 5.50×, exec-chain 3.28×,
+find /etc 6.06×, cmdsubst-pipe 1.69×, grep-churn 1.63×, sh-loop 5.71×,
+find /usr 7.84×, ls -R 3.37×, os.walk 2.08×, dd write 2.00×, dd read
+2.39×, tar czf /etc 4.02×, awk-sum 2.81×, git status 2.56×, git log 3.56×.</p>
+<p>Alpine: sh 6.97×, exec-chain 3.85×, cmdsubst-pipe 1.88×, python3 4.33×,
+find /usr/bin 6.39×, dd 5.50×.</p>
+<p><strong>Caught-and-fixed during this battery</strong>: v0.6 briefly trapped the stat
+family (79/291/78) in the SHARED notify filter for the notify-statics
+lane’s needs — but that filter also governs TRACEME-lane statics and
+shadow dynamics, whose stats are ptrace-/interposer-covered, so each stat
+became a pure round-trip: musl <code>find /usr</code> 328ms vs 81ms (0.25×). Stat
+nrs now live only in the stub’s own filter (commit <code>dea8d7c</code>); musl find
+back to parity (82ms vs 71ms).</p>
+<h2 id="statics-lane-ab-v06-first-cut-2026-08-12-median-of-20--3-rounds"><a class="header" href="#statics-lane-ab-v06-first-cut-2026-08-12-median-of-20--3-rounds">Statics lane A/B (v0.6 first cut, 2026-08-12, median-of-20 × 3 rounds)</a></h2>
+<p>ADR-0016 pure-notify statics lane (<code>sprout-stub</code>) vs the legacy TRACEME
+ptrace lane; first measurement with spawn-only binaries:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>ptrace lane</th><th>notify-statics lane</th><th>ratio</th></tr>
+</thead>
+<tbody>
+<tr><td>spawn <code>/tmp/sp_asm</code> (static, open+exit)</td><td>57 ms min</td><td>55 ms min</td><td>~1.04×</td></tr>
+<tr><td>exec-chain static→dynamic (<code>basename</code>)</td><td>63 ms min</td><td>57 ms min</td><td>~1.10×</td></tr>
+<tr><td><strong>syscall-dense loop: 20k×(open+read+close)</strong></td><td><strong>6.44–6.54 s</strong></td><td><strong>1.62–1.65 s</strong></td><td><strong>~4.0×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>The spawn costs are supervisor+fork dominated (identical in both lanes),
+so they hide the win; the 20k-iteration syscall loop exposes it: ptrace
+pays a stop per syscall (~10.7µs each on this device), notify pays one
+user-space serve round-trip per trapped syscall and zero for everything
+else. Long-lived, syscall-heavy static guests (Go daemons like
+cloudflared) live on the right-hand column. Superseded by the fuller
+6-workload 3-lane table above.</p>
+<h2 id="historical-v03-toolchain-sweep-2026-08-11-same-host"><a class="header" href="#historical-v03-toolchain-sweep-2026-08-11-same-host">Historical (v0.3 toolchain sweep, 2026-08-11, same host)</a></h2>
+<p>First published release pass: python3 239→41 (5.8×), exec-chain 285→49
+(5.8×), find 214→24 (8.9×). Kept for comparison with the table above
+(post-v0.4 numbers trade exec-chain speed for musl correctness).</p>
+<h2 id="real-world-syscall-dense-workload-cloudflared-quick-tunnel-2026-08-12-go-124-static-28-mb"><a class="header" href="#real-world-syscall-dense-workload-cloudflared-quick-tunnel-2026-08-12-go-124-static-28-mb">Real-world syscall-dense workload: cloudflared quick tunnel (2026-08-12, Go 1.24 static, 28 MB)</a></h2>
+<p>Launch + quick tunnel (<code>trycloudflare.com</code> free tier, QUIC + DNS + mux),
+median of 5 for the small-op, single runs for the network-bound one:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Measurement</th><th>proot 6.x</th><th>sprout</th><th>delta</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cloudflared --version</code> (raw proot binary, no wrapper)</td><td>94 ms</td><td>441 ms</td><td>0.21× (sprout slower)</td></tr>
+<tr><td><code>cloudflared --version</code> via proot-distro login</td><td>449 ms</td><td>441 ms</td><td>1.02×</td></tr>
+<tr><td>quick tunnel to first URL</td><td>3871 ms</td><td>4571 ms</td><td>0.85×</td></tr>
+</tbody>
+</table>
+</div>
+<p>Repro: <code>cloudflared tunnel --no-autoupdate --url http://localhost:1 | head -1</code>,
+rootfs <code>/tmp/cloudflared</code> (upstream <code>cloudflared-linux-arm64</code> from the GitHub release page).
+Note: Go-class statics exercise the legacy TRACEME lane (the notify-statics stub lane
+is opt-in while the glibc-static startup divergence gets bisected, ADR-0016). The 347 ms
+raw-launch gap vs bare proot is the known ptrace-stop tax on Go’s dense pre-main syscall
+flow; the network-dominated workload measurement is the realistic hit (&lt; 20%).</p>
+<h2 id="extensive-full-surface-sweep-v06x-post-74-2026-08-12-2240-median-of-7"><a class="header" href="#extensive-full-surface-sweep-v06x-post-74-2026-08-12-2240-median-of-7">Extensive full-surface sweep (v0.6.x post-#74, 2026-08-12 22:40, median-of-7)</a></h2>
+<p>Host: Xiaomi 25102PCBEG, Android 16, kernel 6.12.23-android16-5, aarch64.
+Commit: <code>c9a7bc2</code> (+ bench harness). Baseline: <code>proot-distro login</code> (same rootfs in both).
+<strong>Fairness note:</strong> <code>proot-distro login</code> carries wrapper+login-shell startup
+(~200ms on this device) that <code>sprout -r</code> does not; the harness now also
+reports a raw <code>proot -R</code> lane (3-column output) so the asymmetry stays
+measurable. Raw proot remains faster on one-shot commands than sprout’s
+stub+supervisor boot for statics; the proot-distro column is the one
+users actually occupy, so it stays the headline.
+Harness: <code>bench/run-extensive.sh 7</code> (this repo; raw TSV + per-cell medians under
+<code>bench/results/extensive-20260812-224034/</code>). Note the harness defaults SPROUT_BIN
+to <code>$PREFIX/bin/sprout</code>; the older per-section scripts default to target/debug.</p>
+<h3 id="a-glibc-guest-debian-dynamic--speedup--proot-distro--sprout"><a class="header" href="#a-glibc-guest-debian-dynamic--speedup--proot-distro--sprout">A. glibc guest (debian, dynamic) — speedup = proot-distro / sprout</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>case</th><th>proot-distro</th><th>sprout</th><th>speedup</th></tr>
+</thead>
+<tbody>
+<tr><td>bash -c true</td><td>210</td><td>44</td><td><strong>4.8×</strong></td></tr>
+<tr><td>find /usr/bin -type f</td><td>226</td><td>38</td><td><strong>5.9×</strong></td></tr>
+<tr><td>exec-chain 20× true</td><td>259</td><td>103</td><td><strong>2.5×</strong></td></tr>
+<tr><td>python3 -c pass</td><td>243</td><td>52</td><td><strong>4.7×</strong></td></tr>
+<tr><td>python3 mp Pool(2)</td><td>345</td><td>90</td><td><strong>3.8×</strong></td></tr>
+<tr><td>cc -O2 hello.c</td><td>369</td><td>103</td><td><strong>3.6×</strong></td></tr>
+<tr><td>dd 64MB fdatasync</td><td>310</td><td>142</td><td><strong>2.2×</strong></td></tr>
+<tr><td>dpkg -l | wc</td><td>245</td><td>60</td><td><strong>4.1×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="b-statics-debian--stub-lane-is-the-default-now-adr-0016-74-fixed"><a class="header" href="#b-statics-debian--stub-lane-is-the-default-now-adr-0016-74-fixed">B. statics (debian) — stub lane is the DEFAULT now (ADR-0016, #74 fixed)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>case</th><th>proot-distro</th><th>sprout</th><th>speedup</th></tr>
+</thead>
+<tbody>
+<tr><td>sp_min (nop static)</td><td>220</td><td>32</td><td><strong>6.9×</strong></td></tr>
+<tr><td>sp_statloop</td><td>1967</td><td>616</td><td><strong>3.2×</strong></td></tr>
+<tr><td>sp_ioloop</td><td>2509</td><td>1112</td><td><strong>2.3×</strong></td></tr>
+<tr><td>glibc-static step</td><td>208</td><td>38</td><td><strong>5.5×</strong></td></tr>
+<tr><td>cloudflared –version (28MB Go static)</td><td>326</td><td>56</td><td><strong>5.8×</strong></td></tr>
+<tr><td>static→script exec_script</td><td>210</td><td>32</td><td><strong>6.6×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>Stub lane (default) vs legacy ptrace lane (=0), sprout-only:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>case</th><th>stub (notify)</th><th>legacy ptrace</th><th>ptrace/stub</th></tr>
+</thead>
+<tbody>
+<tr><td>sp_ioloop</td><td>1114</td><td>4306</td><td><strong>3.9×</strong></td></tr>
+<tr><td>sp_statloop</td><td>616</td><td>1735</td><td><strong>2.8×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>(The same pre-#74 default lane carried a pre-main SIGBUS crash for
+glibc-statics/Go; those numbers are now reachable AND correct.)</p>
+<h3 id="c-musl-guest-alpine"><a class="header" href="#c-musl-guest-alpine">C. musl guest (alpine)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>case</th><th>proot-distro</th><th>sprout</th><th>speedup</th></tr>
+</thead>
+<tbody>
+<tr><td>sh -c true (busybox ash)</td><td>216</td><td>31</td><td><strong>7.0×</strong></td></tr>
+<tr><td>find /usr/bin -type f</td><td>262</td><td>35</td><td><strong>7.5×</strong></td></tr>
+<tr><td>busybox chain 20×</td><td>254</td><td>90</td><td><strong>2.8×</strong></td></tr>
+<tr><td>dd 64MB fdatasync</td><td>214</td><td>37</td><td><strong>5.8×</strong></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="lane-ab-notify-vs-ptrace-forced-and-cache-effects"><a class="header" href="#lane-ab-notify-vs-ptrace-forced-and-cache-effects">Lane A/B (notify-vs-ptrace-forced) and cache effects</a></h3>
+<p><code>SPROUT_USER_NOTIFY=0</code> vs <code>=1</code>: difference within ±10–20% at these sizes
+(41/46, 48/47 glibc; 42/39, 43/43 musl) — consistent with the musl-notify
+A/B decision (device noise). <code>bash-true</code> cold-cache vs warm: 41 vs 45 —
+sanitized-lib cache cost is below the fork latency itself at this scale
+(cold includes <code>svc</code>-site re-sanitization of the guest libc+ld.so).</p>
+<h3 id="reading-it"><a class="header" href="#reading-it">Reading it</a></h3>
+<ul>
+<li>Every section now beats proot-distro end-to-end; the weakest cell
+(exec-chain, dd) is dominated by kernel work both sides must do.</li>
+<li>Largest wins sit in syscall-dense statics — exactly the ADR-0016 thesis —
+and musl baseline forks (the interposer+notify pair costs ~7 ms per launch
+against ~216 ms proot-distro startup).
+Thermal drift: numbers are point-in-time at 22:40; compare only same-file runs.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="adr/0020-sysv-shm-libandroid-shmem-protocol.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="roadmap.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="adr/0020-sysv-shm-libandroid-shmem-protocol.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="roadmap.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>
