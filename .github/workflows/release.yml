@@ -22,6 +22,14 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@v2
 
+      # arm runner image lacks the native C compiler the build scripts of
+      # sprout-preload/sprout-ptrace spawn (cc::Build -> `cc`); without it
+      # cargo aborts with exit 101 at the first build-script execution.
+      - name: install native C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
       # Smoke: the usual linux-gnu workspace build (keeps this workflow a
       # CI lane too, and produces the GUEST-side glibc interposer .so).
       - run: cargo build --release --workspace
