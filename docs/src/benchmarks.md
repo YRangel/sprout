@@ -57,20 +57,38 @@ so freedreno (mesa 25.0.7's ICD `freedreno_icd.aarch64.json`) talks KGSL
 ioctls directly; vkmark sees `Adreno (TM) 840` under BOTH runtimes (no
 sprout-specific patching of the vulkan path).
 
-### lavapipe (CPU) vkmark-xcb lane: runtime parities NOT reached
+### lavapipe (CPU) vkmark-xcb lane — FIXED 2026-08-14 (ADR-0020)
 
-- proot (`llvmpipe`, fifo): 400x300 `clear` scene completes (60.0 FPS,
-  vsync lock — the CPU lane naturally clamps at 60 with fifo).
-- **sprout (`llvmpipe`, xcb any present-mode)**: freezes at scene-1.
-  Present-path block: `LP_NO_RAST=1` (blank GPU command path) still hangs,
-  `LP_NUM_THREADS=1` (single-thread raster stack) still hangs,
-  validation layers print nothing before the freeze. Same freeze regardless
-  of present mode. vkcube on the very same `llvmpipe` ICD under sprout
-  renders fine in 30s. Blast radius is vkmark's specific present path
-  under sprout's lane (bug candidate: llvmpipe vkmark works under proot,
-  vkcube renders on the same ICD under sprout — debug deferred). Blast
-  radius capped: llvmpipe is CI-grade CPU rendering, nobody games on it.
-  Documented; not a benchmark data point today.
+Root cause + fix (full story in [ADR-0020](./adr/0020-sysv-shm-libandroid-shmem-protocol.md):
+llvmpipe's WSI sends XShm pixmaps whose shmids came from a SysV
+`shmget()` Android lacks; termux-x11 resolves proot's emulated ids via
+the libandroid-shmem ashmem/socket protocol and denied ours. Sprout's
+interposer now runs the same emulation (`sprout_shm.inc`): shmget →
+ashmem + `/dev/shm/<sockid>` fd-hydration socket, shmid =
+`(sockid << 16)|counter`.
+
+*vkmark 2025.01, `--winsys xcb --size 1280x720` (defaults, mailbox), full
+13-scene suite:*
+
+| runtime | vkmark score | clear | cube | texture aniso=0 | shading phong | desktop |
+|---|---|---|---|---|---|---|
+| **lvp sprout** | **469** | 1559 | 1083 | 698 | 215 | 197 |
+| lvp proot | 259 | 1090 | 383 | 278 | 134 | 146 |
+
+**sprout ≈ 1.8× proot on llvmpipe.** vkcube llvmpipe renders under sprout
+(immediate burn ~133 jiffies/3s; was 0 at freeze). The old failure
+signature (kept for history): everything futex-frozen at `[clear]` scene
+start, `LP_NO_RAST=1`/`LP_NUM_THREADS=1`/validation-layer bisects all
+silent, `MESA_VK_WSI_HEADLESS_SWAPCHAIN=1` clean — i.e. everything OK
+except the visible xcb present loop. Confirmed root cause absent-SHM
+after an xtrace capture showed `XShmAttach shmid=0xFFFFFFFF` + MIT-SHM
+`BadShmSeg`/`Access` errors on the sprout leg.
+
+### Observed rollovers / notes for vkmark on sprout
+
+- `--present-mode` default (mailbox) is the vkmark out-of-the-box mode
+  and the real-world default for swap-chain-driven games: frame
+  production races ahead, the display eats the newest.
 
 ### Observed rollovers / notes for vkmark on sprout
 

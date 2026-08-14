@@ -3423,4 +3423,7 @@ void *dlopen(const char *file, int mode) {
     return SP_REAL(dlopen)(p, mode);
 }
 
+/* ADR-0020: sysv-shm emulation (termux libandroid-shmem protocol). */
+#include "sprout_shm.inc"
+
 #endif /* SPROUT_INTERPOSE */

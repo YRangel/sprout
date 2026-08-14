@@ -39,6 +39,7 @@
 - [0017: userspace binfmt adapter (proot -q parity)](./adr/0017-userspace-binfmt-adapter.md)
 - [0018: userspace SysV IPC emulation for box64/box32 guests](./adr/0018-userspace-sysvipc-shim.md)
 - [0019: proot runtime-flag parity (-k/-p/-v/-V/-h/--kill-on-exit/--sysvipc/--ashmem-memfd)](./adr/0019-proot-runtime-flag-parity.md)
+- [0020: sysv-shm emulation via the libandroid-shmem protocol (MIT-SHM/llvmpipe fix)](./adr/0020-sysv-shm-libandroid-shmem-protocol.md)
 
 # Operations
 
