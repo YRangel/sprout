@@ -11,8 +11,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-    env:
-      ANDROID_TARGET: aarch64-linux-android
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -55,39 +53,27 @@ jobs:
         with:
           version: 0.14.1
 
-      # cross-rs: the aarch64-linux-android container image already carries
-      # the NDK + sane API-level default; no sdkmanager roulette (breaks on
-      # cmdline-tools 16.0: "Dependant package with key emulator not found").
-      - name: install cargo-binstall
-        run: cargo install --locked cargo-binstall
+      # ANDROID HOST BINARIES (sprout + sprout-super) CANNOT be linked on
+      # GitHub runners. Proof chain: cargo-zigbuild aborts on
+      # "Malformed zig target abi suffix" for the .28 abi; android-actions/
+      # setup-android's sdkmanager dies on cmdline-tools 16.0 ("Dependant
+      # package with key emulator not found"); cross-rs's x86_64 container
+      # under binfmt-qemu can start but its in-container rustup rejects any
+      # x86_64 toolchain install on the emulated aarch64 host check.
+      # Termux/bionic host binaries MUST be built on-device (the native
+      # build host) or on a self-hosted Termux runner
+      # (.github/workflows/termux-selfhosted.yml). Until a runner is
+      # attached, this release ships guest-side artifacts only
+      # (the two interposer DSOs; the launcher stays an on-device
+      # `cargo build --release` per README).
+      
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.1
 
-      - name: install cross (NDK-in-container android toolchain)
-        run: cargo binstall -y cross
-
-      - name: android-target workspace build (sprout + sprout-super for bionic hosts)
-        run: |
-          # cross images are x86_64 containers (run under binfmt-qemu on the
-          # arm runner and ship their own stable toolchain); our
-          # rust-toolchain.toml pin (1.97.1) makes the in-container rustup
-          # try to fetch 1.97.1-x86_64-* and the qemu host check refuses.
-          # Park the pin for this step only.
-          mv rust-toolchain.toml rust-toolchain.toml.pinned
-          trap 'mv rust-toolchain.toml.pinned rust-toolchain.toml' EXIT
-          # The container is x86_64-under-qemu; a nested rustup call sees the
-          # EMULATED HOST's aarch64 uname and refuses x86_64 toolchain
-          # installs ('may not be able to run on this system'). qemu-user
-          # spoofs uname when QEMU_SET_UNAME=1 is visible in the emulated
-          # process environment; cross forwards it via this passthrough list.
-          export CROSS_CONTAINER_ENV_PASSTHROUGH=QEMU_SET_UNAME
-          export QEMU_SET_UNAME=1
-          cross build --release --workspace --target "$ANDROID_TARGET"
-
-      - name: collect artifacts (android launcher/supervisor + glibc interposer + musl interposer)
+      - name: collect artifacts (glibc + musl guest interposers)
         run: |
           mkdir -p dist
-          cp target/$ANDROID_TARGET/release/sprout dist/sprout
-          sup=$(find target/$ANDROID_TARGET/release/build/sprout-ptrace-*/out -name sprout-super | head -1)
-          test -n "$sup" && cp "$sup" dist/sprout-super
           so=$(find target/release/build/sprout-preload-*/out -name libsprout-core.so | head -1)
           test -n "$so" && cp "$so" dist/libsprout-core.so
           # musl guest interposer: zig cc against alpine-linux-musl
@@ -97,9 +83,9 @@ jobs:
             -o dist/libsprout-core-musl.so \
             crates/sprout-preload/csrc/sprout_preload.c -ldl
           chmod 0755 dist/* || true
-          tar -C dist -cJf dist/sprout-aarch64-termux.tar.xz \
-            sprout sprout-super libsprout-core.so libsprout-core-musl.so
-          cd dist && sha256sum sprout sprout-super libsprout-core.so libsprout-core-musl.so sprout-aarch64-termux.tar.xz > SHA256SUMS
+          tar -C dist -cJf dist/sprout-guest-interposers-aarch64.tar.xz \
+            libsprout-core.so libsprout-core-musl.so
+          cd dist && sha256sum libsprout-core.so libsprout-core-musl.so sprout-guest-interposers-aarch64.tar.xz > SHA256SUMS
 
       # Fail loudly rather than ship silent garbage: ELF kinds plus the
       # interposer's ADR-0020 shm interpose must be present in both flavors
@@ -110,8 +96,6 @@ jobs:
           file dist/*
           nm -D dist/libsprout-core.so | grep -qE ' T shmget' || { echo 'glibc interposer missing shm interpose (ADR-0020)'; exit 1; }
           nm -D dist/libsprout-core-musl.so | grep -qE ' T shmget' || { echo 'musl interposer missing shm interpose (ADR-0020)'; exit 1; }
-          # android binaries must not drag glibc: check dynamic section for libc.so
-          objdump -p dist/sprout | grep -E 'NEEDED.*libc' || : ; echo 'android-binaries-linked (bionic target) check done'
           echo OK: dist verified
 
       - uses: softprops/action-gh-release@v2
@@ -123,7 +107,7 @@ jobs:
       - uses: actions/upload-artifact@v5
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          name: sprout-aarch64-termux
+          name: sprout-guest-interposers
           path: dist/*
           retention-days: 30
 

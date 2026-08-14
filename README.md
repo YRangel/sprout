@@ -27,24 +27,29 @@ cargo build --release          # needs: pkg install rust (pinned toolchain)
 ./install.sh --verify          # places sprout into $PREFIX/bin, verifies hashes
 ```
 
-### No Rust toolchain? Use the prebuilt binaries
+### Faster install: prebuilt guest interposers
 
-Tagged releases ship Termux-ready aarch64 binaries (built by the release CI
-with cargo-zigbuild against bionic; musl flavor compiled with zig cc):
+Tagged releases ship the two **guest-side** interposer DSOs from CI
+(`libsprout-core.so` + `libsprout-core-musl.so`; SHA256SUMS + tarball).
+The **host-side** binaries (`sprout`, `sprout-super`) link against Android's
+bionic and cannot be produced by GitHub-hosted runners — every cross route
+(cargo-zigbuild abi suffix, setup-android sdkmanager on cmdline-tools 16.0,
+cross-rs x86 container under qemu) failed structurally; the intended
+production lane is a self-hosted Termux runner (`.github/workflows/
+termux-selfhosted.yml`). Until then: `cargo build --release` on the device
+is the launcher install path.
 
 ```sh
+# optional: prebuilt guest interposers (then cargo build only covers host .so)
 cd $PREFIX/tmp
-curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout
-curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-super
-curl -sLO https://github.com/YRangel/sprout/releases/latest/download/libsprout-core.so
-curl -sLO https://github.com/YRangel/sprout/releases/latest/download/libsprout-core-musl.so
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-guest-interposers-aarch64.tar.xz
 curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS
+tar -xf sprout-guest-interposers-aarch64.tar.xz
 sha256sum --ignore-missing -c SHA256SUMS
-chmod +x sprout sprout-super
-cp sprout sprout-super libsprout-core.so libsprout-core-musl.so $PREFIX/bin/
+cp libsprout-core.so libsprout-core-musl.so $PREFIX/bin/
+# then:
+cd sprout && cargo build --release && ./install.sh --verify
 ```
-
-(one tarball also available as `sprout-aarch64-termux.tar.xz`)
 
 Then run anything:
 
