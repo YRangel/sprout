@@ -34,10 +34,9 @@ Tagged releases ship the two **guest-side** interposer DSOs from CI
 The **host-side** binaries (`sprout`, `sprout-super`) link against Android's
 bionic and cannot be produced by GitHub-hosted runners — every cross route
 (cargo-zigbuild abi suffix, setup-android sdkmanager on cmdline-tools 16.0,
-cross-rs x86 container under qemu) failed structurally; the intended
-production lane is a self-hosted Termux runner (`.github/workflows/
-termux-selfhosted.yml`). Until then: `cargo build --release` on the device
-is the launcher install path.
+cross-rs x86 container under qemu) failed structurally. The install path
+for the host binaries is on-device: `cargo build --release &&
+./install.sh --verify`.
 
 ```sh
 # optional: prebuilt guest interposers (then cargo build only covers host .so)
