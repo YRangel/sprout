@@ -2173,6 +2173,11 @@ int stat(const char *path, struct stat *st) {
     return rc;
 }
 
+#if defined(__GLIBC__)
+/* The *64 transitional family (fstat64/fstatat64/stat64/lstat64) is a
+ * glibc ABI: musl does not provide struct stat64 nor these symbols, so
+ * guard the whole block. */
+
 /* fstat64: no path to translate, only the ownership spoof contract. */
 int fstat64(int fd, struct stat64 *st) {
     static int (*SP_REAL(fstat64))(int, struct stat64 *) = NULL;
@@ -2241,6 +2246,7 @@ int lstat64(const char *path, struct stat64 *st) {
     if (rc == 0) { sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid); if (sp_hreg_hit(path) && ((struct stat *)st)->st_nlink == 1) ((struct stat *)st)->st_nlink = 2; }
     return rc;
 }
+#endif /* __GLIBC__ */
 
 
 ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
