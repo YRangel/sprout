@@ -39,8 +39,10 @@ sprout -r $B /usr/bin/curl -fsSL -o /tmp/x https://example.com/file
 
 Verified: cowsay run, node--binaries execute, Go run, static / musl /
 Go-static / Go-dynamic binaries, X11 (termux-x11) handshake, cloudflared
-static binary executing. Unsupported host GPU nodes/devices stay
-SELinux-blocked, same as proot-distro.
+static binary executing, and full vkmark 2025.01 suites on both Adreno-840
+Turnip (native; ≈10.4× proot-distro) and llvmpipe (≈1.8×) — see
+`bench/run-vkmark.sh`. On devices whose SELinux blocks `/dev/kgsl-3d0`,
+GPU access gates/fallbacks keep behaving exactly like proot-distro.
 
 Semantics match proot (`-r -b -w -0 --link2symlink`) plus `--shared-tmp`,
 `--termux-x11` (DISPLAY/PULSE preset — sprout itself never invents those

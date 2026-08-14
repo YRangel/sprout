@@ -12,7 +12,7 @@ fallback lanes for static/Go binaries (ptrace supervisor, or the pure-notify
 MIT OR Apache-2.0. Every architectural decision documented in ADRs.
 
 - **Docs**: `docs/src` (mdBook — `cd docs && mdbook build`)
-- **Benchmarks**: `docs/src/benchmarks.md` (median-of-N + hyperfine crosscheck)
+- **Benchmarks**: `docs/src/benchmarks.md` (vkmark GPU/CPU suites + syscall hyperfine pairs)
 - **GitHub**: <https://github.com/YRangel/sprout>
 
 ## Quick start
@@ -50,19 +50,22 @@ Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
   --termux-x11 --kill-on-exit --dry-run`; ADR-0019 parity flags:
   `-k/--kernel-release` (uname release spoof), `-p/--port-mapping`
   (bind(2) ports <1024 -> 1024+p), `-v [LEVEL]`, `-V` (version+license
-  banner), `-h` (usage), `--sysvipc` (accepted no-op: always-on per
-  ADR-0018), `--ashmem-memfd` (memfd_create fallback to /dev/ashmem +
-  fstat st_size simulation).
+  banner), `-h` (usage), `--sysvipc` (accepted no-op: emulation always-on
+  per ADR-0018 + ADR-0020), `--ashmem-memfd` (memfd_create fallback to
+  /dev/ashmem + fstat st_size simulation).
 - **-q / x86 emulation without root**: userspace binfmt adapter (ADR-0017)
   sniffs x86_64/i386 ELFs at exec and routes them through a guest emulator
   (`/usr/local/bin/box64` by default; set `SPROUT_BINFMT_X86_64` /
   `SPROUT_BINFMT_I386`, or `-q PATH`); `SPROUT_BINFMT_ALWAYS=1` wraps every
   exec proot-`-q`-style for whole-rootfs emulation.
-- **SysV IPC for x86+binfmt guests** (steam's live runtime): guest-ABI
-  `libsprout-sysvipc.so` is injected into `BOX64_LD_PRELOAD` of every wrapped
-  exec, emulating `semget/semop/semctl/shm*` in userspace against a shared
-  `/tmp/sprout-sysvipc` backing dir (ADR-0018). Needed because stock Android
-  GKI ships `CONFIG_SYSVIPC=n`; disable with `SPROUT_SYSVIPC_OFF=1`.
+- **SysV IPC, userspace-emulated (Android has none)**: for native guests,
+  `libsprout-core.so` interposes `shmget/shmat/shmdt/shmctl` using the termux
+  libandroid-shmem wire contract (ashmem segments + `/dev/shm/<sockid>`
+  SCM_RIGHTS fd-hydration; ADR-0020) — that makes mesa's XShm present path
+  work, un-freezing llvmpipe Vulkan/GL under termux-x11. For x86+binfmt
+  guests (steam's live runtime), a guest-ABI `libsprout-sysvipc.so` injected
+  into `BOX64_LD_PRELOAD` additionally emulates `semget/semop/semctl/shm*`
+  (ADR-0018). Both disable with `SPROUT_SYSVIPC_OFF=1`.
 - **Environment policy**: never invents vars; `HOME` defaults guest when you ask
   to live inside; `--termux-x11` is the explicit preset for GUI sessions.
 - **Reproducible batteries**: `bench/flags-matrix.sh` (34 cells),
@@ -73,7 +76,8 @@ Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
 
 Issues welcome: <https://github.com/YRangel/sprout/issues>. If sprout can be
 observably falsified by a workload that worked under proot, the harness to
-prove it is usually `bench/run-statics.sh` or `bench/run-hyperfine.sh`.
+prove it is usually `bench/run-statics.sh`, `bench/run-hyperfine.sh` or
+(GUI/GPU regressions) `bench/run-vkmark.sh`.
 
 ## Project layout
 
@@ -88,11 +92,22 @@ docs/             mdBook — user guide, architecture, ADRs, benchmarks
 install.sh        install/self-verify (<10 s)
 ```
 
+## Benchmarks (vkmark 2025.01, 1280x720, default present mode, live X11)
+
+| lane | sprout | proot-distro | delta |
+|------|--------|--------------|-------|
+| Adreno 840 (Turnip, real GPU) | **7883** | 755 | **10.4×** |
+| llvmpipe (CPU / XShm)         | **339**  | 190 | **1.8×**  |
+
+Repro: `bench/run-vkmark.sh`. Full per-scene tables + old hyperfine pairs
+(4.88×–16.03× on syscall-heavy workloads) in `docs/src/benchmarks.md`.
+
 ## Status
 
-Post-v0.1: glibc guest shells, static/Go binaries, musl, apt/apk, X11 desktop
-and Firefox ESR all work on-device; performance beats proot-distro on every
-published cell. See **Roadmap** in `docs/src/roadmap.md` for what's next.
+Post-v0.1: glibc guest shells, static/Go binaries, musl, apt/apk, X11 desktop,
+Firefox ESR and GPU-rendered Vulkan (Turnip native + llvmpipe via ADR-0020
+sysv-shm emulation) all work on-device; performance beats proot-distro on
+every published cell. See **Roadmap** in `docs/src/roadmap.md` for what's next.
 
 ## License
 

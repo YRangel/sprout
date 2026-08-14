@@ -15,7 +15,8 @@ OUT=${OUT:-$PREFIX/tmp/vkmark-results-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"
 
 run() { # $1 label $2 launcher $3 icd
-    local label=$1 launcher=$2 icd=$3 log=$OUT/$label.log
+    local label=$1 launcher=$2 icd=$3
+    local log="$OUT/$label.log"
     local winsys="--winsys xcb --size $SIZE"
     [ -n "$PM" ] && winsys="$winsys --present-mode $PM"
     echo "== $label ($icd) ==" | tee -a "$OUT/SUMMARY"
@@ -31,10 +32,9 @@ run() { # $1 label $2 launcher $3 icd
 
 run sprout-turnip  sprout /usr/share/vulkan/icd.d/freedreno_icd.aarch64.json
 run proot-turnip   proot  /usr/share/vulkan/icd.d/freedreno_icd.aarch64.json
+run sprout-lvp     sprout /usr/share/vulkan/icd.d/lvp_icd.json
+run proot-lvp      proot  /usr/share/vulkan/icd.d/lvp_icd.json
 echo
 echo "--- summary ---"
 cat "$OUT/SUMMARY"
 echo "(logs: $OUT)"
-echo
-echo "note: llvmpipe (CPU) lane hangs under sprout's vkmark-xcb present path"
-echo "      (bug candidate; proot lane works). See docs/src/benchmarks.md."

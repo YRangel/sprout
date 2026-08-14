@@ -19,6 +19,12 @@ for static/Go binaries and a pure-notify stub lane for AArch64 statics.
   the guest (e.g. Mesa built natively for Turnip GPU bring-up)
 - Static and Go binaries (ptrace supervisor, or pure USER_NOTIFY stub lane)
 - Two rootfs flavors: glibc (Debian) and musl (Alpine)
+- Vulkan visible-present workloads on Turnip (real Adreno GPU) AND llvmpipe
+  (software/XShm) under termux-x11 — vkmark head-to-head benchmarks favor
+  sprout on both (see [Benchmarks](./benchmarks.md)).
+- x86_64/i386 guests via the userspace binfmt adapter (box64/box32), with
+  SysV semaphores emulated for the steam chain (ADR-0017 + ADR-0018) and
+  SysV shared memory emulated for native guests (ADR-0020).
 
 ## Why not proroot?
 

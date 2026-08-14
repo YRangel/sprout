@@ -47,24 +47,27 @@ additional flags are needed.
 
 ## GPU: what is and isn't possible
 
-Rootless guests on Android cannot reach the graphics driver device:
+Whether a rootless guest can reach the real GPU depends on the device's
+node permissions and SELinux policy:
 
 | device node | owner | accessible to Termux? |
 |-------------|-------|-----------------------|
-| `/dev/kgsl-3d0` (Adreno)  | root/kgsl | **no** — SELinux blocks non-system apps |
+| `/dev/kgsl-3d0` (Adreno)  | root/kgsl | **device-dependent**: SELinux blocks it on most devices, but on the Xiaomi 25102PCBEG (kernel 6.12.23) it is `crw-rw-rw-` world-open |
 | `/dev/mali0` (Mali)      | root     | **no** |
 | `/dev/dri/renderD128`    | —        | doesn't exist on Android |
 
-So **direct GPU passthrough is impossible without root** — for proot, for
-sprout, for any userspace container. What proot-distro and Termux actually
-use today is a *host-rendered, socket-shipped* pipeline, which sprout
-reproduces socket-for-socket:
+Where the node is open (this device), freedreno/Turnip Vulkan runs **native
+inside the sprout guest** — no sprout-specific patching; vkmark head-to-head
+scores on the Adreno 840 show sprout ≈ **10.4× proot-distro**
+(mailbox, 1280x720; [Benchmarks](../benchmarks.md)). Where SELinux forbids
+it, the fallbacks below still hold:
 
 | path | mechanism | sprout support |
 |------|-----------|----------------|
-| **llvmpipe / softpipe** (Mesa software GL) | pure userspace in the guest | works out of the box |
+| **freedreno / Turnip Vulkan** (Kgsl ioctl path) | direct GPU device | works natively where `/dev/kgsl-3d0` is open (this device: yes) |
+| **llvmpipe / softpipe** (Mesa software GL **and Vulkan** incl. visible XShm present) | pure userspace in the guest | works (`shmget` et al. emulated per ADR-0020) |
 | **VirGL / virpipe** (host virglrenderer renders GLES on the Adreno/Mali host driver, guest gets `virtio-gpu`) | unix socket in `$PREFIX/tmp` | `--shared-tmp` carries it; guest needs `GALLIUM_DRIVER=virpipe` and Mesa with virgl (Debian class) |
-| **Zink-on-Turnip / Freedreno via Kgsl** | needs `/dev/kgsl-3d0` | **not possible** rootless; blocked by SELinux, not by sprout |
+| **Zink-on-Turnip / Freedreno via Kgsl (GL)** | needs `/dev/kgsl-3d0` | works only where Kgsl is open (same gate as above) |
 
 A working guest-side GL setup (verified with glxinfo + glxgears from x11-app):
 

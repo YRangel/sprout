@@ -42,15 +42,24 @@ Mesa 25.0.7, guest trixie). All runs: `--winsys xcb`, uniform canvas
 `--size 1280x720`, live X on `$PREFIX/tmp/.X11-unix/X0`, window watched
 on the user's Termux-X11 :0.
 
-| row | lane | present | score | per-scene FPS range |
-|-----|------|---------|-------|---------------------|
-| Adreno 840 (Turnip) | **sprout** | mailbox (default) | **7625**  | 5312–9085 |
-| Adreno 840 (Turnip) | proot   | mailbox (default)            | 776       | 620–839   |
+| row | lane | present | score |
+|-----|------|---------|-------|
+| Adreno 840 (Turnip) | **sprout** | mailbox (default) | **7883** |
+| Adreno 840 (Turnip) | proot   | mailbox (default)            | 755       |
+| llvmpipe (CPU) | **sprout** | mailbox (default) | **339** |
+| llvmpipe (CPU) | proot   | mailbox (default)            | 190       |
 
-Delta: **9.8× (mailbox)**. Mailbox mode lets the driver queue presents
-without blocking, so the ptrace per-syscall accumulates on the frame-
-submit path: proot's 776 vs sprout's 7625 on the same Turnip (v1.4.354)
-driver code paths.
+Delta: **10.4× (mailbox, Turnip); 1.8× (mailbox, llvmpipe)**. Mailbox
+mode lets the driver queue presents without blocking, so the ptrace
+per-syscall accumulates on the frame-submit path: proot's 755 vs
+sprout's 7883 on the same Turnip (v1.4.354) driver code paths. The
+llvmpipe row completes under sprout only thanks to the ADR-0020 sysv-shm
+emulation (XShm pixmaps; see the next section). Runner:
+`bench/run-vkmark.sh` (same command lines, logs under
+`$PREFIX/tmp/vkmark-results-*/`).
+
+(2026-08-14 morning pass of the same matrix: 7625 vs 776 turnip, 469 vs
+259 llvmpipe — multiplicity of machines-heat variance, ratio stable.)
 
 GPU details: `/dev/kgsl-3d0` is `crw-rw-rw-` world-open on this device,
 so freedreno (mesa 25.0.7's ICD `freedreno_icd.aarch64.json`) talks KGSL
@@ -68,14 +77,15 @@ ashmem + `/dev/shm/<sockid>` fd-hydration socket, shmid =
 `(sockid << 16)|counter`.
 
 *vkmark 2025.01, `--winsys xcb --size 1280x720` (defaults, mailbox), full
-13-scene suite:*
+13-scene suite, morning capture with per-scene rows:*
 
 | runtime | vkmark score | clear | cube | texture aniso=0 | shading phong | desktop |
 |---|---|---|---|---|---|---|
 | **lvp sprout** | **469** | 1559 | 1083 | 698 | 215 | 197 |
 | lvp proot | 259 | 1090 | 383 | 278 | 134 | 146 |
 
-**sprout ≈ 1.8× proot on llvmpipe.** vkcube llvmpipe renders under sprout
+Evening same-suite (post-heat): **sprout 339 vs proot 190** — ratio stable
+≈ **1.8× sprout on llvmpipe** across both captures. vkcube llvmpipe renders under sprout
 (immediate burn ~133 jiffies/3s; was 0 at freeze). The old failure
 signature (kept for history): everything futex-frozen at `[clear]` scene
 start, `LP_NO_RAST=1`/`LP_NUM_THREADS=1`/validation-layer bisects all

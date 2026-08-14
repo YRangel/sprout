@@ -28,7 +28,7 @@ is a no-op. The table is sorted by how `proot-distro login` uses flags.
 | `-V` | `-V` | ✅ banner + copyright/license/contact |
 | `-h` | `-h` | ✅ auto-clap usage |
 | `--kill-on-exit` | `--kill-on-exit` | ✅ v1 : env-tag sweep over /proc (bare lanes belt; supervisor lineage-kill always runs) |
-| `--sysvipc` | `--sysvipc` | ✅ accepted (semantic no-op; ADR-0018 is always-on under box64/box32) |
+| `--sysvipc` | `--sysvipc` | ✅ accepted (semantic no-op; SysV IPC emulated always-on: ADR-0020 shm for native guests, ADR-0018 sem/shm for box64/box32) |
 | `--ashmem-memfd` | `--ashmem-memfd` | ✅ preload memfd_create fallback + fstat st_size sim |
 | `-p` | `-p` / `--port-mapping` | ✅ preload bind remap, ports <1024 -> 1024+port |
 | `--help` / `--version` | same | ✅ |
@@ -102,7 +102,8 @@ sprout -r $ROOTFS /usr/bin/python3 ...   # any tool
 ```
 
 sprout still needs no special flags to import proot-distro environments;
-`--sysvipc` is a semantic no-op lens on ADR-0018's always-on emulation,
+`--sysvipc` is a semantic no-op lens on the always-on emulation of
+ADR-0020 (native shm) + ADR-0018 (binfmt-lane sem/shm),
 and the loader chain plus the interposer handle everything the dynamic
 fast path covers (static binaries route
 through the supervisor automatically).
@@ -123,7 +124,7 @@ proot-distro bind-mounts from its own `sysdata/`).
 | `--link2symlink` | `--link2symlink` | |
 | `proot-distro login --shared-tmp` | `--shared-tmp` | binds `$PREFIX/tmp` → guest `/tmp`; carries X11/Wayland/VirGL sockets |
 | proot-distro login profile's `DISPLAY`/`PULSE_SERVER` exports | `--termux-x11` (opt-in) | presets `DISPLAY=:0` (when a `/tmp` bind exists) + `PULSE_SERVER=127.0.0.1`; without the flag sprout only inherits host-set values |
-| proot bind of host `/dev/*` | `-b /dev/...` | only pseudo files (`/dev/null`, `/dev/urandom`); **real device nodes (kgsl/mali) are SELinux-blocked for ALL unprivileged apps, proot included** |
+| proot bind of host `/dev/*` | `-b /dev/...` | real device nodes are SELinux-blocked *on most devices*; on the Xiaomi 25102PCBEG `/dev/kgsl-3d0` is world-open, and sprout's `-b /dev/kgsl-3d0` (or the default `/dev` visibility) gives guests native freedreno/Turnip Vulkan (vkmark ≈ 10.4× proot) |
 | proot's fake `/proc` files | — (not implemented) | sprout passes the host `/proc` variant through; doc'd divergence |
 
 
