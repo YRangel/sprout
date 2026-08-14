@@ -19,7 +19,13 @@ use sprout_core::{
 /// Runs guest binaries through `LD_PRELOAD` path translation with an
 /// automatic ptrace fallback for static/Go binaries (v0.3).
 #[derive(Debug, Parser)]
-#[command(name = "sprout", version, about, long_about = None)]
+#[command(
+    name = "sprout",
+    version,
+    long_version = concat!(env!("CARGO_PKG_VERSION"), "\nCopyright (c) 2026 sprout contributors\nLicense: MIT OR Apache-2.0 (dual).\nGitHub: https://github.com/YRangel/sprout"),
+    about,
+    long_about = None
+)]
 struct Cli {
     /// Guest root directory (the "fake chroot").
     #[arg(short = 'r', long = "rootfs", value_name = "PATH")]
@@ -123,17 +129,60 @@ struct Cli {
     dry_run: bool,
 
     /// Log every path translation to stderr.
-    #[arg(short = 'v', long = "verbose", default_value_t = false)]
-    verbose: bool,
+    /// proot parity: level-capable (-v -v or -v 3 accepted; levels beyond 1
+    /// are reserved — the interposer has a single trace depth today).
+    #[arg(short = 'v', long = "verbose", num_args = 0..=1,
+          default_missing_value = "1", value_name = "LEVEL")]
+    verbose: Option<u32>,
 
     /// Command and arguments, guest-spelled.
     #[arg(
         value_name = "COMMAND [ARGS...]",
         trailing_var_arg = true,
-        allow_hyphen_values = true,
-        required = true
+        allow_hyphen_values = true
     )]
     cmd: Vec<OsString>,
+
+    /// proot --kill-on-exit parity: kill launched processes when the
+    /// command exits. Mechanism: tag the child env (SPROUT_KILL_TAG=<pid>);
+    /// at exit sweep /proc for processes whose environ contains the tag
+    /// (env survives exec through the whole guest session) and SIGKILL
+    /// them. Inherit-only: processes that launched OUTSIDE our session
+    /// (e.g. a steam daemon that forked from a DIFFERENT sprout run)
+    /// are not swept — documented as the v1 honest envelope.
+    #[arg(long = "kill-on-exit", default_value_t = false)]
+    kill_on_exit: bool,
+
+    /// proot -k parity: make `uname(2)` report RELEASE as the guest kernel
+    /// release. Handle via the preload interposer's uname wrapper, which
+    /// swaps uts.release post-syscall — applies across every exec because
+    /// env var SPROUT_KERNEL_RELEASE is pushed through the chain merge.
+    #[arg(short = 'k', long = "kernel-release", value_name = "RELEASE")]
+    kernel_release: Option<String>,
+
+    /// proot -p parity: make bind(2) on privileged ports (<1024) use the
+    /// unprivileged higher port 1024+port instead. Android denies
+    /// CAP_NET_BIND_SERVICE to app uids; proot-distro users needed this
+    /// for guest servers to start at all. Rewritten in the preload bind
+    /// wrapper for AF_INET/AF_INET6 only.
+    #[arg(short = 'p', long = "port-mapping", default_value_t = false)]
+    port_mapping: bool,
+
+    /// proot --sysvipc compatibility acceptance flag: sprout's sysvipc
+    /// emulation (ADR-0018) is ALWAYS on for x86/box64 lanes (the kernel
+    /// never carries CONFIG_SYSVIPC), toggled by SPROUT_SYSVIPC_OFF=1.
+    /// This flag exists so proot-distro-style command lines parse cleanly;
+    /// it is a documented semantic no-op.
+    #[arg(long = "sysvipc", default_value_t = false)]
+    sysvipc_compat: bool,
+
+    /// proot --ashmem-memfd parity: preload memfd_create() wrapper tries
+    /// the native syscall first, and only on ENOSYS falls back to
+    /// /dev/ashmem (ASHMEM_SET_NAME + SET_SIZE ioctls from K&R history;
+    /// proot stores the size ashmem cannot put in fstat; we replicate by
+    /// patching st_size = lseek-end for the tracked fd ring).
+    #[arg(long = "ashmem-memfd", default_value_t = false)]
+    ashmem_memfd: bool,
 }
 
 extern "C" {
@@ -202,6 +251,11 @@ fn run() -> Result<u8, Error> {
         rootfs.root.join("tmp").display()
     ))?);
 
+    if cli.cmd.is_empty() {
+        eprintln!("sprout: COMMAND is required (try 'sprout -r <rootfs> --help')");
+        std::process::exit(2);
+    }
+    let verbose = cli.verbose.unwrap_or(0) > 0;
     let mut program_name = cli.cmd[0].to_string_lossy().into_owned();
     let mut program_host = rootfs.find_program(&program_name)?;
     /* Symlink-forest guests (Alpine: every applet -> /bin/busybox) must be
@@ -408,7 +462,7 @@ fn run() -> Result<u8, Error> {
                         program_host,
                         &program_name,
                         &cli.cmd[1..],
-                        cli.verbose,
+                        verbose,
                         preload_so,
                         &cache_dir,
                     )?;
@@ -425,7 +479,7 @@ fn run() -> Result<u8, Error> {
                         program_host,
                         &full_cmd,
                         preload_so,
-                        cli.verbose,
+                        verbose,
                         &cache_dir,
                     )?;
                     LaunchPlan::supervise(pre, supervisor)
@@ -443,7 +497,7 @@ fn run() -> Result<u8, Error> {
                         program_host,
                         &full_cmd,
                         preload_so,
-                        cli.verbose,
+                        verbose,
                         &cache_dir,
                     )?;
                     LaunchPlan::supervise(pre, supervisor)
@@ -458,7 +512,7 @@ fn run() -> Result<u8, Error> {
                         program_host,
                         &full_cmd,
                         preload_so,
-                        cli.verbose,
+                        verbose,
                         &cache_dir,
                     )?;
                     LaunchPlan::supervise(pre, supervisor)
@@ -470,7 +524,7 @@ fn run() -> Result<u8, Error> {
                         program_host,
                         &program_name,
                         &cli.cmd[1..],
-                        cli.verbose,
+                        verbose,
                         preload_so,
                         &cache_dir,
                     )?;
@@ -498,7 +552,7 @@ fn run() -> Result<u8, Error> {
             program_host,
             &full_cmd,
             preload_so,
-            cli.verbose,
+            verbose,
             &cache_dir,
         )?;
         /* SHADOW SUPERVISION (ADR-0012): interposed glibc processes make
@@ -523,11 +577,6 @@ fn run() -> Result<u8, Error> {
         }
     };
 
-    if cli.dry_run {
-        eprintln!("{}", plan.explain());
-        return Ok(0);
-    }
-
     let mut plan = plan;
     /* Static binaries launched from INSIDE the preload interposer must
      * route through the supervisor (the interposer can't seccomp-emulate
@@ -540,8 +589,82 @@ fn run() -> Result<u8, Error> {
         }
     }
 
+    /* proot-flag parity env (ADR-0019). The interposer reads these; the
+     * env is inherited through the whole exec chain, so descendants see
+     * them without further flag plumbing. */
+    if let Some(rel) = &cli.kernel_release {
+        plan.env.push(("SPROUT_KERNEL_RELEASE".into(), rel.clone()));
+    }
+    if cli.port_mapping {
+        plan.env.push(("SPROUT_PORTMAP".into(), "1".into()));
+    }
+    if cli.ashmem_memfd {
+        plan.env.push(("SPROUT_ASHMEM_MEMFD".into(), "1".into()));
+    }
+    let kill_tag = cli.kill_on_exit.then(|| format!("{}", std::process::id()));
+    if let Some(tag) = &kill_tag {
+        plan.env.push(("SPROUT_KILL_TAG".into(), tag.clone()));
+    }
+
+    if cli.dry_run {
+        eprintln!("{}", plan.explain());
+        return Ok(0);
+    }
+
     let status = plan.run()?;
+
+    /* proot --kill-on-exit: after the command exits, sweep /proc for any
+     * process whose environ carries our SPROUT_KILL_TAG=<pid> marker and
+     * SIGKILL it (env survives every exec, so all descendants inherit the
+     * tag without the launcher tracing them). Best-effort: processes the
+     * signal hits mid-exit may already be gone (ESRCH is swallowed). */
+    if let Some(tag) = &kill_tag {
+        sweep_kill_tagged(tag);
+    }
+
     Ok(status.code().map(|c| c as u8).unwrap_or(1))
+}
+
+/// Kill every LIVE process whose /proc/PID/environ contains
+/// "SPROUT_KILL_TAG=<tag>". Skips self (the launcher IS one of the
+/// tagged, killing it would short-circuit the sweep before the last PIDs
+/// are processed). Proc-parses can fail on per-PID procfs permission
+/// denials — those PIDs stay alive, which is the documented best-effort
+/// envelope of the v1 implementation (supervisor lanes have pid lists
+/// handled by ptrace; this sweep covers the preload fast path).
+fn sweep_kill_tagged(tag: &str) {
+    let needle = format!("SPROUT_KILL_TAG={}", tag);
+    let uid = unsafe { getuid() };
+    let self_pid = std::process::id() as i32;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for ent in entries.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let env_path = ent.path().join("environ");
+        let Ok(environ) = std::fs::read(&env_path) else {
+            continue;
+        };
+        if std::str::from_utf8(&environ)
+            .map(|s| s.contains(needle.as_str()))
+            .unwrap_or(false)
+        {
+            unsafe { kill(pid, 9) };
+        }
+    }
+    let _ = uid;
+}
+
+extern "C" {
+    fn getuid() -> u32;
+    fn kill(pid: i32, sig: i32) -> i32;
 }
 
 /// Where the sanitized-libc cache lives (ADR-0007). Override with

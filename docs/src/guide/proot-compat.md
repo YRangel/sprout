@@ -20,10 +20,17 @@ is a no-op. The table is sorted by how `proot-distro login` uses flags.
 | (HOME passthrough) | `--host-home` | v0.5.1+: default is proot's `HOME=/root`; flag carries the host `$HOME` in |
 | (host PATH append) | `--host-path` | v0.5.1+: default is the clean guest-only PATH; flag appends `$PREFIX/bin` (proot-distro's opt-in shape) |
 | `-i <id>` | implicit (always the launcher uid) | ✅ equivalent |
-| `--kernel-release` | -- | untracked; guests see host kernel |
+| `--kernel-release <rel>` | `-k` / `--kernel-release <rel>` | ✅ (ADR-0019; preload uname wrapper patches uts.release, env-inherited through nested execs) |
 | `--mixed-mode` | `--fallback=auto` | ✅ v0.3 (semantics satisfied) |
 | `--root-id` | `-0` | alias |
 | `--verbose <n>` | `-v` / `--verbose` | sprout is less chattery by design |
+| `-v <n>` | `-v <n>` | ✅ levels accepted (reserved >1) |
+| `-V` | `-V` | ✅ banner + copyright/license/contact |
+| `-h` | `-h` | ✅ auto-clap usage |
+| `--kill-on-exit` | `--kill-on-exit` | ✅ v1 : env-tag sweep over /proc (bare lanes belt; supervisor lineage-kill always runs) |
+| `--sysvipc` | `--sysvipc` | ✅ accepted (semantic no-op; ADR-0018 is always-on under box64/box32) |
+| `--ashmem-memfd` | `--ashmem-memfd` | ✅ preload memfd_create fallback + fstat st_size sim |
+| `-p` | `-p` / `--port-mapping` | ✅ preload bind remap, ports <1024 -> 1024+port |
 | `--help` / `--version` | same | ✅ |
 
 ## apt/dpkg runtime compatibility (v0.4.3+)
@@ -94,10 +101,11 @@ sprout -r $ROOTFS /bin/bash              # interactive shell
 sprout -r $ROOTFS /usr/bin/python3 ...   # any tool
 ```
 
-sprout needs *none* of proot-distro's wrapper flags (`--sysvipc`,
-`--kernel-release`, `l2s` symlinks): the loader chain plus the interposer
-handle everything the dynamic fast path covers, and static binaries route
-through the supervisor automatically.
+sprout still needs no special flags to import proot-distro environments;
+`--sysvipc` is a semantic no-op lens on ADR-0018's always-on emulation,
+and the loader chain plus the interposer handle everything the dynamic
+fast path covers (static binaries route
+through the supervisor automatically).
 
 Known deltas vs `proot-distro login`: sprout does not (yet) -b system
 paths by default (pass `-b /dev -b /proc -b /sys` if a tool needs them)

@@ -1836,12 +1836,143 @@ static void sp_addr_rev_unix(struct sockaddr *addr, socklen_t *len) {
     *len = (socklen_t)(off + n + 1);
 }
 
+/* ADR-0019: -k kernel-release parity. The real syscall still runs (the
+ * kernel's sysname/nodename/machine comportment is unchanged); we only
+ * substitute the uts.release field when the caller opted in with -k.
+ * Static cache of the env value keeps the hot path per-call free. */
+#include <sys/utsname.h>
+int uname(struct utsname *b) {
+    static int (*SP_REAL(uname))(struct utsname *) = NULL;
+    SP_RESOLVE(uname);
+    int rc = SP_REAL(uname)(b);
+    if (rc != 0) return rc;
+    static char rel[65];
+    static int init_ = -1;
+    if (init_ < 0) {
+        init_ = 0;
+        const char *e = getenv("SPROUT_KERNEL_RELEASE");
+        if (e && *e) {
+            strncpy(rel, e, sizeof(rel) - 1);
+            rel[sizeof(rel) - 1] = '\0';
+            init_ = 1;
+        }
+    }
+    if (init_ == 1) {
+        strncpy(b->release, rel, sizeof(b->release) - 1);
+        b->release[sizeof(b->release) - 1] = '\0';
+    }
+    return rc;
+}
+
+/* ADR-0019: --ashmem-memfd parity. Android kernels before CONFIG_MEMFD_
+ * CREATE=1 era need the ashmem fallback; GKI kernels accept the real
+ * syscall anyway, so this wrapper is a strict superset: native first,
+ * ENOSYS/ENODEV/EINVAL -> /dev/ashmem when the flag is set, carrying the
+ * tracking fd in a tiny ring so fstat's st_size can be simulated
+ * (ashmem's fstat reports 0; guest code checks it meaningfully without
+ * our patch). FDs tracked are only THIS process's view (fd numbers are
+ * process-scoped anyway). */
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+
+#define SV_ASHMEMIOC   0x77
+#define SV_ASHMEM_SET_NAME   _IOW(SV_ASHMEMIOC, 1, char [256])
+#define SV_ASHMEM_SET_SIZE   _IOW(SV_ASHMEMIOC, 3, size_t)
+
+static int sv_ashmem_fds[16];
+static int sv_ashmem_pos;
+static void sv_ashmem_track(int fd) {
+    sv_ashmem_fds[sv_ashmem_pos % 16] = fd;
+    sv_ashmem_pos++;
+}
+static int sv_ashmem_is_tracked(int fd) {
+    for (int i = 0; i < 16; i++) if (sv_ashmem_fds[i] == fd) return 1;
+    return 0;
+}
+
+int memfd_create(const char *name, unsigned int flags) {
+    static int (*SP_REAL(memfd_create))(const char *, unsigned int) = NULL;
+    SP_RESOLVE(memfd_create);
+    int fd = -1;
+    if (SP_REAL(memfd_create)) fd = SP_REAL(memfd_create)(name, flags);
+    if (fd >= 0) return fd;
+    int saved = errno;
+    static int afd_flag = -1;
+    if (afd_flag < 0)
+        afd_flag = getenv("SPROUT_ASHMEM_MEMFD") ? 1 : 0;
+    if (!afd_flag || (saved != ENOSYS && saved != ENODEV && saved != EINVAL)) {
+        errno = saved;
+        return -1;
+    }
+    static int (*SP_REAL(open))(const char *, int, ...) = NULL;
+    SP_RESOLVE(open);
+    int afd = SP_REAL(open)("/dev/ashmem", O_RDWR | O_CLOEXEC, 0600);
+    if (afd < 0) { errno = saved; return -1; }
+    char nm[256];
+    snprintf(nm, sizeof(nm), "%s", name && *name ? name : "memfd");
+    (void)ioctl(afd, SV_ASHMEM_SET_NAME, nm);
+    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    (void)ioctl(afd, SV_ASHMEM_SET_SIZE, pg);
+    sv_ashmem_track(afd);
+    return afd;
+}
+
+/* --ashmem-memfd fstat simulation: tracked ashmem fds report st_size=0;
+ * the correct value is lseek-end. Used from the fstat-family wrappers.
+ * NOTE the stored offset is RESTORED so the caller's fd position isn't
+ * observable through the wrapper. */
+static void sv_ashmem_fstat_fixup(int fd, off_t *size_out) {
+    static int afd_flag = -1;
+    if (afd_flag < 0)
+        afd_flag = getenv("SPROUT_ASHMEM_MEMFD") ? 1 : 0;
+    if (!afd_flag || !sv_ashmem_is_tracked(fd)) return;
+    if (*size_out != 0) return;
+    static off_t (*SP_REAL(lseek))(int, off_t, int) = NULL;
+    SP_RESOLVE(lseek);
+    off_t cur = SP_REAL(lseek)(fd, 0, SEEK_CUR);
+    off_t end = SP_REAL(lseek)(fd, 0, SEEK_END);
+    if (end > 0) *size_out = end;
+    if (cur >= 0) (void)SP_REAL(lseek)(fd, cur, SEEK_SET);
+}
+
+#include <netinet/in.h>
 int bind(int fd, const struct sockaddr *addr, socklen_t len) {
     static int (*SP_REAL(bind))(int, const struct sockaddr *, socklen_t) = NULL;
     SP_RESOLVE(bind);
     struct sockaddr_un x;
     socklen_t xl = sp_addr_fwd_unix(addr, len, &x);
     if (xl) return SP_REAL(bind)(fd, (const struct sockaddr *)&x, xl);
+    /* ADR-0019 -p, proot port-mapping parity: privileged ports (<1024)
+     * are remapped to 1024+port. Android denies CAP_NET_BIND_SERVICE to
+     * app uids, so guest servers (lighttpd on :80, sshd on :22,
+     * dnsmasq on :53) die on bind(2) — mapping them transparently keeps
+     * the process model working. Connect/sendto stay untouched: the
+     * mapping exists to start services, not to lie about client intent.
+     * Only when SPROUT_PORTMAP=1 is set (explicit opt-in of v1). */
+    static int pmap = -1;
+    if (pmap < 0) pmap = getenv("SPROUT_PORTMAP") ? 1 : 0;
+    if (pmap && addr) {
+        if (addr->sa_family == AF_INET) {
+            struct sockaddr_in in4;
+            memcpy(&in4, addr, sizeof(in4));
+            unsigned port = ntohs(in4.sin_port);
+            if (port > 0 && port < 1024) {
+                in4.sin_port = htons((uint16_t)(1024 + port));
+                return SP_REAL(bind)(fd, (const struct sockaddr *)&in4,
+                                     sizeof(in4));
+            }
+        } else if (addr->sa_family == AF_INET6) {
+            struct sockaddr_in6 in6;
+            memcpy(&in6, addr, sizeof(in6));
+            unsigned port = ntohs(in6.sin6_port);
+            if (port > 0 && port < 1024) {
+                in6.sin6_port = htons((uint16_t)(1024 + port));
+                return SP_REAL(bind)(fd, (const struct sockaddr *)&in6,
+                                     sizeof(in6));
+            }
+        }
+    }
     return SP_REAL(bind)(fd, addr, len);
 }
 
@@ -2047,7 +2178,24 @@ int fstat64(int fd, struct stat64 *st) {
     static int (*SP_REAL(fstat64))(int, struct stat64 *) = NULL;
     SP_RESOLVE(fstat64);
     int rc = SP_REAL(fstat64)(fd, st);
-    if (rc == 0) sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid);
+    if (rc == 0) {
+        sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid);
+        sv_ashmem_fstat_fixup(fd, (off_t *)&st->st_size);
+    }
+    return rc;
+}
+
+/* fstat: glibc exports this symbol even on 64-bit (no path to translate,
+ * nobody wrapped it until --ashmem-memfd: the presence of this symbol is
+ * what lets the simulated st_size surface for ashmem fds). */
+int fstat(int fd, struct stat *st) {
+    static int (*SP_REAL(fstat))(int, struct stat *) = NULL;
+    SP_RESOLVE(fstat);
+    int rc = SP_REAL(fstat)(fd, st);
+    if (rc == 0) {
+        sp_spoof_uid_gid(&st->st_uid, &st->st_gid);
+        sv_ashmem_fstat_fixup(fd, &st->st_size);
+    }
     return rc;
 }
 int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {

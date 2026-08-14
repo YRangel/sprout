@@ -42,5 +42,28 @@ T "shared-tmp-vis"          "$($S -r $B --shared-tmp /bin/bash -c 'ls /tmp | hea
 
 TR "dry-run-exports"         "$($S -r $B --dry-run /usr/bin/true 2>&1 | grep -c '^export')" 16 18
 
+T "-k release"              "$($S -r $B -k 5.4.42-sprout /bin/uname -r)" "5.4.42-sprout"
+T "-k nested"               "$($S -r $B -k 5.4.42-sprout /bin/bash -c /bin/uname\ -r)" "5.4.42-sprout"
+T "-V banner"               "$($S -V 2>/dev/null | head -1)" "sprout 0.1.0"
+T "-h usage"                "$($S -h 2>/dev/null | grep -c '^Usage:')" "1"
+T "-v level-accepted"       "$($S -r $B -v 2 /usr/bin/true >/dev/null 2>&1; echo rc=$?)" "rc=0"
+cat > $B/tmp/sp_bind80.py <<'PYFIX'
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 80))
+print(s.getsockname()[1])
+PYFIX
+cat > $B/tmp/sp_memfd.py <<'PYFIX'
+import ctypes
+c = ctypes.CDLL(None)
+f = c.memfd_create(b"x", 0)
+print(f > 0)
+PYFIX
+T "-p remap-1024+80"        "$($S -r $B -p /usr/bin/python3 /tmp/sp_bind80.py; sleep 1)" "1104"
+T "--sysvipc-parse"         "$($S -r $B --sysvipc /usr/bin/true; echo rc=$?)" "rc=0"
+T "--ashmem-memfd"          "$($S -r $B --ashmem-memfd /usr/bin/python3 /tmp/sp_memfd.py)" "True"
+T "--kill-on-exit"          "$(P=$B/tmp/sp-koe.pid; rm -f $P; $S -r $B --kill-on-exit /bin/bash -c 'sleep 47 & echo "$!" > /tmp/sp-koe.pid' >/dev/null 2>&1; sleep 0.4; PID=$(cat $P 2>/dev/null); ( kill -0 $PID 2>/dev/null && echo alive ) || echo dead; rm -f $P)" "dead"
+
 echo "SUMMARY: pass=$pass fail=$fail"
 

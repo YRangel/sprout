@@ -47,7 +47,12 @@ Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
 - **Zero `.text` patching** of installed files; cached *derivative* ld.so/libc
   (in `~/.cache/sprout`) carry the Android seccomp workarounds.
 - **proot-compatible CLI**: `-r -b -w -0 --link2symlink --shared-tmp
-  --termux-x11 --kill-on-exit --dry-run`.
+  --termux-x11 --kill-on-exit --dry-run`; ADR-0019 parity flags:
+  `-k/--kernel-release` (uname release spoof), `-p/--port-mapping`
+  (bind(2) ports <1024 -> 1024+p), `-v [LEVEL]`, `-V` (version+license
+  banner), `-h` (usage), `--sysvipc` (accepted no-op: always-on per
+  ADR-0018), `--ashmem-memfd` (memfd_create fallback to /dev/ashmem +
+  fstat st_size simulation).
 - **-q / x86 emulation without root**: userspace binfmt adapter (ADR-0017)
   sniffs x86_64/i386 ELFs at exec and routes them through a guest emulator
   (`/usr/local/bin/box64` by default; set `SPROUT_BINFMT_X86_64` /
@@ -60,7 +65,7 @@ Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
   GKI ships `CONFIG_SYSVIPC=n`; disable with `SPROUT_SYSVIPC_OFF=1`.
 - **Environment policy**: never invents vars; `HOME` defaults guest when you ask
   to live inside; `--termux-x11` is the explicit preset for GUI sessions.
-- **Reproducible batteries**: `bench/flags-matrix.sh` (25 cells),
+- **Reproducible batteries**: `bench/flags-matrix.sh` (34 cells),
   `bench/flags-matrix-extended.sh` (73), hyperfine benchmark pairs.
 - **Audited surface**: every major decision written down in `docs/src/adr/`.
 

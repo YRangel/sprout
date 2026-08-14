@@ -20,6 +20,10 @@ These land in the launch plan *unless a user env already defines them*:
 | `SPROUT_BINFMT_ALWAYS` | unset | `=1` wraps even native aarch64 ELFs into the emulator (proot `-q` parity for whole-rootfs x86 usage) |
 | `SPROUT_SYSVIPC_OFF` | unset | `=1` prevents the sysvipc shim DSO (`/usr/lib/sprout-sysvipc/{i386,x86_64}/libsprout-sysvipc.so`) from being injected into `BOX64_LD_PRELOAD` of wrapped x86 guests (ADR-0018; required for steam's startup semaphores) |
 | `SPROUT_SYSVIPC_DIR` | `/tmp/sprout-sysvipc` | guest-path directory backing the emulated SysV objects (must be reachable by EVERY wrapped process — keep it the Termux-shared `/tmp` bind for cross-session reach) |
+| `SPROUT_KERNEL_RELEASE` | unset | `uname(2)` override applied by the preloaded uname wrapper; set via `-k/--kernel-release` (proot parity) |
+| `SPROUT_PORTMAP` | unset | `=1` (set by `-p/--port-mapping`) makes`bind(2)` on ports <1024 use `1024+port` instead (proot parity for guests binding privileged ports without CAP_NET_BIND_SERVICE) |
+| `SPROUT_ASHMEM_MEMFD` | unset | `=1` (set by `--ashmem-memfd`) makes the preloaded `memfd_create()` fall back to `/dev/ashmem` when the kernel says ENOSYS/ENODEV/EINVAL; tracked fd ring feeds the fstat st_size simulation (proot parity) |
+| `SPROUT_KILL_TAG` | unset | `=<sprout-pid>` (set by `--kill-on-exit`) marks every descendant env; the post-run proc-sweep SIGKILLs any process whose environ carries it |
 | `BOX64_LD_LIBRARY_PATH` | (unset ⇒ box defaults injected when routing x86_64) | overrides the box64 runtime library search path |
 | `BOX32_LD_LIBRARY_PATH` | (unset ⇒ box defaults injected when routing i386) | overrides the box32 runtime library search path |
 | `TMPDIR` | `/tmp` | host TMPDIR escapes the guest view |
