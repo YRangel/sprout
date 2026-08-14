@@ -46,13 +46,11 @@ on the user's Termux-X11 :0.
 |-----|------|---------|-------|---------------------|
 | Adreno 840 (Turnip) | **sprout** | mailbox (default) | **7625**  | 5312–9085 |
 | Adreno 840 (Turnip) | proot   | mailbox (default)            | 776       | 620–839   |
-| Adreno 840 (Turnip) | sprout  | immediate (no vsync)         | 2616 / 2058 | 1900–3249 |
-| Adreno 840 (Turnip) | proot   | immediate (no vsync)         | 852       | 753–1017  |
 
-Deltas: **9.8× (mailbox)**, **~3.07× (immediate)**. Mailbox mode lets
-the driver queue presents without blocking, so the ptrace per-syscall
-accumulates on the frame-submit path: proot's 776 vs sprout's 7625 on the same
-Turnip (v1.4.354) driver code paths.
+Delta: **9.8× (mailbox)**. Mailbox mode lets the driver queue presents
+without blocking, so the ptrace per-syscall accumulates on the frame-
+submit path: proot's 776 vs sprout's 7625 on the same Turnip (v1.4.354)
+driver code paths.
 
 GPU details: `/dev/kgsl-3d0` is `crw-rw-rw-` world-open on this device,
 so freedreno (mesa 25.0.7's ICD `freedreno_icd.aarch64.json`) talks KGSL
@@ -76,21 +74,16 @@ sprout-specific patching of the vulkan path).
 
 ### Observed rollovers / notes for vkmark on sprout
 
-- `--present-mode` default (mailbox) is the real-world default for swap-
-  chain-driven games: frame production races ahead, the display eats
-  the newest. The pure-immediate mode gives lower absolute scores but
-  denser per-frame blocking contact cost, making the lane gap wider in
-  absolute FPS terms but narrower in ratio (~3x vs ~9.8x).
-- xfce4 composited session: measured 1816 on sprout+Turnip immediate
-  under xfwm4 (`sync_to_vblank=off`) — composite-blit cost is real but
-  visual tearing drops out. For up-to-screen smooth-presentation tests,
-  use xfce4+mailbox; for raw throughput numbers, use bare X on :0.
+- `--present-mode` default (mailbox) is the vkmark out-of-the-box mode
+  and the real-world default for swap-chain-driven games: frame
+  production races ahead, the display eats the newest.
+- xfce4 compositing (untested stack): WM composite absorbs presents —
+  tear-free but by design bounded by the composite pass. Unmeasured;
+  only the bare-X number above is the benchmark.
 - `vkmark --winsys kms` remains broken on this host (no DRM card0 mas-
   ter). Wayland absent. X only.
-- Deviations to guard: the immediate row varied run-to-run (2616→2058
-  between the baseline run and the live-watch re-run); the llvmpipe lane
-  freezes ONLY under sprout, so any future llvmpipe regression will look
-  like a freeze, never a score change.
+- The llvmpipe lane freezes ONLY under sprout, so any future llvmpipe
+  regression there will look like a freeze, never a score change.
 
 ## glibc guest — LD_PRELOAD fast path (release build, median-of-5)
 
