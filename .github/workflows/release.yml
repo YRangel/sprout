@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04-arm
     env:
-      ANDROID_TARGET: aarch64-linux-android.28
+      ANDROID_TARGET: aarch64-linux-android
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -46,18 +46,37 @@ jobs:
             exit 101
           fi
 
-      # Termux-host artifacts must be linked against **bionic**, so we cross
-      # to aarch64-linux-android with cargo-zigbuild (zig's bundled clang is
-      # also our musl toolchain for the alpine-guest interposer).
+      # Termux-host artifacts must be linked against **bionic** — use the
+      # Android NDK clang (real bionic headers/libs), not zig's synthetic
+      # android target (cargo-zigbuild .28 aborted with
+      # "Malformed zig target abi suffix"). zig stays ON ONLY for the musl
+      # guest interposer build further below.
       - uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.14.1
 
-      - name: install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild
+      - uses: android-actions/setup-android@v3
+
+      - name: ensure NDK + configure android linker
+        run: |
+          set -eu
+          # newest NDK: prefer a preinstalled one; else sdkmanager to newest listed
+          ND=$(ls -d "$ANDROID_HOME"/ndk/*/toolchains/llvm/prebuilt/linux-aarch64/bin 2>/dev/null | tail -1 || true)
+          if [ -z "$ND" ]; then
+            CANDID=$(sdkmanager --list 2>/dev/null | grep -oE 'ndk;[0-9]+\.[0-9]+\.[0-9]+' | sort -u | tail -1)
+            test -n "$CANDID" || { echo "::error::sdkmanager lists no NDK"; exit 1; }
+            yes | sdkmanager --install "$CANDID" >/dev/null
+            ND=$(ls -d "$ANDROID_HOME"/ndk/*/toolchains/llvm/prebuilt/linux-aarch64/bin 2>/dev/null | tail -1)
+          fi
+          CLANG="$ND/aarch64-linux-android28-clang"
+          test -x "$CLANG" || { echo "::error::missing $CLANG"; exit 1; }
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$CLANG" >> "$GITHUB_ENV"
 
       - name: android-target workspace build (sprout + sprout-super for bionic hosts)
-        run: cargo zigbuild --release --workspace --target "$ANDROID_TARGET"
+        run: |
+          rustup target add aarch64-linux-android
+          cargo build --release --workspace --target "$ANDROID_TARGET"
 
       - name: collect artifacts (android launcher/supervisor + glibc interposer + musl interposer)
         run: |
