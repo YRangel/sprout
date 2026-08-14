@@ -35,6 +35,63 @@ The **16×** find-walk number exceeds earlier median-of-N runs because
 hyperfine's wall-clock includes both launchers' startup, and proot's
 per-syscall overhead dominates the tree walk.
 
+## 2026-08-14 — vkmark 2025.01 (Adreno 840 / Turnip, real GPU, X11 :0)
+
+Vulkan GPU matrix on today's device (Xiaomi 25102PCBEG, kernel 6.12.23,
+Mesa 25.0.7, guest trixie). All runs: `--winsys xcb`, uniform canvas
+`--size 1280x720`, live X on `$PREFIX/tmp/.X11-unix/X0`, window watched
+on the user's Termux-X11 :0.
+
+| row | lane | present | score | per-scene FPS range |
+|-----|------|---------|-------|---------------------|
+| Adreno 840 (Turnip) | **sprout** | mailbox (default) | **7625**  | 5312–9085 |
+| Adreno 840 (Turnip) | proot   | mailbox (default)            | 776       | 620–839   |
+| Adreno 840 (Turnip) | sprout  | immediate (no vsync)         | 2616 / 2058 | 1900–3249 |
+| Adreno 840 (Turnip) | proot   | immediate (no vsync)         | 852       | 753–1017  |
+
+Deltas: **9.8× (mailbox)**, **~3.07× (immediate)**. Mailbox mode lets
+the driver queue presents without blocking, so the ptrace per-syscall
+accumulates on the frame-submit path: proot's 776 vs sprout's 7625 on the same
+Turnip (v1.4.354) driver code paths.
+
+GPU details: `/dev/kgsl-3d0` is `crw-rw-rw-` world-open on this device,
+so freedreno (mesa 25.0.7's ICD `freedreno_icd.aarch64.json`) talks KGSL
+ioctls directly; vkmark sees `Adreno (TM) 840` under BOTH runtimes (no
+sprout-specific patching of the vulkan path).
+
+### lavapipe (CPU) vkmark-xcb lane: runtime parities NOT reached
+
+- proot (`llvmpipe`, fifo): 400x300 `clear` scene completes (60.0 FPS,
+  vsync lock — the CPU lane naturally clamps at 60 with fifo).
+- **sprout (`llvmpipe`, xcb any present-mode)**: freezes at scene-1.
+  Present-path block: `LP_NO_RAST=1` (blank GPU command path) still hangs,
+  `LP_NUM_THREADS=1` (single-thread raster stack) still hangs,
+  validation layers print nothing before the freeze. Same freeze regardless
+  of present mode. vkcube on the very same `llvmpipe` ICD under sprout
+  renders fine in 30s. Blast radius is vkmark's specific present path
+  under sprout's lane (bug candidate: llvmpipe vkmark works under proot,
+  vkcube renders on the same ICD under sprout — debug deferred). Blast
+  radius capped: llvmpipe is CI-grade CPU rendering, nobody games on it.
+  Documented; not a benchmark data point today.
+
+### Observed rollovers / notes for vkmark on sprout
+
+- `--present-mode` default (mailbox) is the real-world default for swap-
+  chain-driven games: frame production races ahead, the display eats
+  the newest. The pure-immediate mode gives lower absolute scores but
+  denser per-frame blocking contact cost, making the lane gap wider in
+  absolute FPS terms but narrower in ratio (~3x vs ~9.8x).
+- xfce4 composited session: measured 1816 on sprout+Turnip immediate
+  under xfwm4 (`sync_to_vblank=off`) — composite-blit cost is real but
+  visual tearing drops out. For up-to-screen smooth-presentation tests,
+  use xfce4+mailbox; for raw throughput numbers, use bare X on :0.
+- `vkmark --winsys kms` remains broken on this host (no DRM card0 mas-
+  ter). Wayland absent. X only.
+- Deviations to guard: the immediate row varied run-to-run (2616→2058
+  between the baseline run and the live-watch re-run); the llvmpipe lane
+  freezes ONLY under sprout, so any future llvmpipe regression will look
+  like a freeze, never a score change.
+
 ## glibc guest — LD_PRELOAD fast path (release build, median-of-5)
 
 Guest: **Debian 13 (trixie, glibc 2.41)** (`proot-distro/containers/debian`).
