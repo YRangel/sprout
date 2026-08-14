@@ -236,6 +236,10 @@ fn run() -> Result<u8, Error> {
     let mut full_cmd: Vec<OsString> = cli.cmd.clone();
 
     let mut class = classify(&classify_path)?;
+    /* ADR-0017: the ELF identity the binfmt gate sniffs — for native execs
+     * this is classify_path; for scripts it must be the SHEBANG interpreter
+     * (the script itself is NotElf, the interpreter is what actually runs). */
+    let mut sniff_target = classify_path.clone();
 
     // Shebang (#!): exec the script's interpreter instead (kernel semantics:
     // argv = [interp, opt-arg?, script, orig args...]). The interpreter must
@@ -282,6 +286,7 @@ fn run() -> Result<u8, Error> {
             program_host = interp_host;
             program_name = interp;
             class = interp_class;
+            sniff_target = interp_class_path;
         }
     }
     // ---- ADR-0018: launcher-side binfmt wrap (proot -q parity at program 0) ----
@@ -300,7 +305,7 @@ fn run() -> Result<u8, Error> {
         let always = std::env::var("SPROUT_BINFMT_ALWAYS")
             .map(|v| v == "1")
             .unwrap_or(false);
-        let wrap_emu = match elf_meta(&classify_path)? {
+        let wrap_emu = match elf_meta(&sniff_target)? {
             Some((2, 62)) => Some(emu64_cfg()),
             Some((1, 3)) => Some(
                 std::env::var("SPROUT_BINFMT_I386")
@@ -317,20 +322,18 @@ fn run() -> Result<u8, Error> {
             let emu_host = rootfs
                 .find_program(&emu)
                 .unwrap_or_else(|_| rootfs.to_host(std::path::Path::new(&emu)));
-            if emu_host != classify_path {
+            if emu_host != sniff_target {
                 if !emu_host.is_file() {
                     return Err(Error::BinfmtNoEmulator {
                         program: program_name.clone(),
                         emu: emu.clone(),
                     });
                 }
-                let orig_args: Vec<OsString> = full_cmd[1..].to_vec();
-                let target_guest = guest_abs
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| program_name.clone());
-                let mut rebuilt: Vec<OsString> = vec![emu.clone().into(), target_guest.into()];
-                rebuilt.extend(orig_args);
+                /* Kernel argv semantics preserved: prepend the emulator to
+                 * the ALREADY-resolved argv — [emu, interp?, script?, args]
+                 * for scripts, [emu, target, args] for direct ELFs. */
+                let mut rebuilt: Vec<OsString> = vec![emu.clone().into()];
+                rebuilt.extend(full_cmd.iter().cloned());
                 full_cmd = rebuilt;
                 program_host = emu_host.clone();
                 program_name = emu;
