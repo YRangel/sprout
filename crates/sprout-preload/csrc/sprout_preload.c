@@ -1937,6 +1937,53 @@ int pivot_root(const char *new_root, const char *put_old) {
     return -1;
 }
 
+/* syscall() itself: FEX-style emulators translate guest x86 syscalls by
+ * calling the HOST's variadic `syscall(nr, ...)` wrapper — bypassing any
+ * named-symbol interposer above. Filter by syscall number; blocklist of
+ * Android-seccomp-killed nrs becomes a caller-answerable failure. */
+#include <stdarg.h>
+long syscall(long nr, ...) {
+    va_list ap; va_start(ap, nr);
+    long a1 = va_arg(ap, long), a2 = va_arg(ap, long), a3 = va_arg(ap, long);
+    long a4 = va_arg(ap, long), a5 = va_arg(ap, long), a6 = va_arg(ap, long);
+    va_end(ap);
+    switch (nr) {
+#ifdef SYS_set_robust_list
+    case SYS_set_robust_list:
+#endif
+#ifdef SYS_get_robust_list
+    case SYS_get_robust_list:
+#endif
+        /* advisory; callers never recover from -EINTR-style errors here */
+        return 0;
+#ifdef SYS_mount
+    case SYS_mount:
+#endif
+#ifdef SYS_umount2
+    case SYS_umount2:
+#endif
+#ifdef SYS_pivot_root
+    case SYS_pivot_root:
+#endif
+#ifdef SYS_swapon
+    case SYS_swapon:
+#endif
+#ifdef SYS_swapoff
+    case SYS_swapoff:
+#endif
+#ifdef SYS_acct
+    case SYS_acct:
+#endif
+        errno = EPERM;
+        return -1;
+    default:
+        break;
+    }
+    static long (*SP_REAL(syscall))(long, ...) = NULL;
+    SP_RESOLVE(syscall);
+    return SP_REAL(syscall)(nr, a1, a2, a3, a4, a5, a6);
+}
+
 int memfd_create(const char *name, unsigned int flags) {
     static int (*SP_REAL(memfd_create))(const char *, unsigned int) = NULL;
     SP_RESOLVE(memfd_create);
