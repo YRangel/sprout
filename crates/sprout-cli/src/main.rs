@@ -348,6 +348,7 @@ fn run() -> Result<u8, Error> {
     // from already-interposed processes; the very first exec issued by the
     // CLI sits outside its reach. Same sniffing contract here, using the
     // final resolved class + host path.
+    let mut emu_is_fex = false;
     {
         let emu64_cfg = || {
             std::env::var("SPROUT_BINFMT_X86_64")
@@ -409,6 +410,27 @@ fn run() -> Result<u8, Error> {
                     && rootfs.guest_real(std::path::Path::new(shim)).is_some()
                 {
                     std::env::set_var("BOX64_LD_PRELOAD", shim);
+                }
+
+                /* FEX lane: host gclib emulator binaries get the arm64 SysV-IPC
+                 * shim prepended (order matters for symbol resolution). Tracked
+                 * via emu_name for a plan-env rewrite at exec-time below. */
+                if emu.starts_with('/') {
+                    let bn = emu.rsplit('/').next().unwrap_or(emu.as_str());
+                    if bn.starts_with("FEX") {
+                        emu_is_fex = rootfs
+                            .guest_real(std::path::Path::new(
+                                "/usr/lib/sprout-sysvipc/arm64/libsprout-sysvipc.so",
+                            ))
+                            .is_some()
+                            && std::env::var_os("SPROUT_SYSVIPC_FEX_OFF").is_none();
+                    }
+                }
+                if emu_is_fex {
+                    std::env::set_var(
+                        "SPROUT_FEX_SHIM_PATH",
+                        "/usr/lib/sprout-sysvipc/arm64/libsprout-sysvipc.so",
+                    );
                 }
                 let mut rebuilt: Vec<OsString> = vec![emu.clone().into()];
                 rebuilt.extend(full_cmd.iter().cloned());

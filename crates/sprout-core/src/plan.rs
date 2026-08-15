@@ -318,7 +318,15 @@ impl LaunchPlan {
         // Order matters: libsprout-core.so FIRST so its wrappers win symbol
         // resolution over libc (verified via dladdr probing: LD_PRELOAD is
         // resolved left-to-right).
-        let ld_preload = format!("{}:{}", preload_so.display(), sanitized.display());
+        // SPROUT_FEX_SHIM_PATH: FEX-lane host SysV-IPC shim gets prepended at
+        // the same phase (only consulted here; FEX = aarch64 host gclib proc).
+        let loader_shim = std::env::var("SPROUT_FEX_SHIM_PATH")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let ld_preload = match loader_shim {
+            Some(s) => format!("{}:{}:{}", s, preload_so.display(), sanitized.display()),
+            None => format!("{}:{}", preload_so.display(), sanitized.display()),
+        };
 
         // Inheriting the host PATH leaks host dirs into the guest PATH
         // search (python's shutil.which, env, shells). proot-distro sets a

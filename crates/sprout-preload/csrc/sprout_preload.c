@@ -3019,6 +3019,40 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
         sprintf(nev[ec], "BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/x86_64/libsprout-sysvipc.so");
         ec++;
     }
+    /* FEX lane: the emulator itself is an aarch64 HOST gclib binary. Its
+     * guest SysV IPC translations now reach named libc calls (FEX patch
+     * series on our tree); preload the HOST-ARCH SysV-IPC shim DSO into the
+     * FEX process env AT FRONT (order matters: shim must beat the chain's
+     * sanitized-libc in symbol resolution for SysV IPC calls). Detection:
+     * basename-prefix "FEX" + presence of the arm64 shim build. */
+    {
+        const char *ebase = strrchr(emu, '/');
+        ebase = ebase ? ebase + 1 : emu;
+        if (!getenv("SPROUT_SYSVIPC_FEX_OFF") && strncmp(ebase, "FEX", 3) == 0
+            && access("/usr/lib/sprout-sysvipc/arm64/libsprout-sysvipc.so", R_OK) == 0) {
+            /* find LD_PRELOAD= entry -> prepend shim path; else add fresh */
+            const char *sh = "/usr/lib/sprout-sysvipc/arm64/libsprout-sysvipc.so";
+            size_t shn = strlen(sh);
+            int pre_i = -1;
+            for (int i = 0; i < ec; i++)
+                if (pre_i < 0 && strncmp(nev[i], "LD_PRELOAD=", 11) == 0) pre_i = i;
+            if (pre_i >= 0 && strstr(nev[pre_i], sh) == NULL) {
+                size_t oldn = strlen(nev[pre_i]);
+                char *nbuf = malloc(shn + oldn + 2);
+                if (!nbuf) { free(nev); free(nv); errno = ENOMEM; return -1; }
+                memcpy(nbuf, nev[pre_i], 11);                /* LD_PRELOAD= */
+                memcpy(nbuf + 11, sh, shn);
+                nbuf[11 + shn] = ':';
+                memcpy(nbuf + 11 + shn + 1, nev[pre_i] + 11, oldn - 11 + 1);
+                nev[pre_i] = nbuf;
+            } else if (pre_i < 0) {
+                nev[ec] = malloc(11 + shn + 1);
+                if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
+                sprintf(nev[ec], "LD_PRELOAD=%s", sh);
+                ec++;
+            }
+        }
+    }
     if (!have_pre && e_machine == EM_386 && has_interp && !getenv("SPROUT_SYSVIPC_OFF")
         && access("/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so", R_OK) == 0) {
         nev[ec] = malloc(strlen("BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so") + 1);
