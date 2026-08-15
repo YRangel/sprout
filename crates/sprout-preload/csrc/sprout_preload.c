@@ -1992,7 +1992,13 @@ long syscall(long nr, ...) {
         const struct sp_open_how *src = (const struct sp_open_how *)(unsigned long)a3;
         if (!src) { errno = EFAULT; return -1; }
         memcpy(&how, src, sizeof how);
-        if (how.resolve != 0) { errno = ENOSYS; return -1; }
+        /* RESOLVE_* semantics (NO_SYMLINKS/MAGICLINKS/BENEATH/IN_ROOT/CACHED)
+         * simply get dropped: the kernel has no openat2 to delegate to and
+         * guest-space path resolution is already done by the caller (FEX's
+         * VFS prefixes RootFS itself). Fenestrating -ENOSYS here previously
+         * broke FEX's wholeVFS (guest ld.so couldn't find anything in its
+         * RootFS at all). The flags are belt-and-suspenders hardening for
+         * paths that come from the guest's own userspace anyway. */
         /* our own openat() interposer above handles sprout path translation,
          * so route through it instead of dlsym(RTLD_NEXT). */
         return openat((int)a1, (const char *)(unsigned long)a2,
