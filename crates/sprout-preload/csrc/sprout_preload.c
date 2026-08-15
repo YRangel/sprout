@@ -1937,6 +1937,10 @@ int pivot_root(const char *new_root, const char *put_old) {
     return -1;
 }
 
+/* open_how layout for openat2 routing: defined locally so we don't depend
+ * on a kernel header the build host happens to ship. */
+struct sp_open_how { unsigned long long flags, mode, resolve; };
+
 /* syscall() itself: FEX-style emulators translate guest x86 syscalls by
  * calling the HOST's variadic `syscall(nr, ...)` wrapper — bypassing any
  * named-symbol interposer above. Filter by syscall number; blocklist of
@@ -1976,6 +1980,25 @@ long syscall(long nr, ...) {
 #endif
         errno = EPERM;
         return -1;
+#ifdef SYS_openat2
+    case SYS_openat2: {
+        /* Android app-seccomp SIGSYS-kills openat2 outright (437 on arm64);
+         * glibc-2.41 ld.so + FEX syscall translation paths call it directly.
+         * Translate: RESOLVE_* unset => plain openat with the same flags;
+         * anything else gets -ENOSYS ("kernel older than openat2") so the
+         * caller takes its canonical fallback path instead of dying. */
+        struct sp_open_how how;
+        if ((size_t)a4 != sizeof(struct sp_open_how)) { errno = EINVAL; return -1; }
+        const struct sp_open_how *src = (const struct sp_open_how *)(unsigned long)a3;
+        if (!src) { errno = EFAULT; return -1; }
+        memcpy(&how, src, sizeof how);
+        if (how.resolve != 0) { errno = ENOSYS; return -1; }
+        /* our own openat() interposer above handles sprout path translation,
+         * so route through it instead of dlsym(RTLD_NEXT). */
+        return openat((int)a1, (const char *)(unsigned long)a2,
+                      (int)how.flags, (int)how.mode);
+    }
+#endif
     default:
         break;
     }
