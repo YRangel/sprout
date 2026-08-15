@@ -400,7 +400,12 @@ fn run() -> Result<u8, Error> {
                 } else {
                     "/usr/lib/sprout-sysvipc/x86_64/libsprout-sysvipc.so"
                 };
+                /* ADR-0018: the sysvipc shim is for DYNAMIC guest ELFs; a
+                 * static x86 exec image (raw _start, no PT_INTERP) has no
+                 * PLT path to it and nothing to gain from the DSO — skip
+                 * injecting to keep that lane free of the loader-chain pass. */
                 if std::env::var_os("BOX64_LD_PRELOAD").is_none()
+                    && !matches!(class, GuestClass::Static)
                     && rootfs.guest_real(std::path::Path::new(shim)).is_some()
                 {
                     std::env::set_var("BOX64_LD_PRELOAD", shim);

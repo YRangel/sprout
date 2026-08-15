@@ -2851,16 +2851,45 @@ static int sp_binfmt_always(void) {
  * + e_machine when it IS an ELF (any arch/class). Returns 1 when ELF, 0
  * otherwise (scripts keep the regular chain, which re-enters the gate for
  * their interpreter). */
-static int sp_elf_meta(const char *host, unsigned char *e_class_out, unsigned short *e_machine_out) {
+static int sp_elf_meta(const char *host, unsigned char *e_class_out, unsigned short *e_machine_out, int *has_interp_out) {
     FILE *f = fopen(host, "rb");
     if (!f) return 0;
-    unsigned char head[20];
+    unsigned char head[64];
     size_t n = fread(head, 1, sizeof(head), f);
-    fclose(f);
-    if (n < sizeof(head) || head[0] != 0x7f || head[1] != 'E' || head[2] != 'L' || head[3] != 'F')
+    if (n < 20 || head[0] != 0x7f || head[1] != 'E' || head[2] != 'L' || head[3] != 'F') {
+        fclose(f);
         return 0;
+    }
     *e_class_out  = head[4];  /* 1=32 2=64 */
     *e_machine_out = (unsigned short)(head[18] | ((unsigned short)head[19] << 8));
+    if (has_interp_out) {
+        *has_interp_out = 0;
+        unsigned long long phoff;
+        unsigned short phentsize, phnum;
+        if (head[4] == 2 && n >= 58) {
+            phoff = 0; for (int i = 0; i < 8; i++) phoff |= (unsigned long long)head[32 + i] << (8 * i);
+            phentsize = (unsigned short)(head[54] | ((unsigned short)head[55] << 8));
+            phnum     = (unsigned short)(head[56] | ((unsigned short)head[57] << 8));
+        } else if (head[4] == 1 && n >= 44) {
+            phoff = 0; for (int i = 0; i < 4; i++) phoff |= (unsigned long long)head[28 + i] << (8 * i);
+            phentsize = (unsigned short)(head[42] | ((unsigned short)head[43] << 8));
+            phnum     = (unsigned short)(head[44] | ((unsigned short)head[45] << 8));
+        } else {
+            fclose(f);
+            return 1;
+        }
+        if (phnum > 0 && phnum <= 256 && phentsize >= 4 && phentsize <= 128) {
+            if (fseeko(f, (off_t)phoff, SEEK_SET) == 0) {
+                for (unsigned short i = 0; i < phnum; i++) {
+                    unsigned char ph[128];
+                    if (fread(ph, 1, phentsize, f) < 4) break;
+                    unsigned long ptype = (unsigned long)(ph[0] | (ph[1] << 8) | ((unsigned long)ph[2] << 16) | ((unsigned long)ph[3] << 24));
+                    if (ptype == 3) { *has_interp_out = 1; break; }
+                }
+            }
+        }
+    }
+    fclose(f);
     return 1;
 }
 
@@ -2873,7 +2902,8 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
                                 char *const argv[], char *const merged_envp[], int depth) {
     unsigned char e_class = 0;
     unsigned short e_machine = 0;
-    int is_elf = sp_elf_meta(host_abs, &e_class, &e_machine);
+    int has_interp = 0;
+    int is_elf = sp_elf_meta(host_abs, &e_class, &e_machine, &has_interp);
     if (!is_elf) return 0; /* scripts etc. — ordinary chain */
 
     const char *emu = NULL, *libenv = NULL, *libdef = NULL;
@@ -2947,14 +2977,20 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
      * BOX64_LD_PRELOAD works for BOTH 64-bit and box32 children. The shim
      * runs entirely in the emulated guest (x86 or i386 ELF); its kernel-ABI
      * calls (int80/syscall) are translated by box64. */
-    if (!have_pre && e_machine == EM_X86_64 && !getenv("SPROUT_SYSVIPC_OFF")
+    /* ADR-0018 sysvipc shim is only injected when the guest can actually
+     * PLT-call it: only meaningful for DYNAMIC x86/x86_64 ELFs (which own a
+     * real libc runtime stack). Static x86 ELF (raw asm / fully static) has
+     * no interposable PLT table and no reason to carry the shim; skipping
+     * it also sidesteps a crash in box64 v0.4.5 when the shim body runs
+     * JIT'd against a no-loader static exec image. */
+    if (!have_pre && e_machine == EM_X86_64 && has_interp && !getenv("SPROUT_SYSVIPC_OFF")
         && access("/usr/lib/sprout-sysvipc/x86_64/libsprout-sysvipc.so", R_OK) == 0) {
         nev[ec] = malloc(strlen("BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/x86_64/libsprout-sysvipc.so") + 1);
         if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
         sprintf(nev[ec], "BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/x86_64/libsprout-sysvipc.so");
         ec++;
     }
-    if (!have_pre && e_machine == EM_386 && !getenv("SPROUT_SYSVIPC_OFF")
+    if (!have_pre && e_machine == EM_386 && has_interp && !getenv("SPROUT_SYSVIPC_OFF")
         && access("/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so", R_OK) == 0) {
         nev[ec] = malloc(strlen("BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so") + 1);
         if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
