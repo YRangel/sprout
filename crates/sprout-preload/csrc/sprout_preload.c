@@ -1891,6 +1891,52 @@ static int sv_ashmem_is_tracked(int fd) {
     return 0;
 }
 
+/* Android's app seccomp policy kills processes that call mount(2)&co with
+ * SIGSYS (SIGSYS is the default action for those nrs, not EPERM). Guest
+ * x86 emulators (FEX) try `mount()` while probing their RootFS VFS setup;
+ * translate that family into a plain EPERM failure so callers fall back
+ * to their no-mount code paths instead of getting reaped. */
+int mount(const char *source, const char *target, const char *fstype,
+          unsigned long flags, const void *data) {
+    (void)source; (void)target; (void)fstype; (void)flags; (void)data;
+    errno = EPERM;
+    return -1;
+}
+int umount(const char *target) {
+    (void)target;
+    errno = EPERM;
+    return -1;
+}
+int umount2(const char *target, int flags) {
+    (void)target; (void)flags;
+    errno = EPERM;
+    return -1;
+}
+/* Same Android seccomp family as mount(): swap, acct, reboot/kexec and
+ * friends are SIGSYS-killed by the host filter. Give each an EPERM answer
+ * so any guest probing them degrades gracefully. */
+int swapon(const char *path, int flags) {
+    (void)path; (void)flags;
+    errno = EPERM;
+    return -1;
+}
+int swapoff(const char *path) {
+    (void)path;
+    errno = EPERM;
+    return -1;
+}
+int acct(const char *filename) {
+    (void)filename;
+    errno = EPERM;
+    return -1;
+}
+
+int pivot_root(const char *new_root, const char *put_old) {
+    (void)new_root; (void)put_old;
+    errno = EPERM;
+    return -1;
+}
+
 int memfd_create(const char *name, unsigned int flags) {
     static int (*SP_REAL(memfd_create))(const char *, unsigned int) = NULL;
     SP_RESOLVE(memfd_create);
