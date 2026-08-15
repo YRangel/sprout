@@ -3059,15 +3059,89 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
         }
         /* SP_SCRIPT recurses with the interpreter; the recursion deep-stamps
          * the interpreter's own gabs — matching kernel semantics where
-         * /proc/self/exe of a script is the INTERPRETER binary. */
-        sp_stamp_exe((char **)envp, gabs);
+         * /proc/self/exe of a script is the INTERPRETER binary.
+         * /proc/self/exe aliases DEFER stamping until hx is resolved below:
+         * stamping the raw alias would poison children with
+         * SPROUT_EXE=/proc/self/exe (self-referential). */
+        if (strcmp(path, "/proc/self/exe") != 0 &&
+            strcmp(path, "/proc/thread-self/exe") != 0)
+            sp_stamp_exe((char **)envp, gabs);
     }
     char x[SP_PATH_MAX];
     const char *host_raw = sp_translate_x(path, x);
     char hx[SP_PATH_MAX];
     snprintf(hx, sizeof(hx), "%s", host_raw);
+    /* /proc/self/exe (and thread-self) name the CURRENT process image.
+     * Under loader-injection the on-disk target is the loader itself
+     * (ldso-sanitized — no PT_INTERP, sp_classify_host() would report
+     * SP_ELF_STATIC and the supervised static lane would re-exec the
+     * SUPERVISOR's own /proc/self/exe with guest argv). The semantically
+     * correct target is the TRACKED original exe (SPROUT_EXE) — the same
+     * oracle the readlink/readlinkat interposers use. FEX guest-exec
+     * relaunch and steam's self-exec both die without this (2026-08-15). */
+    int is_self_exe = (strcmp(path, "/proc/self/exe") == 0 ||
+                       strcmp(path, "/proc/thread-self/exe") == 0);
+    if (is_self_exe) {
+        char se[SP_PATH_MAX];
+        int sen = sp_self_exe_answer(path, se, sizeof(se) - 1);
+        if (sen <= 0) {
+            /* thread-self alias: helper only matches self-exe/self-pid */
+            const char *e = getenv("SPROUT_EXE");
+            if (e && *e) {
+                size_t el = strlen(e);
+                if (el >= sizeof(se)) el = sizeof(se) - 1;
+                memcpy(se, e, el);
+                sen = (int)el;
+            }
+        }
+        if (sen <= 0) {
+            /* env fully lost (emulator relaunch rebuilds env from a
+             * whitelist): recover from our own loader argv — the image is
+             * ldso-sanitized and the REAL program is the first token after
+             * ld.so's option cluster (see sp_build_loader_argv layout). */
+            int cf = syscall(SYS_openat, AT_FDCWD, "/proc/self/cmdline", O_RDONLY, 0);
+            if (cf >= 0) {
+                char cb[4096];
+                ssize_t cn = syscall(SYS_read, cf, cb, sizeof(cb) - 1);
+                syscall(SYS_close, cf);
+                if (cn > 0) {
+                    cb[cn] = '\0';
+                    int skip = 0; /* 1: previous token was a valued ld.so option */
+                    size_t off = 0;
+                    while (off < (size_t)cn) {
+                        char *tok = cb + off;
+                        size_t tl = strlen(tok);
+                        if (!tl) { off++; continue; }
+                        off += tl + 1;
+                        if (skip) { skip = 0; continue; }
+                        if (!strcmp(tok, "--argv0") || !strcmp(tok, "--preload") ||
+                            !strcmp(tok, "--library-path") || !strcmp(tok, "--list") ||
+                            !strcmp(tok, "--verify")) { skip = 1; continue; }
+                        if (tok[0] == '-') continue;          /* flag option */
+                        if (tok[0] != '/') continue;          /* argv0 or junk */
+                        if (strstr(tok, "ldso-sanitized") || strstr(tok, "ld-linux") ||
+                            strstr(tok, "ld-musl")) continue;   /* the loader image */
+                        size_t el = strlen(tok);
+                        if (el >= sizeof(se)) el = sizeof(se) - 1;
+                        memcpy(se, tok, el);
+                        sen = (int)el;
+                        break;
+                    }
+                }
+            }
+        }
+        if (sen > 0) {
+            se[sen] = '\0';
+            snprintf(hx, sizeof(hx), "%s", se);
+        }
+    }
     sp_resolve_absolute_symlink(hx);
     const char *host = hx;
+    /* deferred stamp for self-exe aliases: children inherit the RESOLVED
+     * image path, keeping SPROUT_EXE meaningful at arbitrary relaunch
+     * depth even when an emulator rebuilt the env (hx == resolved exe). */
+    if (is_self_exe)
+        sp_stamp_exe((char **)envp, hx);
 
     {
         int brc = sp_binfmt_maybe_exec(path, host, argv, envp, depth);
