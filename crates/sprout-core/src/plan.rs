@@ -68,6 +68,16 @@ fn guest_home(rootfs: &Rootfs) -> String {
     }
 }
 
+/// Guest-absolute path → host path, honoring `-b` bindings FIRST (first
+/// match wins, mirroring the interposer's bind loop in sp_translate()) and
+/// falling back to the plain rootfs prefix join. `to_host()` alone silently
+/// drops `-b` targets — feeding it a `-w` cwd inside a bound dir then fails
+/// at the exec-time chdir with a blameless "os error 2" (caller's
+/// `current_dir`).
+fn to_host_bound(rootfs: &Rootfs, guest: &str) -> std::path::PathBuf {
+    rootfs.to_host_bound(std::path::Path::new(guest))
+}
+
 /// Push HOME/TERM/SHELL/TMPDIR policy defaults onto a plan env:
 /// - HOME: /root by default (proot parity); `--host-home` passes the host
 ///   $HOME through.
@@ -262,7 +272,6 @@ impl LaunchPlan {
             }
             push_home_term(&mut env, rootfs);
             ensure_dev_shm(rootfs);
-            ensure_dev_shm(rootfs);
             let def_cwd = if rootfs.cwd.is_some() {
                 rootfs.cwd.clone().unwrap()
             } else {
@@ -274,7 +283,7 @@ impl LaunchPlan {
             let host_cwd = if rootfs.host_home {
                 std::path::PathBuf::from(&def_cwd)
             } else {
-                rootfs.to_host(std::path::Path::new(&def_cwd))
+                to_host_bound(rootfs, &def_cwd)
             };
             return Ok(Self {
                 strategy: Strategy::Preload,
@@ -318,9 +327,10 @@ impl LaunchPlan {
         // Order matters: libsprout-core.so FIRST so its wrappers win symbol
         // resolution over libc (verified via dladdr probing: LD_PRELOAD is
         // resolved left-to-right).
-        // SPROUT_FEX_SHIM_PATH: FEX-lane host SysV-IPC shim gets prepended at
-        // the same phase (only consulted here; FEX = aarch64 host gclib proc).
-        let loader_shim = std::env::var("SPROUT_FEX_SHIM_PATH")
+        // SPROUT_EMU_SYSVIPC_PATH: host-emulator-lane arm64 SysV-IPC shim
+        // gets prepended at the same phase (only consulted here; injects
+        // into any aarch64-host gclib emulator process env).
+        let loader_shim = std::env::var("SPROUT_EMU_SYSVIPC_PATH")
             .ok()
             .filter(|s| !s.is_empty());
         let ld_preload = match loader_shim {
@@ -376,7 +386,7 @@ impl LaunchPlan {
         let cwd = if rootfs.host_home {
             Some(std::path::PathBuf::from(&def_cwd))
         } else {
-            Some(rootfs.to_host(std::path::Path::new(&def_cwd)))
+            Some(to_host_bound(rootfs, &def_cwd))
         };
 
         Ok(Self {

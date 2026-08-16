@@ -81,9 +81,24 @@ pub struct Rootfs {
 }
 
 impl Rootfs {
-    /// Guest libc flavor detection: musl rootfses ship /lib/ld-musl-*.so.1
-    /// (which IS the libc); glibc rootfses ship ld-linux sources.
+    /// Guest libc flavor detection: glibc wins on the canonical ld-linux
+    /// loader BEFORE the musl probe — glibc distros with `musl-tools`
+    /// installed ALSO drop an ld-musl-*.so.1 symlink into /lib (debian
+    /// musl-tools, observed 2026-08-16: /lib/ld-musl-aarch64.so.1 →
+    /// aarch64-linux-musl/libc.so), so a musl-first probe misclassifies
+    /// the whole glibc guest as musl and half the symbol set vanishes at
+    /// launch. musl rootfses ship ONLY the ld-musl loader, so the order
+    /// stays total.
     pub fn libc_flavor(&self) -> LibcFlavor {
+        if self
+            .to_host(Path::new("/lib/ld-linux-aarch64.so.1"))
+            .exists()
+            || self
+                .to_host(Path::new("/lib64/ld-linux-aarch64.so.1"))
+                .exists()
+        {
+            return LibcFlavor::Glibc;
+        }
         if self
             .to_host(Path::new("/lib/ld-musl-aarch64.so.1"))
             .exists()
@@ -204,6 +219,21 @@ impl Rootfs {
         self.root.join(guest.strip_prefix("/").unwrap_or(guest))
     }
 
+    /// Guest-absolute → host, honoring `-b` bindings FIRST (first match
+    /// wins — mirror of the interposer's bind loop in sp_translate()),
+    /// falling back to the plain rootfs prefix join from to_host(). The
+    /// runtime interposer resolves binds itself; without this helper every
+    /// launcher-side lookup (find_program, `-w` cwd host translation)
+    /// silently drops `-b` targets and surfaces a blameless ENOENT.
+    pub fn to_host_bound(&self, guest: &Path) -> PathBuf {
+        for b in &self.bindings {
+            if let Ok(rest) = guest.strip_prefix(&b.guest) {
+                return b.host.join(rest);
+            }
+        }
+        self.to_host(guest)
+    }
+
     /// Resolve `guest` (absolute path inside THIS rootfs) through symlink
     /// chains *relative to the rootfs*, not the host root. Bare
     /// fs::metadata() evaluates an absolute symlink like `bin/ls -&gt;
@@ -233,6 +263,13 @@ impl Rootfs {
             let guest = Path::new(name);
             if self.guest_real(guest).is_some() {
                 return Ok(self.to_host(guest));
+            }
+            /* `-b`-bound target: the guest-path view only exists through
+             * the binding; resolve it against the bound host dir before
+             * declaring ProgramNotFound (proot parity). */
+            let bound = self.to_host_bound(guest);
+            if bound != self.to_host(guest) && bound.exists() {
+                return Ok(bound);
             }
             return Err(Error::ProgramNotFound(name.to_string()));
         }
