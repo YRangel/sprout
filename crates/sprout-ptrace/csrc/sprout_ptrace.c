@@ -134,6 +134,32 @@ static const sp_emul_rule SP_EMULATE_BASE[] = {
     { 195, -38 },  /* shmctl   */
     { 196, -38 },  /* shmat    */
     { 197, -38 },  /* shmdt    */
+    /* POSIX mqueue: seccomp-killed for the android app domain the same
+     * way the SysV family is (observed 2026-08-15: glibc + FEX guests die
+     * with SIGSYS nr=183 mq_timedreceive the moment a preload-lane
+     * binary calls an unknown syscall nr; apps must fall back honestly
+     * just like the SysV IPC fallback above). */
+    { 180, -38 },  /* mq_open        */
+    { 181, -38 },  /* mq_unlink      */
+    { 182, -38 },  /* mq_timedsend   */
+    { 183, -38 },  /* mq_timedreceive*/
+    { 184, -38 },  /* mq_notify      */
+    { 185, -38 },  /* mq_getsetattr  */
+    { 272, -38 },  /* kcmp — seccomp-killed for android app domains; glibc
+                    * only probes it opportunistically (dirent dedup), so
+                    * -ENOSYS is the honest fallback */
+    { 400, -38 },  /* the 400-423 time64 family: Android app-seccomp kills every
+                    * one identically; guests probing clock semantics must fall
+                    * back to the (always-present) 32-bit variants.
+                    * clock_*time64, timer_*time64, timerfd_*time64, utimensat,
+                    * pselect6, ppoll, io_pgetevents, recvmmsg, mq_*_time64,
+                    * semtimedop_time64, rt_sigtimedwait, futex_time64,
+                    * sched_rr_get_interval_time64 */
+    { 401, -38 }, { 402, -38 }, { 403, -38 }, { 404, -38 }, { 405, -38 },
+    { 406, -38 }, { 407, -38 }, { 408, -38 }, { 409, -38 }, { 410, -38 },
+    { 411, -38 }, { 412, -38 }, { 413, -38 }, { 414, -38 }, { 415, -38 },
+    { 416, -38 }, { 417, -38 }, { 418, -38 }, { 419, -38 }, { 420, -38 },
+    { 421, -38 }, { 422, -38 }, { 423, -38 },
     { 439, -38 },  /* faccessat2 raw callers -> -ENOSYS (libc falls back) */
     { 452, -38 },  /* fchmodat2 (GNU tar >= 1.35) -> -ENOSYS (fallback to fchmodat) */
     /* accept(202) deliberately NOT here: Android policy layers trigger
