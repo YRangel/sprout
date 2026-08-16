@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-5c709904.js";
+            window.path_to_searchindex_js = "../searchindex-e408c899.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-1f510b02.js"></script>
@@ -196,7 +196,9 @@ libsprout-core-musl.so  # LD_PRELOAD interposer (musl-linked, musl guests like A
 <p>sprout discovers <code>libsprout-core.so</code> and <code>sprout-super</code> <em>next to the
 <code>sprout</code> binary</em> (sibling-of-argv[0] rule), so an extracted copy runs
 without installing too. Full install:</p>
-<pre><code class="language-sh">curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-termux-host-aarch64.tar.xz
+<pre><code class="language-sh">cd "$(mktemp -d)"  # checksum in an EMPTY dir: stale files from older releases
+                   # with the same names make -c legitimately report FAILED
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-termux-host-aarch64.tar.xz
 curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 tar -xJf sprout-termux-host-aarch64.tar.xz
