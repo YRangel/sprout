@@ -44,7 +44,7 @@ TR "dry-run-exports"         "$($S -r $B --dry-run /usr/bin/true 2>&1 | grep -c 
 
 T "-k release"              "$($S -r $B -k 5.4.42-sprout /bin/uname -r)" "5.4.42-sprout"
 T "-k nested"               "$($S -r $B -k 5.4.42-sprout /bin/bash -c /bin/uname\ -r)" "5.4.42-sprout"
-T "-V banner"               "$($S -V 2>/dev/null | head -1)" "sprout 0.1.0"
+T "-V banner"               "$($S -V 2>/dev/null | head -1)" "sprout $(sed -n 's/^version = "\(.*\)"/\1/p' /data/data/com.termux/files/home/projeto/sprout/crates/sprout-cli/Cargo.toml | head -1)"
 T "-h usage"                "$($S -h 2>/dev/null | grep -c '^Usage:')" "1"
 T "-v level-accepted"       "$($S -r $B -v 2 /usr/bin/true >/dev/null 2>&1; echo rc=$?)" "rc=0"
 cat > $B/tmp/sp_bind80.py <<'PYFIX'
