@@ -48,13 +48,17 @@ non-sibling artifacts explicitly (useful for development).
 
 ## From source
 
-On Termux the interposer is a glibc-linked ELF and therefore **cannot** be
-produced by the host's bionic toolchain; build it inside a glibc guest
-(proot-distro works fine):
-
 ```sh
 git clone <repo> && cd sprout
-cargo build --release --workspace          # produces sprout + supervisor + stub
+cargo build --release --workspace   # produces sprout + supervisor + stub (glibc interposer skipped on bionic)
+./install.sh --verify               # auto-fetches the two interposer DSOs from the latest
+                                    # GitHub release (sha256-verified) when absent locally
+```
+
+If you want the interposer built *from your tree* (e.g. hacking on
+`csrc/sprout_preload.c`), build it inside a glibc guest (proot-distro works):
+
+```sh
 proot-distro login debian --work-dir $PWD -- /usr/bin/sh -c \
   'gcc -std=c11 -O3 -flto -Wall -Wextra -Wpedantic -D_GNU_SOURCE -DSPROUT_INTERPOSE \
      -fPIC -shared -fvisibility=default -o target/libsprout-core.so \
@@ -64,8 +68,17 @@ proot-distro login debian --work-dir $PWD -- /usr/bin/sh -c \
   'musl-gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -DSPROUT_INTERPOSE \
      -fPIC -shared -o target/libsprout-core-musl.so \
      crates/sprout-preload/csrc/sprout_preload.c -ldl'
-./install.sh                               # picks release artifacts, verifies hashes
+./install.sh --verify               # picks tree artifacts first, verifies hashes
 ```
+
+> **Trap:** `proot-distro login` appends **Termux's own `$PREFIX/bin`** to the
+> guest PATH — inside the guest, `cargo`/`rustc` resolve to the *bionic* host
+> toolchain unless you installed `rust` in the guest (`apt install cargo`).
+> That is why a "guest" cargo build prints the same `skipping
+> libsprout-core.so on Android host` warning: the target is still android. The
+> `gcc` one-liners above are unaffected (they use the guest's `/usr/bin/gcc`).
+> Prefer guest-native cargo (`apt install cargo rustc`), or simply let
+> `./install.sh` fetch the prebuilt interposers.
 
 The release workflow builds the exact same interposer artifacts on
 `ubuntu-24.04-arm` and ships them as release downloads; local musl / bionic

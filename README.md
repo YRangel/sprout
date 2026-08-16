@@ -40,8 +40,10 @@ tar -xJf sprout-termux-host-aarch64.tar.xz
 ```sh
 git clone https://github.com/YRangel/sprout.git
 cd sprout
-cargo build --release          # needs: pkg install rust (pinned toolchain)
-./install.sh --verify          # places sprout into $PREFIX/bin, verifies hashes
+cargo build --release --workspace  # needs: pkg install rust (pinned toolchain)
+./install.sh --verify              # installs into $PREFIX/bin; fetches the two
+                                   # guest interposer DSOs from the latest release
+                                   # (sha256-verified) when absent from the tree
 ```
 
 Tagged releases also ship the two **guest-side** interposer DSOs standalone

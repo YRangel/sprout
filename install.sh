@@ -42,6 +42,30 @@ SO=$(pick libsprout-core.so)
 PX=$(pick sprout-super); [ -n "$PX" ] || PX=$(pick sprout-ptrace)
 PS=$(pick sprout-stub)
 
+# Source builds on a bionic host (Termux) can never produce the glibc-linked
+# interposer (build.rs skips it deliberately) — fetch the pair from the
+# matching GitHub release instead, hash-verified. Never shadow artifacts
+# that DO exist locally (deploy-discipline law: freshness beats presence).
+fetch_interposers() {
+    [ -n "$SO" ] && [ -n "$MS" ] && return 0
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v sha256sum >/dev/null 2>&1 || return 1
+    local base=https://github.com/YRangel/sprout/releases/latest/download
+    local dlm
+    dlm=$(mktemp -d "${TMPDIR:-/tmp}/sprout-fetch.XXXXXX")
+    mkdir -p "$dlm"
+    curl -sfL "$base/sprout-guest-interposers-aarch64.tar.xz" -o "$dlm/sprout-guest-interposers-aarch64.tar.xz" || return 1
+    curl -sfL "$base/SHA256SUMS" -o "$dlm/SHA256SUMS" || return 1
+    (cd "$dlm" && sha256sum --ignore-missing -c SHA256SUMS >/dev/null) || return 1
+    (cd "$dlm" && tar -xJf sprout-guest-interposers-aarch64.tar.xz) || return 1
+    [ -f "$dlm/libsprout-core.so" ] && [ -f "$dlm/libsprout-core-musl.so" ] || return 1
+    [ -n "$SO" ] || SO="$dlm/libsprout-core.so"
+    [ -n "$MS" ] || MS="$dlm/libsprout-core-musl.so"
+    printf 'install.sh: fetched prebuilt interposers from GitHub release (hash-verified)\n'
+    return 0
+}
+fetch_interposers || true
+
 missing=""
 [ -n "$SP" ] || missing="$missing sprout"
 [ -n "$SO" ] || missing="$missing libsprout-core.so"
