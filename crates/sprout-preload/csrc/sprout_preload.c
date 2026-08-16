@@ -2295,6 +2295,23 @@ int stat(const char *path, struct stat *st) {
     return rc;
 }
 
+/* PLAIN lstat lives OUTSIDE the __GLIBC__ guard: musl exports lstat(3)
+ * as a real PLT-visible symbol (busybox's whole stat family resolves
+ * through it), and musl-ldso WILL bind a preload's lstat export over
+ * its own — guarding it out silently un-translates every symlink-
+ * probing call in musl guests (observed 2026-08-16: `find /usr/bin`
+ * returning 0 with 348 applets + .l2s stubs invisible under alpine). */
+int lstat(const char *path, struct stat *st) {
+    static int (*SP_REAL(lstat))(const char *, struct stat *) = NULL;
+    SP_RESOLVE(lstat);
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_l(path, x);
+    SP_TRACE("lstat", path, p);
+    int rc = SP_REAL(lstat)(p, st);
+    if (rc == 0) { sp_spoof_uid_gid(&st->st_uid, &st->st_gid); if (sp_hreg_hit(path) && st->st_nlink == 1) st->st_nlink = 2; }
+    return rc;
+}
+
 #if defined(__GLIBC__)
 /* The *64 transitional family (fstat64/fstatat64/stat64/lstat64) is a
  * glibc ABI: musl does not provide struct stat64 nor these symbols, so
@@ -2344,17 +2361,6 @@ int stat64(const char *path, struct stat64 *st) {
     SP_TRACE("stat64", path, p);
     int rc = SP_REAL(stat64)(p, st);
     if (rc == 0) { sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid); if (sp_hreg_hit(path) && ((struct stat *)st)->st_nlink == 1) ((struct stat *)st)->st_nlink = 2; }
-    return rc;
-}
-
-int lstat(const char *path, struct stat *st) {
-    static int (*SP_REAL(lstat))(const char *, struct stat *) = NULL;
-    SP_RESOLVE(lstat);
-    char x[SP_PATH_MAX];
-    const char *p = sp_translate_l(path, x);
-    SP_TRACE("lstat", path, p);
-    int rc = SP_REAL(lstat)(p, st);
-    if (rc == 0) { sp_spoof_uid_gid(&st->st_uid, &st->st_gid); if (sp_hreg_hit(path) && st->st_nlink == 1) st->st_nlink = 2; }
     return rc;
 }
 
