@@ -800,7 +800,22 @@ static int translate_reg_path(tracee_t *t, pid_t pid, struct user_pt_regs *r, in
     if (peek_str(pid, ptr, guest, sizeof(guest)) < 0) return 0;
     if (guest_absolutize(pid, guest) != 0) return 0;
     char host[SP_PATH_MAX];
-    if (!sp_translate(&g_cfg, guest, host)) return 0;
+    /* /proc/self/root -> guest rootfs. Android SELinux denies untrusted
+     * apps opendir() on their own /proc/self/root magic dir (stat passes,
+     * opendir gets EACCES), which kills pressure-vessel/bwrap-style tools
+     * that access their pre-namespace root through it. From sprout's view
+     * the tracee's REAL root is the guest rootfs: emulate the symlink
+     * spelling there. Spelled-in-guest only — host /proc/<pid>/ stays. */
+    {
+        static const char SROOT[] = "/proc/self/root";
+        const size_t sl = sizeof(SROOT) - 1;
+        if (strncmp(guest, SROOT, sl) == 0 && (guest[sl] == '\0' || guest[sl] == '/')) {
+            if (snprintf(host, sizeof(host), "%s%s", g_cfg.rootfs, guest + sl) >= (int)sizeof(host)) return 0;
+            goto have_host;
+        }
+        if (!sp_translate(&g_cfg, guest, host)) return 0;
+    }
+have_host:
     /* Existence filter (phase-guard): force-prefixing loader-phase host
      * opens (cache .so under $PREFIX/...) would corrupt them. Translate
      * only when the candidate (or its parent, for O_CREAT-ish callers)
@@ -1449,7 +1464,18 @@ static void sp_notify_reply_open(unsigned long long id,
  * Returns 1 when host[] holds a usable path. */
 static int sp_notify_hostpath(pid_t pid, const char *guest, char *host, size_t cap) {
     if (!guest || !host || cap == 0) return 0;
-    if (guest[0] == '/') return sp_translate(&g_cfg, guest, host) ? 1 : 0;
+    if (guest[0] == '/') {
+        /* /proc/self/root: Android SELinux denies untrusted apps opendir()
+         * on their own magic root dir (stat passes, opendir -> EACCES),
+         * which kills pressure-vessel/bwrap-style tools. The tracee's REAL
+         * root is the guest rootfs; emulate the spelled path there. */
+        static const char SROOT[] = "/proc/self/root";
+        const size_t sl = sizeof(SROOT) - 1;
+        if (strncmp(guest, SROOT, sl) == 0 && (guest[sl] == '\0' || guest[sl] == '/')) {
+            return snprintf(host, cap, "%s%s", g_cfg.rootfs, guest + sl) < (int)cap ? 1 : 0;
+        }
+        return sp_translate(&g_cfg, guest, host) ? 1 : 0;
+    }
     char cw[SP_PATH_MAX];
     {
         char pdir[64];
@@ -1788,6 +1814,8 @@ static int sp_fake_proc_cpu_count(void) {
 static int sp_fake_proc_serve(unsigned long long id, const char *which,
                               struct seccomp_notif_resp *resp) {
     int is_stat = strcmp(which, "/proc/stat") == 0;
+    int is_overflow = strcmp(which, "/proc/sys/kernel/overflowuid") == 0
+                   || strcmp(which, "/proc/sys/kernel/overflowgid") == 0;
     char tmp_t[SP_PATH_MAX];
     /* NB: TMPDIR in this process is the GUEST's (/tmp policy from the
      * launch plan) — for supervisor-side temp files it must stay a
@@ -1810,6 +1838,10 @@ static int sp_fake_proc_serve(unsigned long long id, const char *which,
             n += snprintf(buf + n, sizeof(buf) - (size_t)n, "cpu%d 0 0 0 0 0 0 0 0 0 0\n", i);
         n += snprintf(buf + n, sizeof(buf) - (size_t)n,
             "intr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 0\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0\n");
+    } else if (is_overflow) {
+        /* bwrap/pressure-vessel reads these to validate uid range mapping;
+         * Android SELinux hides them. 65534 = unmapped-nobody default. */
+        n = snprintf(buf, sizeof(buf), "65534\n");
     } else { /* /proc/loadavg */
         n = snprintf(buf, sizeof(buf), "0.00 0.00 0.00 1/512 12345\n");
     }
@@ -1881,7 +1913,9 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         /* proot-parity fakes: Android locks /proc/stat + /proc/loadavg
          * for untrusted apps even when guests expect them — synthesize. */
         if (g_debug && guest[0] == '/' && guest[1] == 'p') SP_TRACE("[notify] openat56 guest='%s'\n", guest);
-        if ((strcmp(guest, "/proc/stat") == 0 || strcmp(guest, "/proc/loadavg") == 0)
+        if ((strcmp(guest, "/proc/stat") == 0 || strcmp(guest, "/proc/loadavg") == 0
+             || strcmp(guest, "/proc/sys/kernel/overflowuid") == 0
+             || strcmp(guest, "/proc/sys/kernel/overflowgid") == 0)
             && sp_fake_proc_serve(id, guest, resp) == 1) return;
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
         sp_notify_reply_open(id, resp, host, flags, (mode_t)args[3]);
