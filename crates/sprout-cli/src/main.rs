@@ -189,6 +189,18 @@ extern "C" {
     fn umask(mask: u32) -> u32;
 }
 
+/* Host-arch SysV-IPC shim lane: aarch64-host gclib emulators (FEX,
+ * qemu-user, box64/box32) re-issue guest SysV IPC through named host-libc
+ * calls, so an arm64 shim prepended into the emulator's own process env
+ * intercepts them (order matters for symbol resolution). Basename detection
+ * mirrored in the preload csrc's matching exec-hook helper. */
+fn host_emu_sysvipc_shim(bn: &str) -> bool {
+    bn.starts_with("FEX")
+        || bn.starts_with("qemu-")
+        || bn.starts_with("box64")
+        || bn.starts_with("box32")
+}
+
 fn run() -> Result<u8, Error> {
     let cli = Cli::parse();
 
@@ -348,7 +360,7 @@ fn run() -> Result<u8, Error> {
     // from already-interposed processes; the very first exec issued by the
     // CLI sits outside its reach. Same sniffing contract here, using the
     // final resolved class + host path.
-    let mut emu_is_fex = false;
+    let mut emu_sysvipc_shim = false;
     {
         let emu64_cfg = || {
             std::env::var("SPROUT_BINFMT_X86_64")
@@ -375,9 +387,22 @@ fn run() -> Result<u8, Error> {
         if let Some(emu) = wrap_emu {
             /* Never wrap the emulator's own exec (it re-surfaces here with
              * the rewritten argv): compare resolved host paths. */
-            let emu_host = rootfs
-                .find_program(&emu)
-                .unwrap_or_else(|_| rootfs.to_host(std::path::Path::new(&emu)));
+            /* Guest resolution first; an absolute path existing only on
+             * the HOST (emulator installed into Termux outside the rootfs)
+             * is taken as-is, checked last so guest defaults keep priority. */
+            let emu_host = {
+                let guest = rootfs
+                    .find_program(&emu)
+                    .unwrap_or_else(|_| rootfs.to_host(std::path::Path::new(&emu)));
+                if guest.is_file()
+                    || !std::path::Path::new(&emu).is_absolute()
+                    || !std::path::Path::new(&emu).is_file()
+                {
+                    guest
+                } else {
+                    std::path::PathBuf::from(&emu)
+                }
+            };
             if emu_host != sniff_target {
                 if !emu_host.is_file() {
                     return Err(Error::BinfmtNoEmulator {
@@ -412,23 +437,20 @@ fn run() -> Result<u8, Error> {
                     std::env::set_var("BOX64_LD_PRELOAD", shim);
                 }
 
-                /* FEX lane: host gclib emulator binaries get the arm64 SysV-IPC
-                 * shim prepended (order matters for symbol resolution). Tracked
-                 * via emu_name for a plan-env rewrite at exec-time below. */
                 if emu.starts_with('/') {
                     let bn = emu.rsplit('/').next().unwrap_or(emu.as_str());
-                    if bn.starts_with("FEX") {
-                        emu_is_fex = rootfs
+                    if host_emu_sysvipc_shim(bn) {
+                        emu_sysvipc_shim = rootfs
                             .guest_real(std::path::Path::new(
                                 "/usr/lib/sprout-sysvipc/arm64/libsprout-sysvipc.so",
                             ))
                             .is_some()
-                            && std::env::var_os("SPROUT_SYSVIPC_FEX_OFF").is_none();
+                            && std::env::var_os("SPROUT_SYSVIPC_EMU_OFF").is_none();
                     }
                 }
-                if emu_is_fex {
+                if emu_sysvipc_shim {
                     std::env::set_var(
-                        "SPROUT_FEX_SHIM_PATH",
+                        "SPROUT_EMU_SYSVIPC_PATH",
                         "/usr/lib/sprout-sysvipc/arm64/libsprout-sysvipc.so",
                     );
                 }

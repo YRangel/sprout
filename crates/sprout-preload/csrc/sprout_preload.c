@@ -2922,6 +2922,18 @@ static int sp_elf_meta(const char *host, unsigned char *e_class_out, unsigned sh
     return 1;
 }
 
+/* Basename detection for the host-arch SysV-IPC shim lane. FEX, qemu-user
+ * and box64/box32 are aarch64 HOST gclib binaries that re-issue guest SysV
+ * IPC through named host-libc calls, so the arm64 shim prepended into the
+ * emulator's own env intercepts them (order matters for symbol resolution).
+ * Mirrored in sprout-cli's host_emu_sysvipc_shim(). */
+static int sp_host_emu_sysvipc_shim(const char *basename) {
+    return strncmp(basename, "FEX", 3) == 0
+        || strncmp(basename, "qemu-", 5) == 0
+        || strncmp(basename, "box64", 5) == 0
+        || strncmp(basename, "box32", 5) == 0;
+}
+
 /* Rewrites the incoming exec to an emulator when the target is a foreign
  * (or ALWAYS-wrapped native) ELF. Returns: 1 = recursion issued (caller
  * propagates rc), 0 = not relevant — proceed with the regular chain;
@@ -3019,16 +3031,14 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
         sprintf(nev[ec], "BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/x86_64/libsprout-sysvipc.so");
         ec++;
     }
-    /* FEX lane: the emulator itself is an aarch64 HOST gclib binary. Its
-     * guest SysV IPC translations now reach named libc calls (FEX patch
-     * series on our tree); preload the HOST-ARCH SysV-IPC shim DSO into the
-     * FEX process env AT FRONT (order matters: shim must beat the chain's
-     * sanitized-libc in symbol resolution for SysV IPC calls). Detection:
-     * basename-prefix "FEX" + presence of the arm64 shim build. */
+    /* Host-emulator lane (mirrored in sprout-cli): prepend the HOST-ARCH
+     * SysV-IPC shim DSO into the emulator process env AT FRONT — the shim
+     * must beat the chain's sanitized-libc in symbol resolution for SysV
+     * IPC calls re-issued by the emulator against named host libc. */
     {
         const char *ebase = strrchr(emu, '/');
         ebase = ebase ? ebase + 1 : emu;
-        if (!getenv("SPROUT_SYSVIPC_FEX_OFF") && strncmp(ebase, "FEX", 3) == 0
+        if (!getenv("SPROUT_SYSVIPC_EMU_OFF") && sp_host_emu_sysvipc_shim(ebase)
             && access("/usr/lib/sprout-sysvipc/arm64/libsprout-sysvipc.so", R_OK) == 0) {
             /* find LD_PRELOAD= entry -> prepend shim path; else add fresh */
             const char *sh = "/usr/lib/sprout-sysvipc/arm64/libsprout-sysvipc.so";

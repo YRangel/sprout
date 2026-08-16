@@ -1,6 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# FEX-shim lane battery — gates landing of the sprout preload FEX lane
-# (main.rs FEX detection + plan.rs env + preload sp_binfmt shim injection).
+# Emulator host-shim lane battery — gates landing of the sprout preload
+# emulator SysV-IPC shim lane (main.rs family detection + plan.rs env +
+# preload sp_binfmt shim injection; FEX, qemu-*, box64, box32 basenames).
 # Run on-device: bash tests/fex-shim-lane.sh
 set -u
 PREFIX=/data/data/com.termux/files/usr
@@ -34,8 +35,8 @@ case "$FIRST" in
   *) bad "arm64 shim injected at LD_PRELOAD front (got: ${FIRST:-<none>})" ;;
 esac
 
-# 5. SPROUT_SYSVIPC_FEX_OFF suppresses the arm64-shim injection
-ENVDUMP=$(env SPROUT_SYSVIPC_FEX_OFF=1 SPROUT_BINFMT_X86_64=$FEX FEX_ROOTFS=Fedora_44-ext sprout -r $B -q $FEX -- /root/x86probe/env 2>/dev/null)
+# 5. SPROUT_SYSVIPC_EMU_OFF suppresses the arm64-shim injection
+ENVDUMP=$(env SPROUT_SYSVIPC_EMU_OFF=1 SPROUT_BINFMT_X86_64=$FEX FEX_ROOTFS=Fedora_44-ext sprout -r $B -q $FEX -- /root/x86probe/env 2>/dev/null)
 if printf '%s' "$ENVDUMP" | grep "^LD_PRELOAD=" | head -1 | grep -q "sprout-sysvipc/arm64"; then
   bad "opt-out suppresses arm64 shim"
 else
