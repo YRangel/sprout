@@ -27,12 +27,14 @@ supervisor built on-device by the maintainer + both guest interposers +
 installer):
 
 ```sh
-cd $PREFIX/tmp
+cd "$(mktemp -d)"  # fresh dir: older downloads lying around with the SAME names
+                   # (e.g. from a previous release) make sha256sum --ignore-missing
+                   # legitimately fail — always checksum in an empty directory
 curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-termux-host-aarch64.tar.xz
 curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing
+sha256sum -c SHA256SUMS --ignore-missing   # must print: sprout-termux-host-aarch64.tar.xz: OK
 tar -xJf sprout-termux-host-aarch64.tar.xz
-./install.sh --verify          # installs into $PREFIX/bin, verifies hashes
+./install.sh --verify          # installs into ${PREFIX:-$HOME/.local}/bin, verifies hashes
 ```
 
 ### From source

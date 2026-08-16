@@ -21,6 +21,8 @@ sprout discovers `libsprout-core.so` and `sprout-super` *next to the
 without installing too. Full install:
 
 ```sh
+cd "$(mktemp -d)"  # checksum in an EMPTY dir: stale files from older releases
+                   # with the same names make -c legitimately report FAILED
 curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-termux-host-aarch64.tar.xz
 curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing

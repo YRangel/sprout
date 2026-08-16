@@ -5,8 +5,9 @@
 Prebuilt (recommended):
 
 ```
-curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-termux-host-aarch64.tar.xz
-curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS
+cd "$(mktemp -d)" && \
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-termux-host-aarch64.tar.xz && \
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS && \
 sha256sum -c SHA256SUMS --ignore-missing && tar -xJf sprout-termux-host-aarch64.tar.xz && ./install.sh --verify
 ```
 
