@@ -1435,6 +1435,35 @@ static int sp_notify_continue(struct seccomp_notif_resp *resp) {
 static void sp_notify_reply_open(unsigned long long id,
                                  struct seccomp_notif_resp *resp,
                                  const char *path, int flags, mode_t mode) {
+    /* FIFO hazard: opening a pipe end WRONLY blocks until a reader
+     * appears — the tracee waits on the *supervisor*, so a blocking
+     * supervisor-side open deadlocks the whole notify journal and every
+     * tracee parks on __seccomp_filter forever. srt-logger creates
+     * srt-fifo.XXXX/fifo in exactly this order (writer first); observed
+     * stall = steamui 64x24 splash. Open RDWR|NONBLOCK (unblocking but
+     * connected), strip O_NONBLOCK from the shared file status BEFORE
+     * injecting, so the tracee's fd reads/writes with normal pipeline
+     * semantics (and the peer-side open wakes correctly). */
+    {
+        struct stat st;
+        if (lstat(path, &st) == 0 && S_ISFIFO(st.st_mode)) {
+            /* strip the guest's access-mode bits (O_WRONLY+O_RDWR is an
+             * EINVAL combo on bionic) and substitute our probing mode */
+            int lf = open(path, (flags & ~O_NONBLOCK & ~O_ACCMODE) | O_RDWR | O_NONBLOCK);
+            if (lf < 0) { resp->error = -errno; resp->val = 0; resp->flags = 0; SP_OFT("openat fifo err %d for %s\n", errno, path); return; }
+            (void)fcntl(lf, F_SETFL, fcntl(lf, F_GETFL) & ~O_NONBLOCK);
+            struct seccomp_notif_addfd af;
+            memset(&af, 0, sizeof(af));
+            af.id = id; af.flags = 0; af.srcfd = lf;
+            af.newfd_flags = (flags & O_CLOEXEC) ? O_CLOEXEC : 0;
+            long nfd = ioctl(g_notify_fd, SECCOMP_IOCTL_NOTIF_ADDFD, &af);
+            close(lf);
+            if (nfd < 0) { resp->error = -errno; resp->val = 0; resp->flags = 0; SP_OFT("ADDFD fail %d\n", errno); return; }
+            resp->error = 0; resp->val = (uint64_t)nfd; resp->flags = 0;
+            SP_OFT("openat fifo -> host fd=%ld childval %s\n", nfd, path);
+            return;
+        }
+    }
     int lf = open(path, flags, mode);
     if (lf < 0) {
         resp->error = -errno; resp->val = 0; resp->flags = 0;
