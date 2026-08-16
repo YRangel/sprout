@@ -1,6 +1,6 @@
 [package]
 name = "sprout-core"
-version = "0.4.0"
+version = "0.4.1"
 description = "Core library for sprout: rootfs model, ELF inspection, strategy selection, guest-link plumbing"
 edition.workspace = true
 license.workspace = true
