@@ -57,14 +57,14 @@ fn main() {
 
     if host_is_bionic && !forced {
         println!(
-            "cargo:warning=skipping libsprout-core.so — this is EXPECTED and \ 
-             harmless: the interposer is glibc-linked (loaded by the guest's \ 
-             ld.so), and building it on bionic would produce an unusable ABI. \ 
-             You do not need to do anything: './install.sh' downloads the \ 
-             prebuilt glibc+musl DSOs from the latest GitHub release and \ 
-             verifies their hashes. (To build from this tree instead, compile \ 
-             crates/sprout-preload/csrc/sprout_preload.c with a glibc gcc \ 
-             inside a glibc guest, or set SPROUT_FORCE_PRELOAD_BUILD=1 with \ 
+            "cargo:warning=skipping libsprout-core.so — this is EXPECTED and \
+             harmless: the interposer is glibc-linked (loaded by the guest's \
+             ld.so), and building it on bionic would produce an unusable ABI. \
+             You do not need to do anything: './install.sh' downloads the \
+             prebuilt glibc+musl DSOs from the latest GitHub release and \
+             verifies their hashes. (To build from this tree instead, compile \
+             crates/sprout-preload/csrc/sprout_preload.c with a glibc gcc \
+             inside a glibc guest, or set SPROUT_FORCE_PRELOAD_BUILD=1 with \
              a glibc cross-gcc.)"
         );
         println!("cargo:rustc-env=SPROUT_PRELOAD_SO=");
