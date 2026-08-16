@@ -20,6 +20,23 @@ MIT OR Apache-2.0. Every architectural decision documented in ADRs.
 **Prerequisites**: Termux on Android (aarch64), a guest rootfs (e.g.
 `pkg install proot-distro && proot-distro install debian`).
 
+### Fastest: prebuilt release tarball
+
+Tagged releases ship a self-contained Termux tarball (host launcher +
+supervisor built on-device by the maintainer + both guest interposers +
+installer):
+
+```sh
+cd $PREFIX/tmp
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-termux-host-aarch64.tar.xz
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xJf sprout-termux-host-aarch64.tar.xz
+./install.sh --verify          # installs into $PREFIX/bin, verifies hashes
+```
+
+### From source
+
 ```sh
 git clone https://github.com/YRangel/sprout.git
 cd sprout
@@ -27,28 +44,10 @@ cargo build --release          # needs: pkg install rust (pinned toolchain)
 ./install.sh --verify          # places sprout into $PREFIX/bin, verifies hashes
 ```
 
-### Faster install: prebuilt guest interposers
-
-Tagged releases ship the two **guest-side** interposer DSOs from CI
-(`libsprout-core.so` + `libsprout-core-musl.so`; SHA256SUMS + tarball).
-The **host-side** binaries (`sprout`, `sprout-super`) link against Android's
-bionic and cannot be produced by GitHub-hosted runners — every cross route
-(cargo-zigbuild abi suffix, setup-android sdkmanager on cmdline-tools 16.0,
-cross-rs x86 container under qemu) failed structurally. The install path
-for the host binaries is on-device: `cargo build --release &&
-./install.sh --verify`.
-
-```sh
-# optional: prebuilt guest interposers (then cargo build only covers host .so)
-cd $PREFIX/tmp
-curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-guest-interposers-aarch64.tar.xz
-curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS
-tar -xf sprout-guest-interposers-aarch64.tar.xz
-sha256sum --ignore-missing -c SHA256SUMS
-cp libsprout-core.so libsprout-core-musl.so $PREFIX/bin/
-# then:
-cd sprout && cargo build --release && ./install.sh --verify
-```
+Tagged releases also ship the two **guest-side** interposer DSOs standalone
+(`sprout-guest-interposers-aarch64.tar.xz`; no launcher, no installer) for
+source builds that want to skip the in-guest interposer compile step
+(`cargo build --release` alone covers only the host .so).
 
 Then run anything:
 
