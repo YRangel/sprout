@@ -79,8 +79,11 @@ Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
 - **-q / x86 emulation without root**: userspace binfmt adapter (ADR-0017)
   sniffs x86_64/i386 ELFs at exec and routes them through a guest emulator
   (`/usr/local/bin/box64` by default; set `SPROUT_BINFMT_X86_64` /
-  `SPROUT_BINFMT_I386`, or `-q PATH`); `SPROUT_BINFMT_ALWAYS=1` wraps every
-  exec proot-`-q`-style for whole-rootfs emulation.
+  `SPROUT_BINFMT_I386`, or `-q PATH`); the emulator may equally be a
+  HOST-side absolute path (Termux-native qemu/box builds outside the
+  rootfs) — guest resolution is tried first, the host path second.
+  `SPROUT_BINFMT_ALWAYS=1` wraps every exec proot-`-q`-style for
+  whole-rootfs emulation.
 - **SysV IPC, userspace-emulated (Android has none)**: for native guests,
   `libsprout-core.so` interposes `shmget/shmat/shmdt/shmctl` using the termux
   libandroid-shmem wire contract (ashmem segments + `/dev/shm/<sockid>`
@@ -88,7 +91,9 @@ Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
   work, un-freezing llvmpipe Vulkan/GL under termux-x11. For x86+binfmt
   guests (steam's live runtime), a guest-ABI `libsprout-sysvipc.so` injected
   into `BOX64_LD_PRELOAD` additionally emulates `semget/semop/semctl/shm*`
-  (ADR-0018). Both disable with `SPROUT_SYSVIPC_OFF=1`.
+  (ADR-0018). Both disable with `SPROUT_SYSVIPC_OFF=1`; the arm64-host
+  emulator lane ({FEX,qemu-*,box64,box32} basenames) disables separately
+  with `SPROUT_SYSVIPC_EMU_OFF=1`.
 - **Environment policy**: never invents vars; `HOME` defaults guest when you ask
   to live inside; `--termux-x11` is the explicit preset for GUI sessions.
 - **Reproducible batteries**: `bench/flags-matrix.sh` (34 cells),
