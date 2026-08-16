@@ -22,21 +22,9 @@ for static/Go binaries and a pure-notify stub lane for AArch64 statics.
 - Vulkan visible-present workloads on Turnip (real Adreno GPU) AND llvmpipe
   (software/XShm) under termux-x11 — vkmark head-to-head benchmarks favor
   sprout on both (see [Benchmarks](./benchmarks.md)).
-- x86_64/i386 guests via the userspace binfmt adapter (box64/box32), with
-  SysV semaphores emulated for the steam chain (ADR-0017 + ADR-0018) and
-  SysV shared memory emulated for native guests (ADR-0020).
-
-## Why not proroot?
-
-[proroot](https://github.com/coderredlab/proroot) pioneered this shape, but:
-
-- **closed-source binaries** — nothing to audit, nothing to patch for your app
-- **no static/Go support** — those binaries take raw syscalls, `LD_PRELOAD` is blind
-- **`.text` binary patching** — modifies guest code pages, fragile across glibc versions
-
-`sprout` is the auditable re-design: MIT/Apache-2.0, every decision in an ADR,
-reproducible benchmarks vs proot, and a testable lanes story (preload / ptrace
-supervisor / notify stub) for every workload class.
+- x86_64/i386 guests via the userspace binfmt adapter (box64/box32, qemu,
+  or any ARM64 emulator exposing `LD_PRELOAD`-composable startup) with
+  userspace SysV IPC emulation (semaphores + shared memory).
 
 ## Layout of this book
 
