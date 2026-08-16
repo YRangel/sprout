@@ -10,11 +10,17 @@
 #   sprout-super      — supervisor (static-binary fallback; v0.5.1 rename,
 #                       legacy `sprout-ptrace` symlinked for compat)
 #
-# Usage: ./install.sh [--verify] [dest-dir] [source-dir]
+# Usage: ./install.sh [--verify|--check] [dest-dir] [source-dir]
+#   --verify  install, then verify copies match source hashes (default verify=on)
+#   --check   verify EXISTING install only; exit 1 on mismatch, no copying
 set -eu
 
 VERIFY=0
-case ${1:-} in --verify) VERIFY=1; shift ;; esac
+CHECK=0
+case ${1:-} in
+    --verify) VERIFY=1; shift ;;
+    --check)  CHECK=1;  shift ;;
+esac
 
 DEST=${1:-${PREFIX:-$HOME/.local}/bin}
 SRC=${2:-$(cd "$(dirname "$0")" && pwd)}
@@ -86,7 +92,7 @@ verify_pair() { # verify_pair SRC DEST — md5 equality, loud fail
 }
 
 mkdir -p "$DEST"
-if [ $VERIFY -eq 1 ]; then
+if [ $CHECK -eq 1 ]; then
     rc=0
     for pair in "$SP sprout" "$SO libsprout-core.so" "$PX sprout-super"; do
         set -- $pair; verify_pair "$1" "$DEST/$2" || rc=1
@@ -94,9 +100,12 @@ if [ $VERIFY -eq 1 ]; then
     [ -n "$PS" ] && { [ -f "$DEST/sprout-stub" ] && verify_pair "$PS" "$DEST/sprout-stub" || rc=1; }
     [ -n "$MS" ] && { [ -f "$DEST/libsprout-core-musl.so" ] && verify_pair "$MS" "$DEST/libsprout-core-musl.so" || rc=1; }
     [ "$(readlink "$DEST/sprout-ptrace" 2>/dev/null)" = "sprout-super" ] || rc=1
-    [ $rc -eq 0 ] && echo "install.sh --verify: ALL artifacts match source ($DEST)"
+    [ $rc -eq 0 ] && echo "install.sh --check: ALL artifacts match source ($DEST)"
     exit $rc
 fi
+# Compatibility: --verify keeps working after the install below makes DEST
+# mirror SRC (the post-install hash pass is the actual verification).
+: $VERIFY
 
 cp "$SP" "$DEST/sprout"
 cp "$SO" "$DEST/libsprout-core.so"
