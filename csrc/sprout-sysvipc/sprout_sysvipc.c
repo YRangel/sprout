@@ -457,6 +457,58 @@ static int sv_fd_get(uint32_t itype, int32_t id) {
     return fd;
 }
 
+int semtimedop(int semid, struct sembuf *sops, size_t nsops,
+               const struct timespec *timeout) {
+    if (!timeout) return semop(semid, sops, nsops);
+    if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct timespec start;
+    (void)clock_gettime(CLOCK_MONOTONIC, &start);
+    const long deadline_ms = (timeout->tv_sec * 1000) + (timeout->tv_nsec / 1000000);
+    if (!sops) { errno = EFAULT; return -1; }
+    int fdfd = sv_fd_get(/*itype=*/1, semid);
+    if (fdfd < 0) return -1;
+    sv_hdr h;
+    (void)flock(fdfd, LOCK_EX);
+    if (sv_pread_full(fdfd, &h, SV_HDR_SIZE, 0) < 0 || h.magic != SV_MAGIC || h.destroy) {
+        (void)flock(fdfd, LOCK_UN);
+        sv_fd_cache_evict(1, semid);
+        errno = EIDRM;
+        return -1;
+    }
+    (void)flock(fdfd, LOCK_UN);
+    for (size_t i = 0; i < nsops; i++) {
+        if ((uint32_t)sops[i].sem_num >= h.nsems) {
+            errno = EFBIG;
+            return -1;
+        }
+    }
+    unsigned spins = 0;
+    struct timespec ts = { 0, 20000L };
+    for (;;) {
+        int blocked = -1;
+        (void)flock(fdfd, LOCK_EX);
+        int rc = sv_semop_step(fdfd, sops, (uint32_t)nsops, &blocked);
+        (void)flock(fdfd, LOCK_UN);
+        if (rc < 0) return -1;
+        if (rc == 0) return 0;
+        if (sops[blocked].sem_flg & IPC_NOWAIT) { errno = EAGAIN; return -1; }
+        if (deadline_ms == 0) { errno = EAGAIN; return -1; } /* [0,0] timeout: immediate */
+        if (deadline_ms > 0) {
+            struct timespec now;
+            (void)clock_gettime(CLOCK_MONOTONIC, &now);
+            long gone_ms = (now.tv_sec - start.tv_sec) * 1000L
+                         + (now.tv_nsec - start.tv_nsec) / 1000000L;
+            if (gone_ms >= deadline_ms) { errno = EAGAIN; return -1; }
+        }
+        if (++spins < 200) { (void)nanosleep(&ts, NULL); continue; }
+        ts.tv_nsec = 1000000L;
+        (void)nanosleep(&ts, NULL);
+    }
+}
+
 int semop(int semid, struct sembuf *sops, size_t nsops) {
     if (!sops) { errno = EFAULT; return -1; }
     int fdfd = sv_fd_get(/*itype=*/1, semid);
@@ -501,8 +553,15 @@ int semctl(int semid, int semnum, int cmd, ...) {
         struct semid_ds *buf;
         unsigned short *array;
     } u = { 0 };
-    if (cmd == SETVAL || cmd == SETALL || cmd == IPC_STAT ||
-        cmd == IPC_SET || cmd == GETALL) {
+    if (cmd == SETVAL) {
+        /* va_arg must match the C-promoted scalar type; reading a union
+         * when the caller passed an int is UB (arm64 va_arg alignment,
+         * observed with x32 direct-ABI FEX guests passing SETVAL's raw int). */
+        va_list ap;
+        va_start(ap, cmd);
+        u.val = va_arg(ap, int);
+        va_end(ap);
+    } else if (cmd == SETALL || cmd == IPC_STAT || cmd == IPC_SET || cmd == GETALL) {
         va_list ap;
         va_start(ap, cmd);
         u = va_arg(ap, union semun);
