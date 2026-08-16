@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-077e811f.js";
+            window.path_to_searchindex_js = "searchindex-5c709904.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-1f510b02.js"></script>
@@ -212,39 +212,72 @@ userspace SysV IPC emulation (semaphores + shared memory).</li>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
 <h2 id="from-a-release-recommended"><a class="header" href="#from-a-release-recommended">From a release (recommended)</a></h2>
-<p>Download the release tarball from GitHub Releases. It contains three files
-that must stay side-by-side:</p>
-<pre><code>sprout              # launcher CLI (Rust)
-libsprout-core.so   # LD_PRELOAD interposer (glibc-linked)
-sprout-super        # supervisor (v0.5.1 rename; legacy sprout-ptrace symlink included) (static binary fallback)
+<p>Download the <strong>Termux host tarball</strong> —
+<code>sprout-termux-host-aarch64.tar.xz</code> from
+<a href="https://github.com/YRangel/sprout/releases">GitHub Releases</a> — plus
+<code>SHA256SUMS</code>. The tarball is self-contained:</p>
+<pre><code>sprout                  # launcher CLI (Rust, bionic-linked)
+sprout-super            # supervisor (static-binary fallback supervisor; sprout-ptrace symlink is installed alongside)
+sprout-stub             # stub for the ptrace supervision lane
+install.sh              # installer / verifier
+libsprout-core.so       # LD_PRELOAD interposer (glibc-linked)
+libsprout-core-musl.so  # LD_PRELOAD interposer (musl-linked, musl guests like Alpine)
 </code></pre>
 <p>sprout discovers <code>libsprout-core.so</code> and <code>sprout-super</code> <em>next to the
-<code>sprout</code> binary</em> (sibling-of-argv[0] rule). Install with:</p>
-<pre><code class="language-sh">./install.sh                 # into ${PREFIX:-$HOME/.local}/bin
+<code>sprout</code> binary</em> (sibling-of-argv[0] rule), so an extracted copy runs
+without installing too. Full install:</p>
+<pre><code class="language-sh">curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-termux-host-aarch64.tar.xz
+curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xJf sprout-termux-host-aarch64.tar.xz
+cd "$(dirname "$(find . -maxdepth 2 -name sprout -type f | head -1)")"
+./install.sh                 # into ${PREFIX:-$HOME/.local}/bin
 # or explicitly:
-./install.sh /data/data/com.termux/files/usr/bin &lt;path-to-extracted-release&gt;
+./install.sh /data/data/com.termux/files/usr/bin "$(pwd)"
 </code></pre>
 <p>Verify:</p>
-<pre><code class="language-sh">sprout --version
+<pre><code class="language-sh">sprout --version                   # reports the release version (e.g. sprout 0.4.0)
 sprout -r /path/to/rootfs /bin/echo SPROUT-OK
 </code></pre>
 <p>Overrides: <code>SPROUT_PRELOAD_PATH</code> and <code>SPROUT_PTRACE_PATH</code> point at
 non-sibling artifacts explicitly (useful for development).</p>
+<blockquote>
+<p>The release also ships <code>sprout-guest-interposers-aarch64.tar.xz</code>:
+only the two interposer DSOs (CI-built), for people building the host
+binaries from source on-device (below). It contains <strong>no</strong> <code>sprout</code>
+launcher and <strong>no</strong> <code>install.sh</code>.</p>
+</blockquote>
 <h2 id="from-source"><a class="header" href="#from-source">From source</a></h2>
-<p>On Termux the interposer is a glibc-linked ELF and therefore <strong>cannot</strong> be
-produced by the host’s bionic toolchain; build it inside a glibc guest
-(proot-distro works fine):</p>
 <pre><code class="language-sh">git clone &lt;repo&gt; &amp;&amp; cd sprout
-cargo build --release --workspace          # produces sprout + supervisor
-proot-distro login debian --work-dir $PWD -- /usr/bin/sh -c \
+cargo build --release --workspace   # produces sprout + supervisor + stub (glibc interposer skipped on bionic)
+./install.sh --verify               # auto-fetches the two interposer DSOs from the latest
+                                    # GitHub release (sha256-verified) when absent locally
+</code></pre>
+<p>If you want the interposer built <em>from your tree</em> (e.g. hacking on
+<code>csrc/sprout_preload.c</code>), build it inside a glibc guest (proot-distro works):</p>
+<pre><code class="language-sh">proot-distro login debian --work-dir $PWD -- /usr/bin/sh -c \
   'gcc -std=c11 -O3 -flto -Wall -Wextra -Wpedantic -D_GNU_SOURCE -DSPROUT_INTERPOSE \
      -fPIC -shared -fvisibility=default -o target/libsprout-core.so \
      crates/sprout-preload/csrc/sprout_preload.c -ldl'
-./install.sh                               # picks release artifacts
+# musl flavor (same guest, needs: apt install musl-tools):
+proot-distro login debian --work-dir $PWD -- /usr/bin/sh -c \
+  'musl-gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -DSPROUT_INTERPOSE \
+     -fPIC -shared -o target/libsprout-core-musl.so \
+     crates/sprout-preload/csrc/sprout_preload.c -ldl'
+./install.sh --verify               # picks tree artifacts first, verifies hashes
 </code></pre>
-<p>The release workflow builds the exact same artifacts on <code>ubuntu-24.04-arm</code>
-and ships them as release downloads; local musl / bionic hosts must always
-use the in-guest route (see <code>development.md</code>).</p>
+<blockquote>
+<p><strong>Trap:</strong> <code>proot-distro login</code> appends <strong>Termux’s own <code>$PREFIX/bin</code></strong> to the
+guest PATH — inside the guest, <code>cargo</code>/<code>rustc</code> resolve to the <em>bionic</em> host
+toolchain unless you installed <code>rust</code> in the guest (<code>apt install cargo</code>).
+That is why a “guest” cargo build prints the same <code>skipping libsprout-core.so on Android host</code> warning: the target is still android. The
+<code>gcc</code> one-liners above are unaffected (they use the guest’s <code>/usr/bin/gcc</code>).
+Prefer guest-native cargo (<code>apt install cargo rustc</code>), or simply let
+<code>./install.sh</code> fetch the prebuilt interposers.</p>
+</blockquote>
+<p>The release workflow builds the exact same interposer artifacts on
+<code>ubuntu-24.04-arm</code> and ships them as release downloads; local musl / bionic
+hosts must always use the in-guest route (see <code>development.md</code>).</p>
 <h2 id="where-files-live-at-runtime"><a class="header" href="#where-files-live-at-runtime">Where files live at runtime</a></h2>
 <div class="table-wrapper">
 <table>
@@ -256,8 +289,9 @@ use the in-guest route (see <code>development.md</code>).</p>
 </tbody>
 </table>
 </div>
-<p>No other global state; uninstall = delete the three installed files +
-<code>~/.cache/sprout</code>.</p>
+<p>No other global state; uninstall = delete the installed files from
+<code>$PREFIX/bin</code> (sprout, sprout-super, sprout-ptrace symlink, sprout-stub,
+libsprout-core.so, libsprout-core-musl.so) and optionally the cache dir.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="proot-cli-compatibility"><a class="header" href="#proot-cli-compatibility">proot CLI compatibility</a></h1>
 <blockquote>
