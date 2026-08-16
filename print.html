@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b7e9565c.js";
+            window.path_to_searchindex_js = "searchindex-077e811f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-1f510b02.js"></script>
@@ -198,20 +198,10 @@ the guest (e.g. Mesa built natively for Turnip GPU bring-up)</li>
 <li>Vulkan visible-present workloads on Turnip (real Adreno GPU) AND llvmpipe
 (software/XShm) under termux-x11 — vkmark head-to-head benchmarks favor
 sprout on both (see <a href="#benchmarks">Benchmarks</a>).</li>
-<li>x86_64/i386 guests via the userspace binfmt adapter (box64/box32), with
-SysV semaphores emulated for the steam chain (ADR-0017 + ADR-0018) and
-SysV shared memory emulated for native guests (ADR-0020).</li>
+<li>x86_64/i386 guests via the userspace binfmt adapter (box64/box32, qemu,
+or any ARM64 emulator exposing <code>LD_PRELOAD</code>-composable startup) with
+userspace SysV IPC emulation (semaphores + shared memory).</li>
 </ul>
-<h2 id="why-not-proroot"><a class="header" href="#why-not-proroot">Why not proroot?</a></h2>
-<p><a href="https://github.com/coderredlab/proroot">proroot</a> pioneered this shape, but:</p>
-<ul>
-<li><strong>closed-source binaries</strong> — nothing to audit, nothing to patch for your app</li>
-<li><strong>no static/Go support</strong> — those binaries take raw syscalls, <code>LD_PRELOAD</code> is blind</li>
-<li><strong><code>.text</code> binary patching</strong> — modifies guest code pages, fragile across glibc versions</li>
-</ul>
-<p><code>sprout</code> is the auditable re-design: MIT/Apache-2.0, every decision in an ADR,
-reproducible benchmarks vs proot, and a testable lanes story (preload / ptrace
-supervisor / notify stub) for every workload class.</p>
 <h2 id="layout-of-this-book"><a class="header" href="#layout-of-this-book">Layout of this book</a></h2>
 <ul>
 <li><strong>User guide</strong> — install, proot-compat table, environment policy, X11/GPU</li>
