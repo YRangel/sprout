@@ -3690,6 +3690,166 @@ gid_t getegid(void) {
     return g_cfg.fakeroot ? g_fake_gid : SP_REAL(getegid)();
 }
 
+/* ---- FAKEROOT passwd/group name lookups (ptrace-only lane NSS fix) ------
+ * glibc serves getpwuid()/getpwnam() from /etc/passwd through libc-internal
+ * opens that NEVER reach the PLT — a preload lane cannot translate them.
+ * On kernels with the user-notify lane the supervisor still fixes the raw
+ * syscall, so NSS works there; on notify-less kernels (ptrace-only mode)
+ * the lookup fails with 'cannot find name for user ID 0' (bash prompt:
+ * 'I have no name!'). Under SPROUT_FAKEROOT the guest identity IS root, so
+ * synthesize the root entries directly from the exported PLT family — no
+ * filesystem access needed, lane-independent. Non-root lookups fall through
+ * to the real libc NSS (hosts where files still work keep those users). */
+#include <pwd.h>
+#include <grp.h>
+#include <stdint.h>
+
+static void sp_root_passwd(struct passwd *pw) {
+    pw->pw_name   = (char *)"root";
+    pw->pw_passwd = (char *)"x";
+    pw->pw_uid    = 0;
+    pw->pw_gid    = 0;
+    pw->pw_gecos  = (char *)"root";
+    pw->pw_dir    = (char *)"/root";
+    pw->pw_shell  = (char *)"/bin/sh";
+}
+static void sp_root_group(struct group *gr) {
+    static char *members[2] = { (char *)"root", NULL };
+    gr->gr_name   = (char *)"root";
+    gr->gr_passwd = (char *)"x";
+    gr->gr_gid    = 0;
+    gr->gr_mem    = members;
+}
+
+/* pack the synthetic root entry into the caller's buffer for *_r variants:
+ * strings first at buf, then (aligned) member-array for group. */
+static int sp_pack_passwd(struct passwd *dst, char *buf, size_t buflen) {
+    struct passwd pw; sp_root_passwd(&pw);
+    size_t need = strlen(pw.pw_name)+1 + 2 + strlen(pw.pw_gecos)+1
+                + strlen(pw.pw_dir)+1 + strlen(pw.pw_shell)+1;
+    if (buflen < need) return ERANGE;
+    char *p = buf;
+    strcpy(p, pw.pw_name);   pw.pw_name = p;   p += strlen(p)+1;
+    strcpy(p, "x");           pw.pw_passwd = p; p += 2;
+    strcpy(p, pw.pw_gecos);  pw.pw_gecos = p;  p += strlen(p)+1;
+    strcpy(p, pw.pw_dir);    pw.pw_dir = p;    p += strlen(p)+1;
+    strcpy(p, pw.pw_shell);  pw.pw_shell = p;
+    *dst = pw;
+    return 0;
+}
+static int sp_pack_group(struct group *dst, char *buf, size_t buflen) {
+    struct group gr; sp_root_group(&gr);
+    size_t need = strlen(gr.gr_name)+1 + 2 + sizeof(char *)*2 + (sizeof(char *)-1);
+    if (buflen < need) return ERANGE;
+    char *p = buf;
+    strcpy(p, gr.gr_name);  gr.gr_name = p;   p += strlen(p)+1;
+    strcpy(p, "x");          gr.gr_passwd = p; p += 2;
+    p = (char *)(((uintptr_t)p + sizeof(char *) - 1) & ~(sizeof(char *) - 1));
+    char **mem = (char **)p;
+    mem[0] = gr.gr_name;
+    mem[1] = NULL;
+    gr.gr_mem = mem;
+    *dst = gr;
+    return 0;
+}
+
+struct passwd *getpwuid(uid_t uid) {
+    static struct passwd *(*SP_REAL(getpwuid))(uid_t) = NULL;
+    SP_RESOLVE(getpwuid);
+    struct passwd *r = SP_REAL(getpwuid)(uid);
+    if (!r && sp_fakeroot_on() && uid == 0) {   /* NSS hole rescue */
+        static struct passwd pw;
+        sp_root_passwd(&pw);
+        return &pw;
+    }
+    return r;
+}
+int getpwuid_r(uid_t uid, struct passwd *pwbuf, char *buf, size_t buflen,
+               struct passwd **result) {
+    static int (*SP_REAL(getpwuid_r))(uid_t, struct passwd *, char *, size_t,
+                                      struct passwd **) = NULL;
+    SP_RESOLVE(getpwuid_r);
+    int rr = SP_REAL(getpwuid_r)(uid, pwbuf, buf, buflen, result);
+    if (result && !*result && sp_fakeroot_on() && uid == 0) {
+        int rc = sp_pack_passwd(pwbuf, buf, buflen);
+        *result = rc == 0 ? pwbuf : NULL;
+        return rc == 0 ? 0 : rc;
+    }
+    return rr;
+}
+struct passwd *getpwnam(const char *name) {
+    static struct passwd *(*SP_REAL(getpwnam))(const char *) = NULL;
+    SP_RESOLVE(getpwnam);
+    struct passwd *r = SP_REAL(getpwnam)(name);
+    if (!r && sp_fakeroot_on() && name && strcmp(name, "root") == 0) {
+        static struct passwd pw;
+        sp_root_passwd(&pw);
+        return &pw;
+    }
+    return r;
+}
+int getpwnam_r(const char *name, struct passwd *pwbuf, char *buf, size_t buflen,
+               struct passwd **result) {
+    static int (*SP_REAL(getpwnam_r))(const char *, struct passwd *, char *,
+                                      size_t, struct passwd **) = NULL;
+    SP_RESOLVE(getpwnam_r);
+    int rr = SP_REAL(getpwnam_r)(name, pwbuf, buf, buflen, result);
+    if (result && !*result && sp_fakeroot_on() && name && strcmp(name, "root") == 0) {
+        int rc = sp_pack_passwd(pwbuf, buf, buflen);
+        *result = rc == 0 ? pwbuf : NULL;
+        return rc == 0 ? 0 : rc;
+    }
+    return rr;
+}
+struct group *getgrgid(gid_t gid) {
+    static struct group *(*SP_REAL(getgrgid))(gid_t) = NULL;
+    SP_RESOLVE(getgrgid);
+    struct group *r = SP_REAL(getgrgid)(gid);
+    if (!r && sp_fakeroot_on() && gid == 0) {
+        static struct group gr;
+        sp_root_group(&gr);
+        return &gr;
+    }
+    return r;
+}
+int getgrgid_r(gid_t gid, struct group *grbuf, char *buf, size_t buflen,
+               struct group **result) {
+    static int (*SP_REAL(getgrgid_r))(gid_t, struct group *, char *, size_t,
+                                      struct group **) = NULL;
+    SP_RESOLVE(getgrgid_r);
+    int rr = SP_REAL(getgrgid_r)(gid, grbuf, buf, buflen, result);
+    if (result && !*result && sp_fakeroot_on() && gid == 0) {
+        int rc = sp_pack_group(grbuf, buf, buflen);
+        *result = rc == 0 ? grbuf : NULL;
+        return rc == 0 ? 0 : rc;
+    }
+    return rr;
+}
+struct group *getgrnam(const char *name) {
+    static struct group *(*SP_REAL(getgrnam))(const char *) = NULL;
+    SP_RESOLVE(getgrnam);
+    struct group *r = SP_REAL(getgrnam)(name);
+    if (!r && sp_fakeroot_on() && name && strcmp(name, "root") == 0) {
+        static struct group gr;
+        sp_root_group(&gr);
+        return &gr;
+    }
+    return r;
+}
+int getgrnam_r(const char *name, struct group *grbuf, char *buf, size_t buflen,
+               struct group **result) {
+    static int (*SP_REAL(getgrnam_r))(const char *, struct group *, char *,
+                                      size_t, struct group **) = NULL;
+    SP_RESOLVE(getgrnam_r);
+    int rr = SP_REAL(getgrnam_r)(name, grbuf, buf, buflen, result);
+    if (result && !*result && sp_fakeroot_on() && name && strcmp(name, "root") == 0) {
+        int rc = sp_pack_group(grbuf, buf, buflen);
+        *result = rc == 0 ? grbuf : NULL;
+        return rc == 0 ? 0 : rc;
+    }
+    return rr;
+}
+
 /* dlopen entry interception. glibc's ld.so opens libraries via ITS OWN
  * private __open* routines — a PLT interposer can never see those. What we
  * CAN intercept is the exported dlopen() entry point: translate the path,

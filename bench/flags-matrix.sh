@@ -64,6 +64,8 @@ T "-p remap-1024+80"        "$($S -r $B -p /usr/bin/python3 /tmp/sp_bind80.py; s
 T "--sysvipc-parse"         "$($S -r $B --sysvipc /usr/bin/true; echo rc=$?)" "rc=0"
 T "--ashmem-memfd"          "$($S -r $B --ashmem-memfd /usr/bin/python3 /tmp/sp_memfd.py)" "True"
 T "--kill-on-exit"          "$(P=$B/tmp/sp-koe.pid; rm -f $P; $S -r $B --kill-on-exit /bin/bash -c 'sleep 47 & echo "$!" > /tmp/sp-koe.pid' >/dev/null 2>&1; sleep 0.4; PID=$(cat $P 2>/dev/null); ( kill -0 $PID 2>/dev/null && echo alive ) || echo dead; rm -f $P)" "dead"
+T "ptrace-only whoami"      "$(SPROUT_USER_NOTIFY=0 $S -r $B /usr/bin/whoami 2>/dev/null)" "root"
+T "ptrace-only id"          "$(SPROUT_USER_NOTIFY=0 $S -r $B /usr/bin/id 2>/dev/null)" "uid=0(root) gid=0(root) groups=0(root)"
 
 echo "SUMMARY: pass=$pass fail=$fail"
 
