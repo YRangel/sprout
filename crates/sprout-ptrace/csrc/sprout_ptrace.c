@@ -1103,6 +1103,10 @@ static void reverse_pending_addr(pid_t pid, tracee_t *t) {
     t->rev_sysno = 0;
 }
 
+/* user-notify lane selector: installed/served only when available. Declared
+ * up here because apply_policy_entry's dynamic-gate reads it. */
+static int g_notify = 0;           /* 1 = install+serve the notify filter */
+
 static void apply_policy_entry(tracee_t *t, pid_t pid,
                                 long sysno, unsigned long long x0, unsigned long long x1) {
     (void)x0; (void)x1;
@@ -1138,8 +1142,14 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
     }
 
     /* Path translation for supervisor-governed tracees (static=1, dynamic
-     * Go=2). Plain dynamic processes have the LD_PRELOAD interposer. */
-    if (t->static_kind <= 0) return;
+     * Go=2). Plain dynamic processes have the LD_PRELOAD interposer —
+     * EXCEPT on ptrace-only kernels, where the preload cannot cover
+     * libc-internal syscall callers (ld.so DT_NEEDED opens, NSS
+     * /etc/passwd), so the syscall-stop lane must translate those too.
+     * Preload-originated calls arrive already translated (idempotent
+     * through the rootfs prefix), so running the gate for dynamics when
+     * !g_notify is safe. */
+    if (t->static_kind <= 0 && g_notify) return;
 
     /* execve/execveat of a DYNAMIC (or script) target from a static
      * process: the kernel cannot satisfy PT_INTERP on the host (empty
@@ -1304,7 +1314,6 @@ static int sp_statx(int dirfd, const char *path, int flags, unsigned int mask, s
 #define SYS_pidfd_open 434
 #endif
 
-static int g_notify = 0;           /* 1 = install+serve the filter */
 static int g_notify_fd = -1;       /* listener fd owned by supervisor */
 static int g_notify_addfd = -1;    /* ADDFD ioctl availability (live-probed) */
 
@@ -2552,6 +2561,12 @@ int main(int argc, char **argv) {
     }
     if (g_debug)
         fprintf(stderr, "[notify] mode=%s\n", g_notify ? "user-notify" : "ptrace-only");
+    /* ptrace-only kernels: preload cannot see libc-internal opens (ld.so
+     * library loads, NSS /etc/passwd lookups) — dynamic/image shadow
+     * free-runs would leave those untranslated (mandb 'cannot open
+     * libmandb-*.so', whoami 'cannot find name'). Proot parity: with no
+     * notify filter available, supervise ALL tracees at the syscall level. */
+    if (!g_notify) g_shadow = 0;
 
     /* (ADR-0016) notify-statics lane: kind 1/2 guests (static, Go-static)
      * launch through the freestanding sprout-stub instead of

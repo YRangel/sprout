@@ -3713,6 +3713,163 @@ static void sp_root_passwd(struct passwd *pw) {
     pw->pw_dir    = (char *)"/root";
     pw->pw_shell  = (char *)"/bin/sh";
 }
+/* ---- guest NSS file caches (passwd+group) ---------------------------------
+ * When the real NSS lookup cannot see a translated /etc/passwd (notify-less
+ * kernels), names other than root still fail (apt: "No sandbox user _apt").
+ * Parse the GUEST /etc/passwd and /etc/group ourselves through our own
+ * fopen interposer (which does translate "/etc/passwd" to the rootfs path).
+ * Refreshed on setpwent/setgrent (cheap, always-current) and on the first
+ * fallback per process. Static storage like glibc's own non-_r variants. */
+#define SP_PW_CACHE_MAX 192
+struct sp_pwentry { struct passwd pw; char buf[160]; };
+static struct sp_pwentry sp_pw_cache[SP_PW_CACHE_MAX];
+static int sp_pw_cache_n = -1;      /* -1 = never parsed */
+static int sp_pw_idx = 0;           /* getpwent cursor */
+
+struct sp_gren { struct group gr; char buf[224]; char *mem[12]; };
+#define SP_GR_CACHE_MAX 96
+static struct sp_gren sp_gr_cache[SP_GR_CACHE_MAX];
+static int sp_gr_cache_n = -1;
+static int sp_gr_idx = 0;
+
+static char *sp_fsa(char **p, const char *x) { char *q=*p; strcpy(q,x); *p+=strlen(x)+1; return q; }
+/* copy entry's strings into caller buffer, retarget pointers */
+static int sp_pack_passwd_from(const struct passwd *src, struct passwd *dst, char *buf, size_t buflen) {
+    size_t need = strlen(src->pw_name)+2 + strlen(src->pw_gecos)+1
+                + strlen(src->pw_dir)+1 + strlen(src->pw_shell)+1;
+    if (buflen < need) return ERANGE;
+    char *p = buf;
+    dst->pw_name   = sp_fsa(&p, src->pw_name);
+    dst->pw_passwd = sp_fsa(&p, src->pw_passwd ? src->pw_passwd : "x");
+    dst->pw_gecos  = sp_fsa(&p, src->pw_gecos ? src->pw_gecos : "");
+    dst->pw_dir    = sp_fsa(&p, src->pw_dir);
+    dst->pw_shell  = sp_fsa(&p, src->pw_shell);
+    dst->pw_uid = src->pw_uid; dst->pw_gid = src->pw_gid;
+    return 0;
+}
+static int sp_pack_group_from(const struct group *src, struct group *dst, char *buf, size_t buflen) {
+    size_t need = strlen(src->gr_name)+2 + (sizeof(char *)*2) + (sizeof(char *)-1);
+    if (src->gr_mem) for (int i = 0; src->gr_mem[i]; i++) need += strlen(src->gr_mem[i])+1 + sizeof(char *);
+    if (buflen < need) return ERANGE;
+    char *p = buf;
+    char *name = sp_fsa(&p, src->gr_name);
+    dst->gr_passwd = sp_fsa(&p, src->gr_passwd ? src->gr_passwd : "x");
+    dst->gr_name = name;
+    p = (char *)(((uintptr_t)p + sizeof(char *) - 1) & ~(sizeof(char *) - 1));
+    char **mem = (char **)p; p += 2 * sizeof(char *);
+    int nm = 0;
+    if (src->gr_mem) {
+        for (; src->gr_mem[nm] && p + sizeof(char *) + 32 < buf + buflen; nm++) {
+            char *s2 = sp_fsa(&p, src->gr_mem[nm]);
+            mem[nm] = s2;
+            p += sizeof(char *);
+        }
+    }
+    mem[nm] = NULL;
+    dst->gr_mem = mem;
+    dst->gr_gid = src->gr_gid;
+    return 0;
+}
+
+static const char *sp_colon(const char *x) { const char *q = strchr(x, ':'); return q ? q + 1 : NULL; }
+static void sp_passwd_refresh(void) {
+    FILE *f = fopen("/etc/passwd", "r");   /* interposed: guest path translated */
+    if (!f) { sp_pw_cache_n = 0; return; }
+    int n = 0; char line[400];
+    while (n < SP_PW_CACHE_MAX && fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        struct sp_pwentry *e = &sp_pw_cache[n];
+        char *p = e->buf; *p = 0;
+        const char *f0 = line, *f1, *f2, *f3, *f4, *f5, *f6;
+        if (!(f1=sp_colon(f0))) continue;
+        if (!(f2=sp_colon(f1))) continue;
+        if (!(f3=sp_colon(f2))) continue;
+        if (!(f4=sp_colon(f3))) continue;
+        if (!(f5=sp_colon(f4))) continue;
+        if (!(f6=sp_colon(f5))) continue;
+        const char *end = strchr(f6, '\n');
+        int ln0 = (int)(f1-f0)-1; if (ln0 < 1 || ln0 > 45) continue;
+        char *name = p; memcpy(p, f0, ln0); p += ln0; *p++ = 0;
+        int lpw = (int)(f2-f1)-1; if (lpw < 0 || lpw > 45) lpw = 1;
+        char *pw_ = p; memcpy(p, f1, lpw); p += lpw; *p++ = 0;
+        int uid = atoi(f2), gid = atoi(f3);
+        int lg = (int)(f5-f4)-1; if (lg < 0) lg = 0; if (lg > 60) lg = 60;
+        char *gec = p; memcpy(p, f4, lg); p += lg; *p++ = 0;
+        int lh = (int)(f6-f5)-1; if (lh < 1) { lh=1; }
+        if (lh > 60) lh = 60;
+        char *home = p; memcpy(p, f5, lh); p += lh; *p++ = 0;
+        char *sh = p;
+        if (end) { int ls=(int)(end-f6); if (ls>60) ls=60; memcpy(p,f6,ls); p+=ls; }
+        else { memcpy(p, f6, 9); p += 9; }
+        *p++ = 0;
+        e->pw.pw_name=name; e->pw.pw_passwd=pw_; e->pw.pw_uid=(uid_t)uid; e->pw.pw_gid=(gid_t)gid;
+        e->pw.pw_gecos=gec; e->pw.pw_dir=home; e->pw.pw_shell=sh;
+        n++;
+    }
+    fclose(f);
+    sp_pw_cache_n = n; sp_pw_idx = 0;
+}
+static void sp_group_refresh(void) {
+    FILE *f = fopen("/etc/group", "r");
+    if (!f) { sp_gr_cache_n = 0; return; }
+    int n = 0; char line[400];
+    while (n < SP_GR_CACHE_MAX && fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        struct sp_gren *e = &sp_gr_cache[n];
+        char *p = e->buf; *p = 0;
+        const char *f0 = line, *f1, *f2, *f3, *end;
+        if (!(f1=sp_colon(f0))) continue;
+        if (!(f2=sp_colon(f1))) continue;
+        if (!(f3=sp_colon(f2))) continue;
+        end = strchr(f3, '\n');
+        int ln0 = (int)(f1-f0)-1; if (ln0 < 1 || ln0 > 45) continue;
+        char *name = p; memcpy(p, f0, ln0); p += ln0; *p++ = 0;
+        int lpw = (int)(f2-f1)-1; if (lpw < 0 || lpw > 45) lpw = 1;
+        char *pw_ = p; memcpy(p, f1, lpw); p += lpw; *p++ = 0;
+        int gid = atoi(f2);
+        int nm = 0;
+        const char *m = f3;
+        while (m && nm < 11) {
+            const char *c = strchr(m, ','); const char *e2 = c ? c : end;
+            int lm = (int)(e2-m); if (lm < 1) break;
+            if (lm > 45) lm = 45;
+            char *mb = p; memcpy(p, m, lm); p += lm; *p++ = 0;
+            e->mem[nm++] = mb;
+            m = c ? c + 1 : NULL;
+            if (!c) break;
+        }
+        e->mem[nm] = NULL;
+        e->gr.gr_name=name; e->gr.gr_passwd=pw_; e->gr.gr_gid=(gid_t)gid; e->gr.gr_mem=e->mem;
+        n++;
+    }
+    fclose(f);
+    sp_gr_cache_n = n; sp_gr_idx = 0;
+}
+static struct passwd *sp_guest_getpwuid(uid_t uid) {
+    if (sp_pw_cache_n < 0) sp_passwd_refresh();
+    for (int i = 0; i < sp_pw_cache_n; i++)
+        if (sp_pw_cache[i].pw.pw_uid == uid) return &sp_pw_cache[i].pw;
+    return NULL;
+}
+static struct passwd *sp_guest_getpwnam(const char *name) {
+    if (sp_pw_cache_n < 0) sp_passwd_refresh();
+    for (int i = 0; i < sp_pw_cache_n; i++)
+        if (!strcmp(sp_pw_cache[i].pw.pw_name, name)) return &sp_pw_cache[i].pw;
+    return NULL;
+}
+static struct group *sp_guest_getgrgid(gid_t gid) {
+    if (sp_gr_cache_n < 0) sp_group_refresh();
+    for (int i = 0; i < sp_gr_cache_n; i++)
+        if (sp_gr_cache[i].gr.gr_gid == gid) return &sp_gr_cache[i].gr;
+    return NULL;
+}
+static struct group *sp_guest_getgrnam(const char *name) {
+    if (sp_gr_cache_n < 0) sp_group_refresh();
+    for (int i = 0; i < sp_gr_cache_n; i++)
+        if (!strcmp(sp_gr_cache[i].gr.gr_name, name)) return &sp_gr_cache[i].gr;
+    return NULL;
+}
+
 static void sp_root_group(struct group *gr) {
     static char *members[2] = { (char *)"root", NULL };
     gr->gr_name   = (char *)"root";
@@ -3757,7 +3914,8 @@ struct passwd *getpwuid(uid_t uid) {
     static struct passwd *(*SP_REAL(getpwuid))(uid_t) = NULL;
     SP_RESOLVE(getpwuid);
     struct passwd *r = SP_REAL(getpwuid)(uid);
-    if (!r && sp_fakeroot_on() && uid == 0) {   /* NSS hole rescue */
+    if (!r) r = sp_guest_getpwuid(uid);          /* notify-less lane: guest file */
+    if (!r && sp_fakeroot_on() && uid == 0) {   /* last resort: synth root */
         static struct passwd pw;
         sp_root_passwd(&pw);
         return &pw;
@@ -3770,10 +3928,15 @@ int getpwuid_r(uid_t uid, struct passwd *pwbuf, char *buf, size_t buflen,
                                       struct passwd **) = NULL;
     SP_RESOLVE(getpwuid_r);
     int rr = SP_REAL(getpwuid_r)(uid, pwbuf, buf, buflen, result);
-    if (result && !*result && sp_fakeroot_on() && uid == 0) {
-        int rc = sp_pack_passwd(pwbuf, buf, buflen);
-        *result = rc == 0 ? pwbuf : NULL;
-        return rc == 0 ? 0 : rc;
+    if (result && !*result) {
+        struct passwd *g = sp_guest_getpwuid(uid);
+        struct passwd pw;
+        if (!g && sp_fakeroot_on() && uid == 0) { sp_root_passwd(&pw); g = &pw; }
+        if (g) {
+            int rc = sp_pack_passwd_from(g, pwbuf, buf, buflen);
+            *result = rc == 0 ? pwbuf : NULL;
+            return rc == 0 ? 0 : rc;
+        }
     }
     return rr;
 }
@@ -3781,6 +3944,7 @@ struct passwd *getpwnam(const char *name) {
     static struct passwd *(*SP_REAL(getpwnam))(const char *) = NULL;
     SP_RESOLVE(getpwnam);
     struct passwd *r = SP_REAL(getpwnam)(name);
+    if (!r && name) r = sp_guest_getpwnam(name);
     if (!r && sp_fakeroot_on() && name && strcmp(name, "root") == 0) {
         static struct passwd pw;
         sp_root_passwd(&pw);
@@ -3794,10 +3958,15 @@ int getpwnam_r(const char *name, struct passwd *pwbuf, char *buf, size_t buflen,
                                       size_t, struct passwd **) = NULL;
     SP_RESOLVE(getpwnam_r);
     int rr = SP_REAL(getpwnam_r)(name, pwbuf, buf, buflen, result);
-    if (result && !*result && sp_fakeroot_on() && name && strcmp(name, "root") == 0) {
-        int rc = sp_pack_passwd(pwbuf, buf, buflen);
-        *result = rc == 0 ? pwbuf : NULL;
-        return rc == 0 ? 0 : rc;
+    if (result && !*result && name) {
+        struct passwd *g = sp_guest_getpwnam(name);
+        struct passwd pw;
+        if (!g && sp_fakeroot_on() && strcmp(name, "root") == 0) { sp_root_passwd(&pw); g = &pw; }
+        if (g) {
+            int rc = sp_pack_passwd_from(g, pwbuf, buf, buflen);
+            *result = rc == 0 ? pwbuf : NULL;
+            return rc == 0 ? 0 : rc;
+        }
     }
     return rr;
 }
@@ -3805,6 +3974,7 @@ struct group *getgrgid(gid_t gid) {
     static struct group *(*SP_REAL(getgrgid))(gid_t) = NULL;
     SP_RESOLVE(getgrgid);
     struct group *r = SP_REAL(getgrgid)(gid);
+    if (!r) r = sp_guest_getgrgid(gid);
     if (!r && sp_fakeroot_on() && gid == 0) {
         static struct group gr;
         sp_root_group(&gr);
@@ -3818,10 +3988,15 @@ int getgrgid_r(gid_t gid, struct group *grbuf, char *buf, size_t buflen,
                                       struct group **) = NULL;
     SP_RESOLVE(getgrgid_r);
     int rr = SP_REAL(getgrgid_r)(gid, grbuf, buf, buflen, result);
-    if (result && !*result && sp_fakeroot_on() && gid == 0) {
-        int rc = sp_pack_group(grbuf, buf, buflen);
-        *result = rc == 0 ? grbuf : NULL;
-        return rc == 0 ? 0 : rc;
+    if (result && !*result) {
+        struct group *g = sp_guest_getgrgid(gid);
+        struct group gr;
+        if (!g && sp_fakeroot_on() && gid == 0) { sp_root_group(&gr); g = &gr; }
+        if (g) {
+            int rc = sp_pack_group_from(g, grbuf, buf, buflen);
+            *result = rc == 0 ? grbuf : NULL;
+            return rc == 0 ? 0 : rc;
+        }
     }
     return rr;
 }
@@ -3829,6 +4004,7 @@ struct group *getgrnam(const char *name) {
     static struct group *(*SP_REAL(getgrnam))(const char *) = NULL;
     SP_RESOLVE(getgrnam);
     struct group *r = SP_REAL(getgrnam)(name);
+    if (!r && name) r = sp_guest_getgrnam(name);
     if (!r && sp_fakeroot_on() && name && strcmp(name, "root") == 0) {
         static struct group gr;
         sp_root_group(&gr);
@@ -3842,10 +4018,15 @@ int getgrnam_r(const char *name, struct group *grbuf, char *buf, size_t buflen,
                                       size_t, struct group **) = NULL;
     SP_RESOLVE(getgrnam_r);
     int rr = SP_REAL(getgrnam_r)(name, grbuf, buf, buflen, result);
-    if (result && !*result && sp_fakeroot_on() && name && strcmp(name, "root") == 0) {
-        int rc = sp_pack_group(grbuf, buf, buflen);
-        *result = rc == 0 ? grbuf : NULL;
-        return rc == 0 ? 0 : rc;
+    if (result && !*result && name) {
+        struct group *g = sp_guest_getgrnam(name);
+        struct group gr;
+        if (!g && sp_fakeroot_on() && strcmp(name, "root") == 0) { sp_root_group(&gr); g = &gr; }
+        if (g) {
+            int rc = sp_pack_group_from(g, grbuf, buf, buflen);
+            *result = rc == 0 ? grbuf : NULL;
+            return rc == 0 ? 0 : rc;
+        }
     }
     return rr;
 }
