@@ -1565,27 +1565,58 @@ static int sp_notify_sock_dup(pid_t pid, int childfd) {
 /* Read the tracee's sockaddr at (addr,alen); if it is a translatable
  * AF_UNIX *pathname* (absolute, non-abstract), produce the host form in
  * `out` and return its length; else 0. */
+static uint64_t sp_sock_fnv64(const char *s) {
+    uint64_t h = 1469598103934665603ULL;   /* FNV-1a 64 */
+    while (*s) { h ^= (unsigned char)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+
 static socklen_t sp_notify_unix_to_host(pid_t pid, unsigned long long addr,
                                         unsigned long long alen,
                                         struct sockaddr_un *out) {
     if (alen > sizeof(struct sockaddr_un) || alen < 3) return 0;
     unsigned char buf[sizeof(struct sockaddr_un)];
     memset(buf, 0, sizeof(buf));
-    if (sp_vm_read(pid, buf, alen, addr) != (ssize_t)alen) return 0;
+    if (sp_vm_read(pid, buf, alen, addr) != (ssize_t)alen) { if (g_debug) SP_TRACE("[notify] unix_to_host: vm_read fail alen=%llu addr=%llx\n", alen, addr); return 0; }
     struct sockaddr_un *su = (struct sockaddr_un *)buf;
-    if (su->sun_family != AF_UNIX) return 0;
-    if (su->sun_path[0] != '/') return 0; /* abstract or unnamed: host is fine */
+    if (su->sun_family != AF_UNIX) { if (g_debug) SP_TRACE("[notify] unix_to_host: family=%d\n", su->sun_family); return 0; }
+    if (g_debug) {
+        /* TEMP-DBG: full sockaddr hex dump to settle byte layout */
+        char hx[512]; int k = 0;
+        size_t lim = alen < 64 ? alen : 64;
+        for (size_t i = 0; i < lim; i++) { k += snprintf(hx + k, sizeof(hx) - k, "%02x", buf[i]); if ((i & 15) == 7) hx[k++] = '.'; }
+        hx[k] = 0;
+        SP_TRACE("[notify] unix_to_host: RAW alen=%llu %s\n", (unsigned long long)alen, hx);
+    }
+    if (su->sun_path[0] != '/') { if (g_debug) SP_TRACE("[notify] unix_to_host: non-abs (abstract/unnamed) byte=%02x\n", (unsigned)su->sun_path[0]); return 0; }
     char guest[SP_PATH_MAX], host[SP_PATH_MAX];
     size_t gl = strnlen(su->sun_path, sizeof(su->sun_path));
     if (gl == 0 || gl >= sizeof(guest)) return 0;
     memcpy(guest, su->sun_path, gl + 1);
+    /* Bind/connect take the rootfs-translated spelling so the resulting
+     * path matches EVERY other file op the guest performs (FEX's own
+     * mkdir/vfs-emu lands guest /tmp at rootfs/tmp too). Where that
+     * deep path exceeds the 108-byte sun_path cap, fall through to the
+     * stable abstract-digest form below — both ends hash identically. */
     if (!sp_notify_hostpath(pid, guest, host, sizeof host)) return 0;
     size_t hl = strlen(host);
-    if (hl >= sizeof(out->sun_path)) return 0;
     memset(out, 0, sizeof(*out));
     out->sun_family = AF_UNIX;
-    memcpy(out->sun_path, host, hl + 1);
-    return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + hl + 1);
+    if (hl < sizeof(out->sun_path)) {
+        memcpy(out->sun_path, host, hl + 1);
+        return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + hl + 1);
+    }
+    /* guest's sun_path translated to a host path longer than the 108-byte
+     * sockaddr_un limit (rootfs deep in /data/data/...). Connecting peers
+     * translate the same way, so a STABLE digest of the full host path in
+     * the abstract namespace lands both ends at the same kernel object
+     * without touching the FS. */
+    int n = snprintf(out->sun_path, sizeof(out->sun_path), "%csprout:%016lx", '\0', (unsigned long)sp_sock_fnv64(host));
+    if (n > 0 && n < (int)sizeof(out->sun_path) && g_debug)
+        SP_TRACE("[notify] unix %s -> abstract(digest)\n", guest);
+    /* n = bytes written counting the LEADING NUL marker, excluding the
+     * snprintf sentinel; abstract namespace needs no trailing NUL. */
+    return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + (n > 0 ? (size_t)n : 1));
 }
 
 /* ---- iovec gather for sendto/sendmsg notify-serve ---- */
@@ -1895,10 +1926,11 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
     case 221: { /* execve(path,argv,envp) — lazy-attach rewrite (ADR-0016 T3) */
         if (sp_notify_read_str(pid, args[0], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
         if (guest[0] != '/') { sp_notify_continue(resp); return; } /* relative: tracee cwd is host-real */
-        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { if (g_debug) SP_TRACE("[dbg221] hostpath FAIL guest='%s' -> CONT\n", guest); sp_notify_continue(resp); return; }
         char interp[SP_PATH_MAX]; interp[0] = '\0';
         char opt[SP_PATH_MAX]; opt[0] = '\0';
         int cls = classify_host_file(host, interp, opt);
+        if (g_debug) SP_TRACE("[dbg221] guest='%s' host='%s' cls=%d\n", guest, host, cls);
         if (cls == 1 || cls == 0) {
             /* static→static: in-place string edit when it fits; otherwise
              * and for static→dynamic (cls==0, the PT_INTERP chain) the
@@ -2027,6 +2059,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
         if (guest[0] != '/') { sp_notify_continue(resp); return; }
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (g_debug) SP_TRACE("[notify] mkdirat guest='%s' host='%s'\n", guest, host);
         int rc = mkdir(host, (mode_t)args[2]);
         if (rc < 0) { resp->error = -errno; return; }
         resp->error = 0; resp->val = 0;
@@ -2164,9 +2197,9 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
     case 203: { /* connect(fd,addr,alen) */
         struct sockaddr_un hsa;
         socklen_t hlen = sp_notify_unix_to_host(pid, args[1], args[2], &hsa);
-        if (hlen == 0) { sp_notify_continue(resp); return; }
+        if (hlen == 0) { if (g_debug) SP_TRACE("[notify] bind/connect CONT: unix_to_host=0 nr=%llu\n", nr); sp_notify_continue(resp); return; }
         int d = sp_notify_sock_dup(pid, (int)args[0]);
-        if (d < 0) { sp_notify_continue(resp); return; }
+        if (d < 0) { if (g_debug) SP_TRACE("[notify] bind/connect CONT: sock_dup fail nr=%llu\n", nr); sp_notify_continue(resp); return; }
         int rc = (nr == 200)
                ? bind(d, (struct sockaddr *)&hsa, hlen)
                : connect(d, (struct sockaddr *)&hsa, hlen);
