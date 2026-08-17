@@ -1,6 +1,6 @@
 [package]
 name = "sprout-preload"
-version = "0.4.4"
+version = "0.4.5"
 description = "Build + discovery for the C11 LD_PRELOAD path-translation core (see ADR-0001). The shipped artifact is a C shared object, not Rust."
 edition.workspace = true
 license.workspace = true
