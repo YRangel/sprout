@@ -2,6 +2,10 @@
 B=/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs
 A=/data/data/com.termux/files/usr/var/lib/proot-distro/containers/alpine/rootfs
 S=$PREFIX/bin/sprout
+# Deterministic temp fixtures (cold-tmpdir flake: the -b cell used to rely
+# on marker state some OTHER run happened to leave behind).
+mkdir -p "$TMPDIR/sp-a"
+printf 'mark' > "$TMPDIR/sp-a/marker"
 pass=0; fail=0
 T(){
   local name="$1" got="$2" want="$3"
