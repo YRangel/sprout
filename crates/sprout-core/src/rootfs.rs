@@ -247,7 +247,16 @@ impl Rootfs {
             if !md.file_type().is_symlink() {
                 return Some(host);
             }
-            let t = std::fs::read_link(&host).ok()?;
+            let mut t = std::fs::read_link(&host).ok()?;
+            /* proot-distro link2symlink spells targets HOST-absolute
+             * ($B/.l2s/...); strip the rootfs prefix back to guest form
+             * so the next hop re-maps it correctly instead of
+             * double-prefixing into a miss. */
+            if t.is_absolute() {
+                if let Ok(stripped) = t.strip_prefix(&self.root) {
+                    t = Path::new("/").join(stripped);
+                }
+            }
             cur = if t.is_absolute() {
                 t
             } else {

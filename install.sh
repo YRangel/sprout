@@ -25,6 +25,30 @@ esac
 DEST=${1:-${PREFIX:-$HOME/.local}/bin}
 SRC=${2:-$(cd "$(dirname "$0")" && pwd)}
 
+# Freshness guard (stale-slot trap, deployed twice on 2026-08-16):
+# build/*/out accumulates hashed dirs keyed by build-input hash; a stale slot
+# from an EARLIER compile of the same crate can shadow the just-built fresh
+# one if the glob returns them in the wrong order. Guard by comparing each
+# slot's mtime against the newest source file of its crate; a slot older than
+# the csrc is rejected with an actionable warning instead of silently
+# deploying pre-fix bytes.
+csrc_max_mtime() {
+    # $1 = crate dir containing csrc/ (or Rust src/)
+    find "$SRC/crates/$1/csrc" "$SRC/crates/$1/src" \
+         -name '*.c' -o -name '*.h' -o -name '*.rs' -o -name 'Cargo.toml' 2>/dev/null \
+        | xargs -r $STAT_MTIME 2>/dev/null | sort -rn | head -1
+}
+crate_of() {
+    case "$1" in
+        sprout)          echo sprout-cli ;;
+        sprout-super|sprout-ptrace|sprout-stub) echo sprout-ptrace ;;
+        libsprout-core.so|libsprout-core-musl.so) echo sprout-preload ;;
+        *)               echo "" ;;
+    esac
+}
+STAT_MTIME='stat -c %Y'
+command -v stat >/dev/null 2>&1 || STAT_MTIME='ls -lT'
+
 pick() {
     # $1 = filename to locate under $SRC
     case ${2:-} in
@@ -33,11 +57,35 @@ pick() {
     esac
     # build/*/out accumulates per-source-changes: newest must win
     # (deploy-discipline law — first-glob can silently downgrade, and did).
-    local newest
+    local newest crate nmt smt
     newest=$(ls -t "$SRC"/target/release/build/*/out/"$1" "$SRC"/target/debug/build/*/out/"$1" 2>/dev/null | head -1)
-    if [ -n "$newest" ]; then echo "$newest"; return; fi
+    if [ -n "$newest" ]; then
+        crate=$(crate_of "$1")
+        if [ -n "$crate" ] && command -v stat >/dev/null 2>&1; then
+            smt=$(csrc_max_mtime "$crate")
+            nmt=$($STAT_MTIME "$newest" 2>/dev/null)
+            if [ -n "$smt" ] && [ -n "$nmt" ] && [ "$nmt" -lt "$smt" ]; then
+                echo "install.sh: STALE $newest (mtime $nmt < csrc mtime $smt)" >&2
+                echo "install.sh: run 'cargo build --release' first, or rm -rf target/release/build/*/out/" >&2
+            else
+                echo "$newest"; return
+            fi
+        else
+            echo "$newest"; return
+        fi
+    fi
+    # Loose-root fallback: only when NOT in a git checkout (tarball use),
+    # or with explicit SPROUT_ALLOW_LOOSE=1 — a stale stray .so from an old
+    # verify rehearsal must NOT silently re-install (deploy-discipline law).
     for d in "$SRC" "$SRC"/target; do
-        if [ -f "$d/$1" ]; then echo "$d/$1"; return; fi
+        if [ -f "$d/$1" ]; then
+            if [ -d "$SRC/.git" ] && [ "${SPROUT_ALLOW_LOOSE:-0}" != "1" ]; then
+                echo "install.sh: ignoring loose $d/$1 inside git checkout" >&2
+                echo "install.sh: SPROUT_ALLOW_LOOSE=1 to override, else the release fetch will supply it" >&2
+                continue
+            fi
+            echo "$d/$1"; return
+        fi
     done
     echo ""
 }

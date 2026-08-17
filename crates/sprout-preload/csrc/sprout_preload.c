@@ -137,6 +137,43 @@ static int path_within(const char *prefix, size_t plen, const char *path) {
            (path[plen] == '\0' || path[plen] == '/');
 }
 
+#include <sys/syscall.h>
+
+/* Resolve a translated path's symlink chain INSIDE the rootfs so that
+ * guest-spelled absolute targets (distro /etc/alternatives/*, proot-distro
+ * "/.l2s/.l2s.*" links) do not leak to the host root when the kernel
+ * follows them. Host-spelled targets (already rootfs-prefixed, e.g.
+ * proot-distro's '$B/.l2s/...' spellings) are adopted verbatim.
+ * Raw syscalls only — the interposed wrappers would recurse. */
+static void sp_resolve_links(const sp_config_t *cfg, char out[SP_PATH_MAX]) {
+    if (cfg->rootfs_len == 0) return;
+    struct stat kb;
+    char link[SP_PATH_MAX];
+    for (int hops = 0; hops < 8; hops++) {
+        if (syscall(SYS_newfstatat, AT_FDCWD, out, &kb, AT_SYMLINK_NOFOLLOW) != 0)
+            return;
+        if (!S_ISLNK(kb.st_mode)) return;
+        ssize_t n = syscall(SYS_readlinkat, AT_FDCWD, out, link, sizeof(link) - 1);
+        if (n <= 0 || (size_t)n >= sizeof(link)) return;
+        link[n] = '\0';
+        if (link[0] != '/') {
+            char *slash = strrchr(out, '/');
+            if (!slash) return;
+            size_t dirlen = (size_t)(slash - out) + 1;
+            if (dirlen + (size_t)n + 1 > SP_PATH_MAX) return;
+            memmove(out + dirlen, link, (size_t)n + 1);
+            continue;
+        }
+        if (path_within(cfg->rootfs, cfg->rootfs_len, link)) {
+            memmove(out, link, (size_t)n + 1);
+            continue;
+        }
+        if (cfg->rootfs_len + (size_t)n + 1 > SP_PATH_MAX) return;
+        memmove(out + cfg->rootfs_len, link, (size_t)n + 1);
+        memcpy(out, cfg->rootfs, cfg->rootfs_len);
+    }
+}
+
 int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]) {
     if (!path || path[0] != '/') return 0; /* relative paths resolve against cwd, untouched */
 
@@ -163,6 +200,7 @@ int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]
         if (b->host_len + rest + 1 > SP_PATH_MAX) return 0;
         memcpy(out, b->host, b->host_len);
         memcpy(out + b->host_len, path + b->guest_len, rest + 1);
+        sp_resolve_links(cfg, out);
         return 1;
     }
 
@@ -177,6 +215,7 @@ int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]
     if (cfg->rootfs_len + n + 1 > SP_PATH_MAX) return 0;
     memcpy(out, cfg->rootfs, cfg->rootfs_len);
     memcpy(out + cfg->rootfs_len, path, n + 1);
+    sp_resolve_links(cfg, out);
     return 1;
 }
 

@@ -66,6 +66,11 @@ T "--ashmem-memfd"          "$($S -r $B --ashmem-memfd /usr/bin/python3 /tmp/sp_
 T "--kill-on-exit"          "$(P=$B/tmp/sp-koe.pid; rm -f $P; $S -r $B --kill-on-exit /bin/bash -c 'sleep 47 & echo "$!" > /tmp/sp-koe.pid' >/dev/null 2>&1; sleep 0.4; PID=$(cat $P 2>/dev/null); ( kill -0 $PID 2>/dev/null && echo alive ) || echo dead; rm -f $P)" "dead"
 T "ptrace-only whoami"      "$(SPROUT_USER_NOTIFY=0 $S -r $B /usr/bin/whoami 2>/dev/null)" "root"
 T "ptrace-only id"          "$(SPROUT_USER_NOTIFY=0 $S -r $B /usr/bin/id 2>/dev/null)" "uid=0(root) gid=0(root) groups=0(root)"
+
+# .l2s link2symlink deref (both species: guest-spelled + host-spelled)
+T "l2s status-old deref"   "$($S -r $B /usr/bin/head -1 /var/lib/dpkg/status-old 2>/dev/null | cut -d: -f1)" "Package"
+T "l2s alpine ar"          "$($S -r $A /usr/bin/ar --version 2>/dev/null | head -1 | cut -d" " -f1-2)" "GNU ar"
+T "l2s ptrace-only deref"  "$(SPROUT_USER_NOTIFY=0 $S -r $B /usr/bin/head -1 /var/lib/dpkg/status-old 2>/dev/null | cut -d: -f1)" "Package"
 T "ptrace-only realpath-stat"  "$(SPROUT_USER_NOTIFY=0 $S -r $B /usr/bin/realpath /var/lib/dpkg/status 2>/dev/null)" "/var/lib/dpkg/status"
 
 echo "SUMMARY: pass=$pass fail=$fail"
