@@ -2793,6 +2793,11 @@ int main(int argc, char **argv) {
                 SP_OFT("stop pid=%d sig=%d eNR=%lld x0=%llx sp=%llx pc=%llx\n",
                        w, sig, (long long)rx.regs[8], rx.regs[0], rx.sp, (unsigned long long)rx.pc);
                 if (sig == SIGABRT || sig == SIGSEGV || sig == SIGBUS || sig == SIGILL) {
+                    siginfo_t si;
+                    memset(&si, 0, sizeof si);
+                    if (ptrace(PTRACE_GETSIGINFO, w, 0, &si) == 0)
+                        SP_OFT("siginfo pid=%d code=%d errno=%d addr=%p si_code=%d\n",
+                               w, si.si_signo, si.si_errno, si.si_addr, si.si_code);
                     char mapfile[64];
                     snprintf(mapfile, sizeof(mapfile), "/proc/%d/maps", w);
                     FILE *mf = fopen(mapfile, "r");
