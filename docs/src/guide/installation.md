@@ -82,6 +82,22 @@ proot-distro login debian --work-dir $PWD -- /usr/bin/sh -c \
 > Prefer guest-native cargo (`apt install cargo rustc`), or simply let
 > `./install.sh` fetch the prebuilt interposers.
 
+### install.sh artifact-selection rules (v0.4.5+)
+
+`install.sh` picks each artifact from the first available slot and refuses
+stale candidates:
+
+| slot tried (in order) | rule |
+|---|---|
+| `target/{release,debug}/<file>` (binaries) | always trusted — cargo wrote it |
+| `target/*/build/*/out/<file>` (crates' build.rs exports) | newest slot wins, but **rejected when its mtime is older than the newest file in `crates/<crate>/csrc/`** — stale out/ slots used to silently ship pre-fix bytes (deploy-discipline law) |
+| `$SRC/<file>`, `$SRC/target/<file>` (loose) | **ignored inside a git checkout** (tarball use only); override with `SPROUT_ALLOW_LOOSE=1` for dev rehearsals |
+
+When no acceptable slot exists, the glibc/musl interposer pair is **fetched
+from the latest GitHub release, sha256-verified against the release's own
+SHA256SUMS**; `--verify` then re-checks every installed file's md5 and prints
+a self-test command.
+
 The release workflow builds the exact same interposer artifacts on
 `ubuntu-24.04-arm` and ships them as release downloads; local musl / bionic
 hosts must always use the in-guest route (see `development.md`).

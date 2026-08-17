@@ -54,6 +54,17 @@ the Post-Invoke shell — users don't need any special flags:
 `sprout -r <debian> apt-get update` works out of the box, no proot-distro
 plugin needed.
 
+### Reading proot-distro's `.l2s` stubs
+
+proot-distro rootfses often contain `--link2symlink` relics from older
+boots: symlink targets spelled into `$ROOT/.l2s/.l2s.<name>.<nonce>`
+(dpkg's `status-old`/`diversions-old`, alpine's `/usr/bin/{ar,as,ld,...}`
+binutils, `/etc/alternatives` chains). Both stub species load correctly
+since v0.4.5: `sp_translate` (preload + supervisor) walks the link chain
+at translate time and `guest_real()` strips the rootfs prefix from
+host-absolute targets. Plain `readlink(2)` guests still see the stub
+spelling, matching proot's own view.
+
 ## Differences worth knowing
 
 1. **Errors are noisier on purpose.** If a guest binary is static and

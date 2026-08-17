@@ -20,10 +20,19 @@ These land in the launch plan *unless a user env already defines them*:
 | `SPROUT_BINFMT_ALWAYS` | unset | `=1` wraps even native aarch64 ELFs into the emulator (proot `-q` parity for whole-rootfs x86 usage) |
 | `SPROUT_SYSVIPC_OFF` | unset | `=1` disables BOTH userspace SysV emulations: the ADR-0018 sysvipc shim DSO (`/usr/lib/sprout-sysvipc/{i386,x86_64}/libsprout-sysvipc.so`) injected into `BOX64_LD_PRELOAD` of wrapped x86 guests (steam's startup semaphores), AND the ADR-0020 `shmget/shmat/shmctl/shmdt` emulation in `libsprout-core.so` for native guests (needed by mesa's XShm present path; disabled shm family then ENOSYS as before) |
 | `SPROUT_SYSVIPC_DIR` | `/tmp/sprout-sysvipc` | guest-path directory backing the emulated SysV objects (must be reachable by EVERY wrapped process — keep it the Termux-shared `/tmp` bind for cross-session reach) |
+| `SPROUT_SYSVIPC_EMU_OFF` | unset | `=1` disables JUST the host-emulator arm64 SysV-IPC shim lane (session-level `shmget/shmat/shmctl/shmdt`), leaving the in-guest ADR-0020 emulation active |
+| `SPROUT_EMU_SYSVIPC_PATH` | unset | explicit host path of the arm64 sysvipc-shim .so (defaults to the shipped artifact under the loader path) |
 | `SPROUT_KERNEL_RELEASE` | unset | `uname(2)` override applied by the preloaded uname wrapper; set via `-k/--kernel-release` (proot parity) |
+| `SPROUT_USER_NOTIFY` | (auto) | `=0` forces the classic ptrace-only supervise lane even on kernels with seccomp user-notify — the debugging switch that reproduces every notify-less-kernel report locally (v0.4.x learnings) |
+| `SPROUT_ALLOW_LOOSE` | unset | `=1` lets `install.sh` install loose `$SRC/<file>` artifacts inside a git checkout (v0.4.5+ default OFF — loose slots are tarball-only); dev-rehearsal escape hatch |
 | `SPROUT_PORTMAP` | unset | `=1` (set by `-p/--port-mapping`) makes`bind(2)` on ports <1024 use `1024+port` instead (proot parity for guests binding privileged ports without CAP_NET_BIND_SERVICE) |
 | `SPROUT_ASHMEM_MEMFD` | unset | `=1` (set by `--ashmem-memfd`) makes the preloaded `memfd_create()` fall back to `/dev/ashmem` when the kernel says ENOSYS/ENODEV/EINVAL; tracked fd ring feeds the fstat st_size simulation (proot parity) |
 | `SPROUT_KILL_TAG` | unset | `=<sprout-pid>` (set by `--kill-on-exit`) marks every descendant env; the post-run proc-sweep SIGKILLs any process whose environ carries it |
+| `SPROUT_NO_SHADOW` | unset | disables the supervisor's notify-shadow fastlane (classic ptrace supervision for everything — the ultimate proot-parity fallback) |
+| `SPROUT_FAKE_UID` / `SPROUT_FAKE_GID` | unset | numeric ids used by the preload fakeroot synthetics when `--fake-id N` is in use (`-0` ⇒ 0/0) |
+| `SPROUT_CACHE_DIR` | `$HOME/.cache/sprout` | sanitized ld.so/libc cache.root (tmp fallback) |
+| `SPROUT_KEEP_UMASK` | unset | `=1` stops sprout from re-asserting its default umask for the guest |
+| `SPROUT_PRELOAD_PATH` | unset | explicit path to `libsprout-core.so` (dev); the default picks the sibling artifact |
 | `BOX64_LD_LIBRARY_PATH` | (unset ⇒ box defaults injected when routing x86_64) | overrides the box64 runtime library search path |
 | `BOX32_LD_LIBRARY_PATH` | (unset ⇒ box defaults injected when routing i386) | overrides the box32 runtime library search path |
 | `TMPDIR` | `/tmp` | host TMPDIR escapes the guest view |
