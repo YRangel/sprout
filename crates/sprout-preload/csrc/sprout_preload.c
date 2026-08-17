@@ -140,9 +140,18 @@ static int path_within(const char *prefix, size_t plen, const char *path) {
 int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]) {
     if (!path || path[0] != '/') return 0; /* relative paths resolve against cwd, untouched */
 
-    /* Idempotence: a path that is already host-side must not be re-prefixed. */
-    if (cfg->rootfs_len > 0 && path_within(cfg->rootfs, cfg->rootfs_len, path))
-        return 0;
+    /* Idempotence: a path that is already host-side must not be re-prefixed.
+     * Covers both the full rootfs form AND its every leading prefix —
+     * glibc realpath()-style walkers emit progressive components ($B/data,
+     * $B/data/data, ...) that would double-translate into missing dirs. */
+    if (cfg->rootfs_len > 0) {
+        if (path_within(cfg->rootfs, cfg->rootfs_len, path)) return 0;
+        size_t plen = strlen(path);
+        if (plen > 0 && plen < cfg->rootfs_len &&
+            strncmp(cfg->rootfs, path, plen) == 0 &&
+            cfg->rootfs[plen] == '/')
+            return 0;
+    }
 
     /* User binds are MORE SPECIFIC than the pseudo-fs passthrough
      * (/proc,/sys,/dev): consult them FIRST so an explicit /dev/shm or
