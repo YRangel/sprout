@@ -1233,6 +1233,76 @@ static int sp_fd_target_guest(pid_t pid, int dfd, const char *rel,
     return 0;
 }
 
+static int sp_fake_proc_cpu_count(void);
+static char g_fakeproc_paths[4][SP_PATH_MAX]; /* 0=/proc/stat 1=loadavg 2=ofuid 3=ofgid */
+static const char *sp_fakeproc_classic_ensure(int which) {
+    if (which < 1 || which > 4) return NULL;
+    if (g_fakeproc_paths[which - 1][0]) return g_fakeproc_paths[which - 1];
+    /* compose content */
+    char buf[4096];
+    int n = 0;
+    if (which == 1) {
+        /* mirror the HOST /proc/stat if the supervisor's own uid can read
+         * it (same as notify lane): newer Android blocks /proc/stat for
+         * untrusted guests. Else emit moving synth rows (zero rows crash
+         * chromium metrics). */
+        int hf = open("/proc/stat", O_RDONLY);
+        if (hf >= 0) {
+            ssize_t rn = read(hf, buf, sizeof(buf) - 1);
+            close(hf);
+            if (rn > 0) {
+                n = (int)rn;
+                if (buf[n - 1] != '\n' && n < (int)sizeof(buf) - 1) buf[n++] = '\n';
+            }
+        }
+        if (n == 0) {
+            struct timespec ts;
+#ifdef CLOCK_BOOTTIME
+            clock_gettime(CLOCK_BOOTTIME, &ts);
+#else
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+            unsigned long long tick = (unsigned long long)ts.tv_sec * 100;
+            unsigned long long ncpu = (unsigned long long)sp_fake_proc_cpu_count();
+            unsigned long long idle = tick, usr = tick / 50 + 37,
+                               sys = tick / 34 + 51, irq = tick / 200,
+                               softirq = tick / 375, iowait = tick / 150;
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          "cpu %llu 0 %llu %llu %llu %llu %llu 0 0 0\n",
+                          usr, sys, idle, iowait, irq, softirq);
+            for (unsigned long long i = 0; i < ncpu && n < (int)sizeof(buf) - 96; i++)
+                n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                              "cpu%llu %llu 0 %llu %llu %llu %llu %llu 0 0 0\n",
+                              i, usr, sys, idle, iowait, irq, softirq);
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          "intr %llu\nctxt %llu\nbtime %lld\nprocesses %llu\nprocs_running 1\nprocs_blocked 0\nsoftirq %llu 0 0 0 0 0 0 0 0 0 0\n",
+                          tick * 4, tick * 12, (long long)(time(NULL) - (long long)ts.tv_sec),
+                          tick / 20 + 123, tick * 8);
+        }
+    } else if (which == 2) {
+        /* /proc/loadavg: real Android /proc/loadavg is UID-locked; synth */;
+        n = snprintf(buf, sizeof(buf), "0.00 0.00 0.00 1/512 12345\n");
+    } else {
+        /* overflowuid / overflowgid */
+        n = snprintf(buf, sizeof(buf), "65534\n");
+    }
+    if (n <= 0) return NULL;
+    const char *cands[2] = { getenv("TMPDIR"), "/data/data/com.termux/files/usr/tmp" };
+    int f = -1; char tmp_t[SP_PATH_MAX];
+    for (int i = 0; i < 2 && f < 0; i++) {
+        if (!cands[i]) continue;
+        snprintf(tmp_t, sizeof tmp_t, "%s/sprout-fakeproc-XXXXXX", cands[i]);
+        f = mkstemp(tmp_t);
+    }
+    if (f < 0) return NULL;
+    if (write(f, buf, (size_t)n) != n) { close(f); unlink(tmp_t); return NULL; }
+    if (lseek(f, 0, SEEK_SET) < 0) { close(f); unlink(tmp_t); return NULL; }
+    close(f);
+    chmod(tmp_t, 0444); /* guest uid must read it; content is synthetic anyway */
+    snprintf(g_fakeproc_paths[which - 1], SP_PATH_MAX, "%s", tmp_t);
+    return g_fakeproc_paths[which - 1];
+}
+
 static void apply_policy_entry(tracee_t *t, pid_t pid,
                                 long sysno, unsigned long long x0, unsigned long long x1) {
     (void)x0; (void)x1;
@@ -1415,6 +1485,52 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
     struct user_pt_regs rchk;
     struct iovec iovchk = { &rchk, sizeof(rchk) };
     int regs_valid = 0, regs_dirty = 0;
+
+    /* classic-lane /proc fake service (notify lane's sp_fake_proc_serve
+     * equivalent): /proc/stat, /proc/loadavg, /proc/sys/kernel/overflowuid,
+     * overflowgid are EACCES for untrusted uids on Android. The notify lane
+     * ADDFD-injects a synthetic fd; classic has no ADDFD, so rewrite the
+     * PATH at syscall ENTRY into a supervisor-materialized cache file
+     * (host-abs under $PREFIX/tmp). Without this htop(1) under the
+     * ptrace-only kernel dies 'Cannot open /proc/stat: Permission denied'
+     * (4.14-class observations, POCO X3 GT). */
+    if (sysno == 56 /*openat*/ || sysno == 437 /*openat2*/) {
+        if (!regs_valid) {
+            if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovchk) != 0) return;
+            regs_valid = 1;
+        }
+        if ((int)rchk.regs[0] == AT_FDCWD_VAL) {
+            char gp[512];
+            if (peek_str(pid, rchk.regs[1], gp, sizeof gp) > 0) {
+                int which = 0;
+                if (strcmp(gp, "/proc/stat") == 0) which = 1;
+                else if (strcmp(gp, "/proc/loadavg") == 0) which = 2;
+                else if (strcmp(gp, "/proc/sys/kernel/overflowuid") == 0) which = 3;
+                else if (strcmp(gp, "/proc/sys/kernel/overflowgid") == 0) which = 4;
+                if (which) {
+                    const char *hp = sp_fakeproc_classic_ensure(which);
+                    if (hp) {
+                        size_t hl = strlen(hp);
+                        if (hl < (size_t)SP_SCRATCH_CAP) {
+                            unsigned long long scratch =
+                                (unsigned long long)rchk.sp - SP_SCRATCH_BELOW_SP
+                                - ((unsigned long long)1 * SP_SCRATCH_CAP);
+                            errno = 0;
+                            if (ptrace(PTRACE_PEEKDATA, pid, (void *)scratch, NULL) != -1 || !errno) {
+                                if (poke_str(pid, scratch, hp, hl) == 0) {
+                                    rchk.regs[1] = scratch;
+                                    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovchk);
+                                    if (g_debug) SP_TRACE("[ptrace] fake-proc %s -> %s\n", gp, hp);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for (size_t i = 0; i < sizeof(SP_PATH_RULES)/sizeof(*SP_PATH_RULES); i++) {
         const sp_path_rule *rule = &SP_PATH_RULES[i];
         if (rule->sysno != sysno) continue;
