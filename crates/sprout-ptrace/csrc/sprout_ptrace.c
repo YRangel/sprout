@@ -1114,6 +1114,81 @@ static void reverse_pending_addr(pid_t pid, tracee_t *t) {
  * up here because apply_policy_entry's dynamic-gate reads it. */
 static int g_notify = 0;           /* 1 = install+serve the notify filter */
 
+/* Resolve an execveat() dirfd target (fd-relative, incl. AT_EMPTY_PATH
+ * == fexecve) into a GUEST-spelled absolute path. Steps: readlink the
+ * fd through /proc/<pid>/fd; materialize ephemeral/anonymous images
+ * (memfd, deleted) into a supervisor-owned cache file (the kernel denies
+ * execveat on those: Android returns EACCES for memfd exec entirely);
+ * join an optional pathname suffix; re-spell host-abs under the rootfs
+ * as guest-abs. Returns 0 with guest_out filled, or -1.
+ * Shared by the classic-ptrace execve branch and the notify 281 case. */
+static int sp_fd_target_guest(pid_t pid, int dfd, const char *rel,
+                              char *guest_out, size_t outcap) {
+    if (dfd < 0 || dfd == -100) return -1;
+    char linkp[64];
+    snprintf(linkp, sizeof(linkp), "/proc/%d/fd/%d", pid, dfd);
+    char fdt[SP_PATH_MAX];
+    ssize_t fn = readlink(linkp, fdt, sizeof(fdt) - 1);
+    if (fn <= 0) { if (g_debug) SP_TRACE("[fdt] readlink %s FAILED errno=%d\n", linkp, errno); return -1; }
+    fdt[fn] = '\0';
+    if (g_debug) SP_TRACE("[fdt] %s -> %s\n", linkp, fdt);
+    if (strstr(fdt, " (deleted)") || strstr(fdt, "memfd") ||
+        !strncmp(fdt, "/memfd:", 7)) {
+        /* cache dir = the dir holding SPROUT_LOADER (the supervisor's own
+         * env HOME inside guests means the GUEST's /root, useless here). */
+        const char *ld = getenv("SPROUT_LOADER");
+        if (!ld || !*ld) { if (g_debug) SP_TRACE("[fdt] no SPROUT_LOADER\n"); return -1; }
+        char cache[SP_PATH_MAX];
+        snprintf(cache, sizeof(cache), "%s", ld);
+        { char *sl = strrchr(cache, '/'); if (sl) *sl = '\0'; }
+        (void)!mkdir(cache, 0700);
+        int sfd = open(linkp, O_RDONLY);
+        if (sfd < 0) {
+            /* SELinux denies untrusted apps opening another process's
+             * /proc/PID/fd entries even under ptrace. pidfd_getfd
+             * duplicates the tracee's fd under ptrace-mode creds (5.6+,
+             * present on the 6.x Android kernels we target). */
+            int pfd = (int)syscall(434 /*pidfd_open*/, pid, 0);
+            if (pfd >= 0) {
+                sfd = (int)syscall(438 /*pidfd_getfd*/, pfd, dfd, 0);
+                close(pfd);
+            }
+        }
+        if (sfd < 0) { if (g_debug) SP_TRACE("[fdt] open %s FAILED errno=%d\n", linkp, errno); return -1; }
+        lseek(sfd, 0, SEEK_SET);
+        struct stat fst;
+        if (fstat(sfd, &fst) != 0) { close(sfd); return -1; }
+        char mat[SP_PATH_MAX];
+        snprintf(mat, sizeof(mat), "%s/fdmat-%llx.bin", cache,
+                 (unsigned long long)fst.st_size ^
+                 ((unsigned long long)fst.st_mtime << 20));
+        struct stat mst;
+        if (stat(mat, &mst) != 0) {
+            char tmp[SP_PATH_MAX];
+            snprintf(tmp, sizeof(tmp), "%s/.fdmat-%d", cache, (int)getpid());
+            int wfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0755);
+            if (wfd >= 0) {
+                char cbuf[65536]; ssize_t cr;
+                while ((cr = read(sfd, cbuf, sizeof(cbuf))) > 0)
+                    if (write(wfd, cbuf, (size_t)cr) != cr) break;
+                close(wfd);
+                rename(tmp, mat);
+            } else if (g_debug) SP_TRACE("[fdt] create %s FAILED errno=%d\n", tmp, errno);
+        }
+        close(sfd);
+        if (stat(mat, &mst) != 0) { if (g_debug) SP_TRACE("[fdt] materialize %s FAILED errno=%d\n", mat, errno); return -1; }
+        if (g_debug) SP_TRACE("[fdt] materialized -> %s\n", mat);
+        snprintf(fdt, sizeof(fdt), "%s", mat);
+    }
+    if (snprintf(guest_out, outcap, "%s%s%s", fdt,
+                 (rel && rel[0]) ? "/" : "", rel && rel[0] ? rel : "")
+        >= (int)outcap) return -1;
+    size_t rl = strlen(g_cfg.rootfs);
+    if (rl && strncmp(guest_out, g_cfg.rootfs, rl) == 0 && guest_out[rl])
+        memmove(guest_out, guest_out + rl, strlen(guest_out + rl) + 1);
+    return 0;
+}
+
 static void apply_policy_entry(tracee_t *t, pid_t pid,
                                 long sysno, unsigned long long x0, unsigned long long x1) {
     (void)x0; (void)x1;
@@ -1167,15 +1242,40 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
         struct user_pt_regs rex;
         struct iovec iovex = { &rex, sizeof(rex) };
         if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovex) != 0) return;
-        if (sysno == SYS_execveat && (int)rex.regs[0] != AT_FDCWD_VAL) return;
-
-        unsigned long long pptr = rex.regs[path_argi];
-        if (pptr == 0 || pptr >= 0x800000000000ULL) return;
         char guest[SP_PATH_MAX];
-        if (peek_str(pid, pptr, guest, sizeof(guest)) < 0) return;
-        if (guest_absolutize(pid, guest) != 0) return;
+        int fdexec = 0;
+        if (sysno == SYS_execveat && (int)rex.regs[0] != AT_FDCWD_VAL) {
+            /* dirfd-relative execveat (incl. AT_EMPTY_PATH == fexecve):
+             * resolve/materialize the fd target into a guest-spelled abs
+             * path via sp_fd_target_guest (memfd exec is kernel-denied
+             * EACCES on Android: dwarfs-based AppImage runtimes self-
+             * re-exec their embedded extractor from a memfd), then ride
+             * the normal classification/chain flow below. */
+            int dfd = (int)rex.regs[0];
+            char rel[SP_PATH_MAX]; rel[0] = '\0';
+            unsigned long long pptr2 = rex.regs[path_argi];
+            if (pptr2 && pptr2 < 0x800000000000ULL)
+                peek_str(pid, pptr2, rel, sizeof(rel));
+            if (sp_fd_target_guest(pid, dfd, rel, guest, sizeof(guest)) != 0)
+                return;
+            rex.regs[0] = (unsigned long long)-100;   /* AT_FDCWD */
+            fdexec = 1;
+            if (g_debug) SP_TRACE("[%d] execveat fd=%d -> guest=%s\n", pid, dfd, guest);
+        }
+        if (!fdexec) {
+            unsigned long long pptr = rex.regs[path_argi];
+            if (pptr == 0 || pptr >= 0x800000000000ULL) return;
+            if (peek_str(pid, pptr, guest, sizeof(guest)) < 0) return;
+            if (guest_absolutize(pid, guest) != 0) return;
+        }
         char host[SP_PATH_MAX];
-        if (!sp_translate(&g_cfg, guest, host)) return;
+        /* sp_translate returns 0 for paths that are already host-abs
+         * (passthrough zones like $HOME/.cache — the case for our
+         * materialized fd targets): use those as-is. */
+        if (!sp_translate(&g_cfg, guest, host)) {
+            if (!fdexec) return;
+            snprintf(host, sizeof(host), "%s", guest);
+        }
         sp_resolve_absolute_symlink(host);
 
         char obuf[SP_PATH_MAX];
@@ -1198,7 +1298,28 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
             return;
         }
         /* static target (or unknown): plain single-string path translation */
-        int changed = translate_reg_path(t, pid, &rex, path_argi, 1, "execve");
+        int changed = 0;
+        if (fdexec) {
+            /* our guest string is ALREADY a host-abs path for materialized
+             * fd targets (passthrough-zone cache) or a guest string the
+             * generic translator will translate: write the FINAL host path
+             * to the scratch slot and push ARG_DIRFD=AT_FDCWD + ARG_PATH
+             * directly; also clear AT_EMPTY_PATH (path now non-empty). */
+            unsigned long long scratch = (unsigned long long)rex.sp
+                                         - SP_SCRATCH_BELOW_SP
+                                         - ((unsigned long long)path_argi * SP_SCRATCH_CAP);
+            errno = 0;
+            if (ptrace(PTRACE_PEEKDATA, pid, (void *)scratch, NULL) != -1 || !errno) {
+                if (poke_str(pid, scratch, host, strlen(host)) == 0) {
+                    rex.regs[0] = (unsigned long long)-100;   /* AT_FDCWD */
+                    rex.regs[1] = scratch;
+                    rex.regs[4] = 0;                          /* flags: path is non-empty now */
+                    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovex);
+                    return;
+                }
+            }
+        } else
+            changed = translate_reg_path(t, pid, &rex, path_argi, 1, "execve");
         if (changed)
             ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovex);
         return;
@@ -2023,6 +2144,42 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
             resp->error = -ENOENT; resp->flags = 0; resp->val = 0; return;
         }
         /* -1 (unknown): native CONT. */
+        sp_notify_continue(resp);
+        return;
+    }
+    case 281: { /* execveat(dirfd,path,argv,envp,flags) — fd-relative incl. AT_EMPTY_PATH */
+        int dfd = (int)args[0];
+        if (dfd == -100 /*AT_FDCWD*/ || dfd < 0) { sp_notify_continue(resp); return; }
+        char rel[SP_PATH_MAX]; rel[0] = '\0';
+        if (args[1]) sp_notify_read_str(pid, args[1], rel, sizeof(rel));
+        char g[SP_PATH_MAX];
+        /* resolve/materialize the fd target (memfd exec is kernel-denied
+         * EACCES on Android: dwarfs AppImage runtimes self-re-exec their
+         * embedded extractor from a memfd through exactly this shape) */
+        if (sp_fd_target_guest(pid, dfd, rel, g, sizeof(g)) != 0) {
+            sp_notify_continue(resp);
+            return;
+        }
+        char h[SP_PATH_MAX];
+        if (!sp_notify_hostpath(pid, g, h, sizeof h)) { sp_notify_continue(resp); return; }
+        char interp[SP_PATH_MAX]; interp[0] = '\0';
+        char opt[SP_PATH_MAX];  opt[0]  = '\0';
+        int cls = classify_host_file(h, interp, opt);
+        if (g_debug) SP_TRACE("[dbg281] fd=%d guest='%s' host='%s' cls=%d\n", dfd, g, h, cls);
+        if (cls == 1 || cls == 0 || cls == 2) {
+            size_t gl = strlen(g), hl = strlen(h);
+            if (cls == 1 && strcmp(h, g) == 0) { sp_notify_continue(resp); return; }
+            if (cls == 1 && hl <= gl && args[1] &&
+                sp_vm_write(pid, h, hl + 1, args[1]) == (ssize_t)(hl + 1) && rel[0]) {
+                /* in-place only when a relative pathname buffer exists */
+                sp_notify_continue(resp);
+                return;
+            }
+            if (sp_notify_lazy_exec_rewrite(pid, g, h, cls) == 1) {
+                sp_notify_continue(resp); return;
+            }
+            resp->error = -ENOSYS; resp->flags = 0; resp->val = 0; return;
+        }
         sp_notify_continue(resp);
         return;
     }
