@@ -57,10 +57,10 @@ Then run anything:
 
 ```sh
 # interactive shell in the debian rootfs
-sprout -r $PREFIX/var/lib/proot-distro/containers/debian /bin/sh
+sprout -r $PREFIX/var/lib/proot-distro/containers/debian/rootfs /bin/sh
 
 # GUI desktop over termux-x11 (DISPLAY/PULSE_SERVER preset)
-sprout -r $PREFIX/var/lib/proot-distro/containers/debian --shared-tmp --termux-x11 startxfce4
+sprout -r $PREFIX/var/lib/proot-distro/containers/debian/rootfs --shared-tmp --termux-x11 startxfce4
 ```
 
 Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
