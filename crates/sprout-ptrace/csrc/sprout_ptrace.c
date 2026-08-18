@@ -792,7 +792,7 @@ static int guest_absolutize(pid_t pid, char guest[SP_PATH_MAX]) {
 }
 
 static int translate_reg_path(tracee_t *t, pid_t pid, struct user_pt_regs *r, int argi,
-                              const char *name) {
+                              int follow, const char *name) {
     (void)t;
     unsigned long long ptr = r->regs[argi];
     if (ptr == 0 || ptr >= 0x800000000000ULL) return 0;
@@ -813,7 +813,7 @@ static int translate_reg_path(tracee_t *t, pid_t pid, struct user_pt_regs *r, in
             if (snprintf(host, sizeof(host), "%s%s", g_cfg.rootfs, guest + sl) >= (int)sizeof(host)) return 0;
             goto have_host;
         }
-        if (!sp_translate(&g_cfg, guest, host)) return 0;
+        if (!sp_translate_f(&g_cfg, guest, host, follow)) return 0;
     }
 have_host:
     /* Existence filter (phase-guard): force-prefixing loader-phase host
@@ -910,30 +910,37 @@ static sp_syscall_view sp_view_syscall(pid_t pid, struct user_pt_regs *regs) {
  * previously and the kernel resolves relative to it. Two-pathname syscalls
  * (linkat/renameat/renameat2) translate BOTH path args, each gated on its
  * own dirfd. */
-typedef struct { long sysno; int dirfd_argi; int path_argi; int dirfd2_argi; int path2_argi; const char *name; } sp_path_rule;
+/* {sysno, dirfd_argi, path_argi, dirfd2_argi, path2_argi, follow, name}.
+ * follow: 1 = chase final symlink (openat/execve/openat2/linkat OLD
+ * path — the .l2s conversion machinery needs the payload); 0 = translate the
+ * LINK itself (readlinkat/unlinkat/mkdirat/mknodat/symlinkat/renameat
+ * family — chasing would delete the payload: same bug as preload lane v0.4.5
+ * regression, fixed for notify lane in 4b499a4); negative N = semantics
+ * depend on the AT_SYMLINK_NOFOLLOW bit of syscall arg |-N|. */
+typedef struct { long sysno; int dirfd_argi; int path_argi; int dirfd2_argi; int path2_argi; int follow; const char *name; } sp_path_rule;
 static const sp_path_rule SP_PATH_RULES[] = {
-    { SYS_openat,      0, 1, -1, -1, "openat"      },
-    { SYS_openat2,     0, 1, -1, -1, "openat2"     },
-    { SYS_newfstatat,  0, 1, -1, -1, "newfstatat"  },
-    { SYS_faccessat,   0, 1, -1, -1, "faccessat"   },
-    { SYS_faccessat2,  0, 1, -1, -1, "faccessat2"  },
-    { SYS_readlinkat,  0, 1, -1, -1, "readlinkat"  },
-    { SYS_statx,       0, 1, -1, -1, "statx"       },
-    { 34 /*mkdirat*/,  0, 1, -1, -1, "mkdirat"     },
-    { 35 /*unlinkat*/, 0, 1, -1, -1, "unlinkat"    },
-    { 33 /*mknodat*/,  0, 1, -1, -1, "mknodat"     },
-    { 53 /*fchmodat*/, 0, 1, -1, -1, "fchmodat"    },
-    { 54 /*fchownat*/, 0, 1, -1, -1, "fchownat"    },
-    { 88 /*utimensat*/,0, 1, -1, -1, "utimensat"   },
+    { SYS_openat,      0, 1, -1, -1,  1, "openat"      },
+    { SYS_openat2,     0, 1, -1, -1,  1, "openat2"     },
+    { SYS_newfstatat,  0, 1, -1, -1, -3, "newfstatat"  },
+    { SYS_faccessat,   0, 1, -1, -1, -3, "faccessat"   },
+    { SYS_faccessat2,  0, 1, -1, -1, -3, "faccessat2"  },
+    { SYS_readlinkat,  0, 1, -1, -1,  0, "readlinkat"  },
+    { SYS_statx,       0, 1, -1, -1, -2, "statx"       },
+    { 34 /*mkdirat*/,  0, 1, -1, -1,  0, "mkdirat"     },
+    { 35 /*unlinkat*/, 0, 1, -1, -1,  0, "unlinkat"    },
+    { 33 /*mknodat*/,  0, 1, -1, -1,  0, "mknodat"     },
+    { 53 /*fchmodat*/, 0, 1, -1, -1, -3, "fchmodat"    },
+    { 54 /*fchownat*/, 0, 1, -1, -1, -4, "fchownat"    },
+    { 88 /*utimensat*/,0, 1, -1, -1, -3, "utimensat"   },
     /* two-arg semantics: only the linkpath translates (target written
      * literally); oldpath gating on its own dirfd, same for newpath. */
-    { 36 /*symlinkat*/,   1, 2, -1, -1, "symlinkat.linkpath" },
-    { 37 /*linkat*/,       0, 1, 2, 3, "linkat"            },
-    { 38 /*renameat*/,     0, 1, 2, 3, "renameat"          },
-    { 276/*renameat2*/,    0, 1, 2, 3, "renameat2"         },
-    { 49 /*chdir*/,       -1, 0, -1, -1, "chdir"     },
-    { SYS_execve,     -1, 0, -1, -1, "execve"      },
-    { SYS_execveat,    0, 1, -1, -1, "execveat"    },
+    { 36 /*symlinkat*/,   1, 2, -1, -1, 0, "symlinkat.linkpath" },
+    { 37 /*linkat*/,       0, 1, 2, 3, 1, "linkat"            },
+    { 38 /*renameat*/,     0, 1, 2, 3, 0, "renameat"          },
+    { 276/*renameat2*/,    0, 1, 2, 3, 0, "renameat2"         },
+    { 49 /*chdir*/,       -1, 0, -1, -1, 1, "chdir"     },
+    { SYS_execve,     -1, 0, -1, -1, 1, "execve"      },
+    { SYS_execveat,    0, 1, -1, -1, 1, "execveat"    },
 };
 
 /* ---- AF_UNIX pathname translation (ADR-0010) -------------------------- */
@@ -1191,7 +1198,7 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
             return;
         }
         /* static target (or unknown): plain single-string path translation */
-        int changed = translate_reg_path(t, pid, &rex, path_argi, "execve");
+        int changed = translate_reg_path(t, pid, &rex, path_argi, 1, "execve");
         if (changed)
             ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovex);
         return;
@@ -1254,13 +1261,19 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
          * resolves in kernel space against an fd we don't mirror) */
         if (rule->dirfd_argi < 0 || (int)rchk.regs[rule->dirfd_argi] == AT_FDCWD_VAL) {
             sp_dbg_cwd("gov", pid);
-            if (translate_reg_path(t, pid, &rchk, rule->path_argi, rule->name))
+            int follow = rule->follow;
+            if (follow < 0)
+                follow = (rchk.regs[-follow] & 0x100 /*AT_SYMLINK_NOFOLLOW*/) ? 0 : 1;
+            if (translate_reg_path(t, pid, &rchk, rule->path_argi, follow, rule->name))
                 regs_dirty = 1;
         }
         /* optional second pathname (linkat/renameat/renameat2 newpath) */
         if (rule->path2_argi >= 0 &&
             (rule->dirfd2_argi < 0 || (int)rchk.regs[rule->dirfd2_argi] == AT_FDCWD_VAL)) {
-            if (translate_reg_path(t, pid, &rchk, rule->path2_argi, rule->name))
+            int follow = rule->follow;
+            if (follow < 0)
+                follow = (rchk.regs[-follow] & 0x100 /*AT_SYMLINK_NOFOLLOW*/) ? 0 : 1;
+            if (translate_reg_path(t, pid, &rchk, rule->path2_argi, follow, rule->name))
                 regs_dirty = 1;
         }
     }
