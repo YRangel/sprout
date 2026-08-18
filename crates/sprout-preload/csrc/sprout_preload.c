@@ -1382,6 +1382,33 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
     return SP_REAL(fchmodat)(dirfd, p, mode, flags);
 }
 
+/* glibc lchmod(): path + AT_SYMLINK_NOFOLLOW. glibc implements it via the
+ * fchmodat2(452) syscall and internal no-cancel helpers — NONE of that is
+ * PLT-visible, so on Android's app-domain seccomp (452 blocked → ENOSYS)
+ * glibc's own fallback (O_PATH open + /proc/self/fd rewrite) runs on the
+ * UNTRANSLATED guest path and returns EBADF (GIO set_unix_mode → Thunar
+ * "Error setting permissions: Bad file descriptor"). Route the call through
+ * our translated fchmodat path instead. The supervisor handles fchmodat
+ * NOFOLLOW via follow_code=0; the preload lane must not let the internal
+ * syscall escape. */
+int lchmod(const char *path, mode_t mode) {
+    static int (*SP_REAL(lchmod))(const char *, mode_t) = NULL;
+    SP_RESOLVE(lchmod);
+    if (!path) { errno = EFAULT; return -1; }
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_l(path, x);
+    SP_TRACE("lchmod", path, p);
+    sp_trace_line("TRM lchmod pid=%d '%s' -> '%s' mode=%04o\n", (int)getpid(),
+                    path ? path : "(null)", p, (unsigned)mode & 07777);
+    /* Route through glibc's fchmodat (53) with the NOFOLLOW flag: in the
+     * preload lane our fchmodat interposer + glibc's own fallback chain
+     * already produce success for this combination (fchmodat2 stays blocked),
+     * while the direct lchmod symbol's ENOSYS fallback collapses to EBADF. */
+    static int (*SP_REAL(fchmodat))(int, const char *, mode_t, int) = NULL;
+    if (!SP_REAL(fchmodat)) SP_REAL(fchmodat) = dlsym(RTLD_NEXT, "fchmodat");
+    return SP_REAL(fchmodat)(-100 /*AT_FDCWD*/, p, mode, AT_SYMLINK_NOFOLLOW);
+}
+
 /* ---- fakeroot identity family (ADR-0011/M3.1 parity with proot -0) ----
  * apt's privilege-drop chain (setgroups/setresgid/setresuid/seteuid...)
  * must BELIEVE it succeeded under -0. Android TRAPs the set*id syscalls
