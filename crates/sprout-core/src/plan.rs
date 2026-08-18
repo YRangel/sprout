@@ -231,6 +231,14 @@ impl LaunchPlan {
         let flavor = rootfs.libc_flavor();
         let loader = rootfs.guest_loader()?;
         let library_path = rootfs.library_path();
+        /* AppImage-ecosystem EXEC binaries pollute e_ident padding
+         * (EI_ABIVERSION) with signature junk; glibc's ld.so in program
+         * role then refuses them ("ELF file ABI version invalid"). Serve
+         * a cached abi-clean derivative through the chain; the installed
+         * file is never touched, and SPROUT_EXE stamping below still uses
+         * the ORIGINAL spelling so self-resolved paths stay canonical. */
+        let launch_prog = crate::sanitize::ensure_abi_sanitized_prog(&guest_prog, cache_dir)
+            .map_err(|e| crate::error::Error::Sanitize(e.to_string()))?;
 
         if flavor == LibcFlavor::Musl {
             /* musl: the ldso IS the libc. Its early init (and every musl
@@ -249,7 +257,7 @@ impl LaunchPlan {
                     .unwrap_or_else(|| guest_prog.clone().into_os_string()),
                 "--library-path".into(),
                 library_path.clone().into(),
-                guest_prog.clone().into_os_string(),
+                launch_prog.clone().into_os_string(),
             ];
             argv.extend(args.iter().skip(1).cloned());
 
@@ -336,7 +344,7 @@ impl LaunchPlan {
             "--inhibit-cache".into(),
             "--library-path".into(),
             library_path.clone().into(),
-            guest_prog.clone().into_os_string(),
+            launch_prog.clone().into_os_string(),
         ];
         argv.extend(args.iter().skip(1).cloned());
 
@@ -389,6 +397,9 @@ impl LaunchPlan {
         }
         if debug {
             env.push(("SPROUT_DEBUG".into(), "1".into()));
+        }
+        if std::env::var_os("SPROUT_NO_LDP").is_some() {
+            env.retain(|(k, _)| k != "LD_PRELOAD");
         }
         push_home_term(&mut env, rootfs);
         ensure_dev_shm(rootfs);

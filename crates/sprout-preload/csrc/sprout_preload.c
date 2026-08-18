@@ -745,6 +745,25 @@ static int sp_auxv_match(const char *path) {
     return (int)syscall(SYS_dup, g_auxv_fd);
 }
 
+/* /proc/self/exe CONTENT reads (AppImage-style embedded-payload runners
+ * seek into their own file image for the squashfs) must see the GUEST
+ * program's bytes; under the loader chain the kernel-deleted exe is the
+ * sanitized ldso — readlink's SPROUT_EXE answer covers string resolution,
+ * open() needs the same stamp at fd level. Returns the guest spelling
+ * (normal translation still applies downstream), or NULL. */
+static const char *sp_self_exe_guest_path(const char *path) {
+    if (!path || path[0] != '/') return NULL;
+    int ok = !strcmp(path, "/proc/self/exe");
+    if (!ok) {
+        char m[96];
+        snprintf(m, sizeof(m), "/proc/%ld/exe", (long)getpid());
+        ok = !strcmp(path, m);
+    }
+    if (!ok) return NULL;
+    const char *e = getenv("SPROUT_EXE");
+    return (e && *e) ? e : NULL;
+}
+
 int open(const char *path, int flags, ...) {
     static int (*SP_REAL(open))(const char *, int, ...) = NULL;
     SP_RESOLVE(open);
@@ -754,6 +773,9 @@ int open(const char *path, int flags, ...) {
         mode = va_arg(ap, mode_t); va_end(ap);
     }
     { int af = sp_auxv_match(path); if (af >= 0) return af; }
+    char eb[SP_PATH_MAX];
+    { const char *g = sp_self_exe_guest_path(path);
+      if (g) { snprintf(eb, sizeof(eb), "%s", g); path = eb; } }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("open", path, p);
@@ -769,6 +791,9 @@ int open64(const char *path, int flags, ...) {
         mode = va_arg(ap, mode_t); va_end(ap);
     }
     { int af = sp_auxv_match(path); if (af >= 0) return af; }
+    char eb[SP_PATH_MAX];
+    { const char *g = sp_self_exe_guest_path(path);
+      if (g) { snprintf(eb, sizeof(eb), "%s", g); path = eb; } }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("open64", path, p);
@@ -790,6 +815,9 @@ int openat(int dirfd, const char *path, int flags, ...) {
     if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(openat)(dirfd, path, flags, mode);
     if (dirfd == -100) { int af = sp_auxv_match(path); if (af >= 0) return af; }
+    char eb[SP_PATH_MAX];
+    { const char *g = sp_self_exe_guest_path(path);
+      if (g && dirfd == -100) { snprintf(eb, sizeof(eb), "%s", g); path = eb; } }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("openat", path, p);
@@ -808,6 +836,9 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(openat64)(dirfd, path, flags, mode);
     if (dirfd == -100) { int af = sp_auxv_match(path); if (af >= 0) return af; }
+    char eb[SP_PATH_MAX];
+    { const char *g = sp_self_exe_guest_path(path);
+      if (g && dirfd == -100) { snprintf(eb, sizeof(eb), "%s", g); path = eb; } }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("openat64", path, p);
@@ -2038,6 +2069,9 @@ int chdir(const char *path) {
 FILE *fopen(const char *path, const char *mode) {
     static FILE *(*SP_REAL(fopen))(const char *, const char *) = NULL;
     SP_RESOLVE(fopen);
+    char eb[SP_PATH_MAX];
+    { const char *g = sp_self_exe_guest_path(path);
+      if (g) { snprintf(eb, sizeof(eb), "%s", g); path = eb; } }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("fopen", path, p);
@@ -2047,6 +2081,9 @@ FILE *fopen(const char *path, const char *mode) {
 FILE *fopen64(const char *path, const char *mode) {
     static FILE *(*SP_REAL(fopen64))(const char *, const char *) = NULL;
     SP_RESOLVE(fopen64);
+    char eb[SP_PATH_MAX];
+    { const char *g = sp_self_exe_guest_path(path);
+      if (g) { snprintf(eb, sizeof(eb), "%s", g); path = eb; } }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("fopen64", path, p);
@@ -3149,6 +3186,62 @@ static char **sp_chain_env(char *const envp[]) {
     return e2;
 }
 
+/* AppImage-ecosystem binaries pollute e_ident padding (EI_ABIVERSION +
+ * EI_PAD, bytes 8..16) with signature junk; glibc's ld.so in program role
+ * refuses to load them ("ELF file ABI version invalid") while the kernel
+ * ignores those bytes. Serve a cached content-keyed abi-clean copy from
+ * the sprout cache dir (dir of SPROUT_LOADER); never patch installed
+ * files (ADR-0007 doctrine extends to guest program images). */
+static const char *sp_abi_cleanse(const char *host) {
+    static char last_in[SP_PATH_MAX], last_out[SP_PATH_MAX];
+    if (last_in[0] && !strcmp(host, last_in)) return last_out;
+    const char *out = host;
+    int fd = open(host, O_RDONLY);
+    if (fd >= 0) {
+        unsigned char id[16];
+        ssize_t n = read(fd, id, 16);
+        if (n == 16 && !memcmp(id, "\x7f" "ELF", 4)) {
+            int dirty = 0;
+            for (int k = 8; k < 16; k++) dirty |= id[k];
+            if (dirty) {
+                const char *ld = getenv("SPROUT_LOADER");
+                if (ld && *ld) {
+                    const char *sl = strrchr(ld, '/');
+                    size_t dl = sl ? (size_t)(sl - ld) : 0;
+                    unsigned long long h = 1469598103934665603ULL;
+                    struct stat st;
+                    memset(&st, 0, sizeof st);
+                    stat(host, &st);
+                    for (int k = 0; k < 16; k++) { h ^= id[k]; h *= 1099511628211ULL; }
+                    h ^= (unsigned long long)st.st_size;   h *= 1099511628211ULL;
+                    h ^= (unsigned long long)st.st_mtime;  h *= 1099511628211ULL;
+                    char cp[SP_PATH_MAX];
+                    snprintf(cp, sizeof(cp), "%.*s/abifix-%016llx.bin", (int)dl, ld, h);
+                    struct stat st2;
+                    if (stat(cp, &st2) < 0) {
+                        int wf = open(cp, O_WRONLY | O_CREAT, 0755);
+                        if (wf >= 0) {
+                            unsigned char zid[16];
+                            memcpy(zid, id, 16);
+                            memset(zid + 8, 0, 8);
+                            (void)!write(wf, zid, 16);
+                            char buf[65536]; ssize_t r;
+                            while ((r = read(fd, buf, sizeof(buf))) > 0)
+                                if (write(wf, buf, (size_t)r) != r) break;
+                            close(wf);
+                        }
+                    }
+                    if (stat(cp, &st2) == 0) out = cp;
+                }
+            }
+        }
+        close(fd);
+    }
+    snprintf(last_in, sizeof(last_in), "%s", host);
+    snprintf(last_out, sizeof(last_out), "%s", out);
+    return last_out;
+}
+
 /* /proc/self/exe truth (Firefox/Gecko-class bug): under the loader chain,
  * the kernel maps /proc/self/exe to OUR sanitized ld.so, so anything that
  * computes its own install dir via readlink(/proc/self/exe) — Mozilla's
@@ -3554,6 +3647,7 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
     }
     sp_resolve_absolute_symlink(hx);
     const char *host = hx;
+    host = sp_abi_cleanse(host);
     /* deferred stamp for self-exe aliases: children inherit the RESOLVED
      * image path, keeping SPROUT_EXE meaningful at arbitrary relaunch
      * depth even when an emulator rebuilt the env (hx == resolved exe). */

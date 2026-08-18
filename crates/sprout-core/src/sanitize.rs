@@ -244,9 +244,72 @@ fn sanitize_impl(
     Ok(out)
 }
 
+/// Ensure a guest program whose e_ident padding bytes (EI_ABIVERSION +
+/// EI_PAD, bytes 8..16) are polluted is launchable through the ld.so
+/// program-role chain. AppImage runtimes embed their signature in those
+/// bytes ("AI\x02"…), and glibc's ld.so-as-program refuses binaries whose
+/// EI_ABIVERSION != 0 with "ELF file ABI version invalid" — while the
+/// KERNEL ignores them entirely when exec'ing. Same doctrine as the
+/// sanitized libc: never patch the installed file, server a cached
+/// content-addressed derivative. Pass-through when already clean or not
+/// an ELF.
+pub fn ensure_abi_sanitized_prog(prog: &Path, cache_dir: &Path) -> Result<PathBuf, SanitizeError> {
+    let src = fs::read(prog)?;
+    const PAD: std::ops::Range<usize> = 8..16;
+    if src.len() < 16 || &src[..4] != b"\x7fELF" || src[PAD.clone()].iter().all(|&b| b == 0) {
+        return Ok(prog.to_path_buf());
+    }
+    let hash = content_hash(&src, &[]);
+    fs::create_dir_all(cache_dir)?;
+    let out = cache_dir.join(format!("abifix-{hash:016x}.bin"));
+    if out.exists() {
+        return Ok(out);
+    }
+    let mut patched = src;
+    for b in &mut patched[PAD] {
+        *b = 0;
+    }
+    let tmp = cache_dir.join(format!(".tmp-abifix-{}-{hash:016x}", std::process::id()));
+    fs::write(&tmp, &patched)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+    }
+    fs::rename(&tmp, &out)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abi_sanitize_zeros_pad_and_caches() {
+        let dir = std::env::temp_dir().join(format!("sprout-abi-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut b = b"\x7fELFjunkhdr!".to_vec();
+        b.resize(64, 0);
+        for (i, v) in b.iter_mut().enumerate().take(16).skip(8) {
+            *v = 0x41 + i as u8;
+        }
+        let prog = dir.join("prog");
+        std::fs::write(&prog, &b).unwrap();
+        let out = ensure_abi_sanitized_prog(&prog, &dir).unwrap();
+        assert_ne!(out, prog);
+        let got = std::fs::read(&out).unwrap();
+        assert_eq!(&got[..8], &b[..8], "magic + class bytes preserved");
+        assert!(got[8..16].iter().all(|&x| x == 0), "pad zeroed");
+        // clean ident → pass-through, no copy
+        let clean = dir.join("clean");
+        let mut c = b.clone();
+        for v in c.iter_mut().take(16).skip(8) {
+            *v = 0;
+        }
+        std::fs::write(&clean, &c).unwrap();
+        assert_eq!(ensure_abi_sanitized_prog(&clean, &dir).unwrap(), clean);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn fixture_libc() -> Vec<u8> {
         // Minimal ELF64 with one executable PT_LOAD containing
