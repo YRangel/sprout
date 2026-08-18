@@ -1409,6 +1409,22 @@ int lchmod(const char *path, mode_t mode) {
     return SP_REAL(fchmodat)(-100 /*AT_FDCWD*/, p, mode, AT_SYMLINK_NOFOLLOW);
 }
 
+/* inotify_add_watch(fd, path, mask): the raw-syscall path arg needs
+ * guest->host translation or glibc's inotify watcher on a guest dir
+ * (Thunar's GLocalFileMonitor for /root/Downloads etc.) hits the host's
+ * raw path (=/tmp on Android -> EACCES) and no refresh events arrive. */
+int inotify_add_watch(int fd, const char *path, uint32_t mask) {
+    static int (*SP_REAL(inotify_add_watch))(int, const char *, uint32_t) = NULL;
+    SP_RESOLVE(inotify_add_watch);
+    if (!path) { errno = EFAULT; return -1; }
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    SP_TRACE("inotify_add_watch", path, p);
+    sp_trace_line("TRM inotify_add_watch pid=%d '%s' -> '%s' mask=%x\n", (int)getpid(),
+                    path ? path : "(null)", p, (unsigned)mask);
+    return SP_REAL(inotify_add_watch)(fd, p, mask);
+}
+
 /* ---- fakeroot identity family (ADR-0011/M3.1 parity with proot -0) ----
  * apt's privilege-drop chain (setgroups/setresgid/setresuid/seteuid...)
  * must BELIEVE it succeeded under -0. Android TRAPs the set*id syscalls

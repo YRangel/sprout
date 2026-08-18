@@ -939,6 +939,12 @@ static const sp_path_rule SP_PATH_RULES[] = {
     { 38 /*renameat*/,     0, 1, 2, 3, 0, "renameat"          },
     { 276/*renameat2*/,    0, 1, 2, 3, 0, "renameat2"         },
     { 49 /*chdir*/,       -1, 0, -1, -1, 1, "chdir"     },
+    /* inotify_add_watch(fd, path, mask): the fd is an inotify INSTANCE,
+     * not a dirfd — but the path inside it needs guest->host translation,
+     * else the watcher registers on the raw guest spelling (host /tmp =
+     * system root on Android -> EACCES and no refresh events ever: the
+     * "Thunar doesn't update after delete" bug). */
+    { 27 /*inotify_add_watch*/, -1, 1, -1, -1, 1, "inotify_add_watch" },
     { SYS_execve,     -1, 0, -1, -1, 1, "execve"      },
     { SYS_execveat,    0, 1, -1, -1, 1, "execveat"    },
 };
