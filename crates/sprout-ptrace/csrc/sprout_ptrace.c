@@ -2820,6 +2820,15 @@ int main(int argc, char **argv) {
                     if (ptrace(PTRACE_GETSIGINFO, w, 0, &si) == 0)
                         SP_OFT("siginfo pid=%d code=%d errno=%d addr=%p si_code=%d\n",
                                w, si.si_signo, si.si_errno, si.si_addr, si.si_code);
+                    /* full register bank + sp-adjacent stack words: catch
+                     * wrong-VA / NULL-arg / smashed-clobber patterns in one shot */
+                    SP_OFT("x1-8 %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                           rx.regs[1], rx.regs[2], rx.regs[3], rx.regs[4],
+                           rx.regs[5], rx.regs[6], rx.regs[7], rx.regs[8]);
+                    SP_OFT("x19-25 %llx %llx %llx %llx %llx %llx %llx lr=%llx fp=%llx\n",
+                           rx.regs[19], rx.regs[20], rx.regs[21], rx.regs[22],
+                           rx.regs[23], rx.regs[24], rx.regs[25],
+                           rx.regs[30], rx.regs[29]);
                     char mapfile[64];
                     snprintf(mapfile, sizeof(mapfile), "/proc/%d/maps", w);
                     FILE *mf = fopen(mapfile, "r");
