@@ -165,6 +165,41 @@ static const sp_emul_rule SP_EMULATE_BASE[] = {
     { 421, -38 }, { 422, -38 }, { 423, -38 },
     { 439, -38 },  /* faccessat2 raw callers -> -ENOSYS (libc falls back) */
     { 452, -38 },  /* fchmodat2 (GNU tar >= 1.35) -> -ENOSYS (fallback to fchmodat) */
+    /* --- Modern-syscall family: app-domain seccomp delivers SIGSYS for
+     * numbers the running kernel predates (observed on 4.14 phone #2:
+     * dpkg-deb's posix_spawn child dies with SIGSYS via clone3=435). The
+     * honest answer is -ENOSYS so glibc/apps take their DESIGNATED
+     * fallbacks (posix_spawn -> clone, openat2 callers probe availability,
+     * lsm/landlock/mseal no-ops, futex_waitv/wake/wait/requeue -> futex,
+     * io_uring -> libaio loop, etc.). Each entry only FIRES when the
+     * kernel's own filter already killed the call, so modern-kernel
+     * guests that legitimately have clone3/openat2/statmount keep them. */
+    { 424, -38 },  /* pidfd_send_signal */
+    { 425, -38 }, { 426, -38 }, { 427, -38 },  /* io_uring family */
+    { 434, -38 },  /* pidfd_open */
+    { 435, -38 },  /* clone3 */
+    { 436, -38 },  /* close_range */
+    { 438, -38 },  /* pidfd_getfd */
+    { 440, -38 },  /* process_madvise */
+    { 441, -38 },  /* epoll_pwait2 */
+    { 442, -38 },  /* mount_setattr */
+    { 443, -38 },  /* quotactl_fd */
+    { 444, -38 }, { 445, -38 }, { 446, -38 },  /* landlock */
+    { 447, -38 },  /* memfd_secret */
+    { 448, -38 },  /* process_mrelease */
+    { 449, -38 },  /* futex_waitv */
+    { 450, -38 },  /* set_mempolicy_home_node */
+    { 451, -38 },  /* cachestat */
+    { 453, -38 },  /* map_shadow_stack */
+    { 454, -38 }, { 455, -38 }, { 456, -38 },  /* futex_wake/wait/requeue */
+    { 457, -38 },  /* statmount */
+    { 458, -38 },  /* listmount */
+    { 459, -38 }, { 460, -38 }, { 461, -38 },  /* lsm_*_self_attr, lsm_list_modules */
+    { 462, -38 },  /* mseal */
+    { 463, -38 }, { 464, -38 }, { 465, -38 }, { 466, -38 },  /* *xattrat */
+    /* openat2 (437) NOT here: SP_PATH_RULES translates its path at ENTRY,
+     * then the syscall number pivots to openat if needed vs the ongoing
+     * kernel-host availability (entry-side logic, not swallow). */
     /* accept(202) deliberately NOT here: Android policy layers trigger
      * SIGSYS on it under our supervisor chain (tmux server accept is the
      * case). It must be PIVOTED to accept4(242) at the SIGSYS stop
