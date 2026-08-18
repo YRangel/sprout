@@ -62,6 +62,9 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/prctl.h>
+#include <time.h> /* CLOCK_BOOTTIME/CLOCK_MONOTONIC for the fake /proc/stat
+                    * fallback tick; was ambulance-by-transitive on Termux,
+                    * missing in ubuntu-latest's glibc headers (CI fail). */
 #include <poll.h>
 
 
