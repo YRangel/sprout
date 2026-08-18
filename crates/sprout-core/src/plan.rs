@@ -198,6 +198,22 @@ fn ensure_dev_shm(rootfs: &Rootfs) {
     }
 }
 
+/// Guest-spelled canonical image path for the SPROUT_EXE stamp.
+///
+/// `guest_prog` is the host-absolute *resolved* path of the guest binary;
+/// the stamp must be the GUEST spelling (rootfs prefix stripped) because
+/// the readlinkat() interposer answers /proc/self/exe verbatim — a
+/// host-spelled answer leaks '/data/data/…' into guests and a raw
+/// launch-alias answer (the chain case) makes symlink-launched binaries
+/// (firefox-esr -> ../lib/firefox-esr/firefox-esr) cut the wrong GRE dir
+/// out of it ("Couldn't load XPCOM").
+fn exe_guest_spelling(rootfs: &Rootfs, guest_prog: &std::path::Path) -> String {
+    match guest_prog.strip_prefix(&rootfs.root) {
+        Ok(rel) if rel.as_os_str().len() > 0 => format!("/{}", rel.display()),
+        _ => guest_prog.display().to_string(),
+    }
+}
+
 impl LaunchPlan {
     /// Build the preload launch plan for an already-classified dynamic ELF.
     ///
@@ -244,7 +260,7 @@ impl LaunchPlan {
                 ("LD_LIBRARY_PATH".into(), library_path.clone()),
                 ("SPROUT_LOADER".into(), loader.display().to_string()),
                 ("SPROUT_LIBRARY_PATH".into(), library_path),
-                ("SPROUT_EXE".into(), guest_prog.display().to_string()),
+                ("SPROUT_EXE".into(), exe_guest_spelling(rootfs, &guest_prog)),
                 ("SPROUT_LIBC".into(), "musl".into()),
                 // Autoconf-style guests fork/exec hundreds of conftest binaries;
                 // pre-binding every PLT entry on load prevents a class of
@@ -354,7 +370,7 @@ impl LaunchPlan {
              * (mozilla "Couldn't load XPCOM") searches the launcher dir.
              * The preload interposer answers /proc/self/exe with this var;
              * chains re-stamp it per child exec. */
-            ("SPROUT_EXE".into(), guest_prog.display().to_string()),
+            ("SPROUT_EXE".into(), exe_guest_spelling(rootfs, &guest_prog)),
             // See musl branch note above: avoids conftest-hang class.
             ("LD_BIND_NOW".into(), "1".into()),
         ];

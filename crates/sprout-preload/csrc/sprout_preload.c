@@ -174,7 +174,12 @@ static void sp_resolve_links(const sp_config_t *cfg, char out[SP_PATH_MAX]) {
     }
 }
 
-int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]) {
+/* follow_final: chase the FINAL symlink into its payload (wanted by
+ * open/stat/readlink-follow semantics, NOT wanted by the NOFOLLOW family:
+ * unlinkat/lstat/rename/lutimes must translate the LINK itself — chasing
+ * here would unlinkat() the payload of /etc/hostname-style .l2s stubs
+ * (real bug found 2026-08-17: 'rm -f /tmp/hl1' deleted the payload). */
+int sp_translate_f(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX], int follow_final) {
     if (!path || path[0] != '/') return 0; /* relative paths resolve against cwd, untouched */
 
     /* Idempotence: a path that is already host-side must not be re-prefixed.
@@ -200,7 +205,7 @@ int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]
         if (b->host_len + rest + 1 > SP_PATH_MAX) return 0;
         memcpy(out, b->host, b->host_len);
         memcpy(out + b->host_len, path + b->guest_len, rest + 1);
-        sp_resolve_links(cfg, out);
+        if (follow_final) sp_resolve_links(cfg, out);
         return 1;
     }
 
@@ -215,8 +220,12 @@ int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]
     if (cfg->rootfs_len + n + 1 > SP_PATH_MAX) return 0;
     memcpy(out, cfg->rootfs, cfg->rootfs_len);
     memcpy(out + cfg->rootfs_len, path, n + 1);
-    sp_resolve_links(cfg, out);
+    if (follow_final) sp_resolve_links(cfg, out);
     return 1;
+}
+
+int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]) {
+    return sp_translate_f(cfg, path, out, 1);
 }
 
 size_t sp_reverse(const sp_config_t *cfg, const char *host, char *out, size_t outsz) {
@@ -433,14 +442,14 @@ static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int 
      * Heisenbug. */
     const char *out;
     if (path == joined) {
-        if (!sp_translate(&g_cfg, path, buf)) {
+        if (!sp_translate_f(&g_cfg, path, buf, follow_final)) {
             size_t jl = strlen(joined);
             if (jl >= SP_PATH_MAX) { errno = ENAMETOOLONG; return NULL; }
             memcpy(buf, joined, jl + 1);
         }
         out = buf;
     } else {
-        out = sp_translate(&g_cfg, path, buf) ? buf : path;
+        out = sp_translate_f(&g_cfg, path, buf, follow_final) ? buf : path;
     }
     if (out != buf) return out;
     if (!follow_final) return out;
@@ -2895,6 +2904,41 @@ static char **sp_chain_env(char *const envp[]) {
  * the readlinkat() interposer below replies with it when asked for the
  * self-exe symlink. proot never needed this because it exec()s the guest
  * binary directly; our chain exec()s a launcher. */
+/* Lexical squeeze of '.' and '..' segments in an absolute guest path.
+ * Needed for the SPROUT_EXE stamp: firefox's XPCOM glue cuts its GRE dir
+ * out of readlink(/proc/self/exe) *textually* (no realpath), so a stamp
+ * spelled '/usr/bin/../lib/firefox-esr/firefox-esr' still worked (kernel
+ * normalizes '..'), but plain symlink '/usr/bin/firefox-esr' did not —
+ * glue cut dirname '/usr/bin' and failed 'dependentlibs.list' with
+ * "Couldn't load XPCOM". Canonicalizing to the real path keeps the
+ * glue's dirname-correct for symlink-launched binaries (proot parity). */
+static void sp_normalize_abs(char *p) {
+    if (!p || p[0] != '/') return;
+    char tmp[SP_PATH_MAX];
+    size_t o = 1;
+    tmp[0] = '/';
+    const char *s = p + 1;
+    while (*s) {
+        const char *e = strchr(s, '/');
+        if (!e) e = s + strlen(s);
+        size_t n = (size_t)(e - s);
+        if (n == 0 || (n == 1 && s[0] == '.')) {
+            /* skip */
+        } else if (n == 2 && s[0] == '.' && s[1] == '.') {
+            while (o > 1 && tmp[o - 1] != '/') o--;
+        } else if (o + n + 2 < SP_PATH_MAX) {
+            if (o > 1 && tmp[o - 1] != '/') tmp[o++] = '/';
+            memcpy(tmp + o, s, n);
+            o += n;
+            tmp[o] = '\0';
+        } else break;
+        s = *e ? e + 1 : e;
+    }
+    if (o > 1 && tmp[o - 1] == '/') o--;
+    tmp[o] = '\0';
+    strcpy(p, tmp);
+}
+
 static void sp_stamp_exe(char **env, const char *gabs) {
     if (!gabs || !*gabs) return;
     static char exe_entry[SP_PATH_MAX + 12];
@@ -3162,8 +3206,20 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
          * stamping the raw alias would poison children with
          * SPROUT_EXE=/proc/self/exe (self-referential). */
         if (strcmp(path, "/proc/self/exe") != 0 &&
-            strcmp(path, "/proc/thread-self/exe") != 0)
+            strcmp(path, "/proc/thread-self/exe") != 0) {
+            /* Canonicalize BEFORE stamping: resolve the symlink chain and
+             * squeeze '..' (via host-translate + reverse) so /proc/self/exe
+             * answers the REAL image path, not its launch alias. */
+            char hx[SP_PATH_MAX], gcan[SP_PATH_MAX];
+            const char *habs = sp_translate_x(gabs, hx);
+            if (habs && sp_reverse(&g_cfg, habs, gcan, sizeof(gcan)) > 0
+                && gcan[0] == '/') {
+                sp_normalize_abs(gcan);
+                size_t gn = strlen(gcan);
+                if (gn > 1) memcpy(gabs, gcan, gn + 1);
+            }
             sp_stamp_exe((char **)envp, gabs);
+        }
     }
     char x[SP_PATH_MAX];
     const char *host_raw = sp_translate_x(path, x);

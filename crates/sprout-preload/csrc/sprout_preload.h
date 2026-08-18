@@ -66,6 +66,7 @@ void sp_config_load(sp_config_t *cfg);
  *   2. already-inside-rootfs guard (keeps us idempotent on re-entry)
  *   3. prefix with rootfs
  */
+int sp_translate_f(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX], int follow_final);
 int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]);
 
 /*
