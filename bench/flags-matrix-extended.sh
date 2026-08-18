@@ -9,6 +9,14 @@ S=$PREFIX/bin/sprout
 # this too, but each battery must be self-sufficient).
 mkdir -p "$TMPDIR/sp-a"
 printf 'mark' > "$TMPDIR/sp-a/marker"
+rm -rf "$A/tmp/batf"; mkdir -p "$A/tmp/batf"
+: > "$A/tmp/batf/a"; : > "$A/tmp/batf/b"; : > "$A/tmp/batf/c"
+[ -e "$B/.l2s/.l2s.hostname.57d21" ] || printf 'localhost.localdomain\n' > "$B/.l2s/.l2s.hostname.57d21"
+LP="$B/.l2s/.l2s.hostname.57d21"
+TGT=$(readlink -f "$B/etc/hostname" 2>/dev/null)
+CONTENT=$(cat "$TGT" 2>/dev/null || echo localhost.localdomain)
+rm -f "$B/.l2s/.l2s..l2s.hostname."*
+printf '%s\n' "$CONTENT" > "$LP"
 pass=0; fail=0
 T(){
   local name="$1" got="$2" want="$3"
@@ -59,7 +67,7 @@ T "musl-no-fakeroot"            "$($S -r $A --no-fakeroot /usr/bin/env 2>/dev/nu
 T "musl-host-home"              "$($S -r $A --host-home /bin/busybox pwd 2>/dev/null)" "/data/data/com.termux/files/home"
 T "musl-umask-default"          "$($S -r $A /bin/busybox sh -c umask 2>/dev/null)" "0022"
 T "musl-notify-statics-off"     "$(SPROUT_NOTIFY_STATICS=0 $S -r $A /tmp/sp_asm >/dev/null 2>&1; echo rc=$?)" "rc=42"
-TR "musl-find"                  "$($S -r $A find /usr/bin -type f 2>/dev/null | wc -l)" 29 31
+TR "musl-find"                  "$($S -r $A find /tmp/batf -type f 2>/dev/null | wc -l)" 3 3
 T "musl-exit39"                 "$($S -r $A /bin/busybox sh -c 'exit 39' 2>/dev/null; echo rc=$?)" "rc=39"
 
 # --- script/shebang class

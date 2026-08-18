@@ -6,6 +6,19 @@ S=$PREFIX/bin/sprout
 # on marker state some OTHER run happened to leave behind).
 mkdir -p "$TMPDIR/sp-a"
 printf 'mark' > "$TMPDIR/sp-a/marker"
+# musl-find fixture: rootfs /usr/bin outgrew the old 29..31 window as apk
+# packages accumulated; count a self-seeded tree instead.
+rm -rf "$A/tmp/batf"; mkdir -p "$A/tmp/batf"
+: > "$A/tmp/batf/a"; : > "$A/tmp/batf/b"; : > "$A/tmp/batf/c"
+# l2s payload precondition for the link2symlink cells: /etc/hostname is a
+# host-spelled .l2s link whose payload chain is MUTATED by every ln run
+# (each adds a wrap hop or drops the stub entirely); normalize to exactly
+# one hop (link -> regular payload) so the cells are state-independent.
+LP="$B/.l2s/.l2s.hostname.57d21"
+TGT=$(readlink -f "$B/etc/hostname" 2>/dev/null)
+CONTENT=$(cat "$TGT" 2>/dev/null || echo localhost.localdomain)
+rm -f "$B/.l2s/.l2s..l2s.hostname."*
+printf '%s\n' "$CONTENT" > "$LP"
 pass=0; fail=0
 T(){
   local name="$1" got="$2" want="$3"
@@ -32,12 +45,12 @@ T "fallback-ptrace-glibc"   "$($S -r $B --fallback ptrace /usr/bin/true; echo rc
 T "fallback-ptrace-statics" "$($S -r $B --fallback ptrace /tmp/sp_asm >/dev/null 2>&1; echo rc=$?)" "rc=42"
 T "fallback-preload-statics" "$($S -r $B --fallback preload /tmp/sp_asm 2>/dev/null; echo rc=$?)" "rc=1"
 T "notify-statics-off"      "$(SPROUT_NOTIFY_STATICS=0 $S -r $B /tmp/sp_asm >/dev/null 2>&1; echo rc=$?)" "rc=42"
-TR "USER_NOTIFY=0-musl-find" "$(SPROUT_USER_NOTIFY=0 $S -r $A find /usr/bin -type f 2>/dev/null | wc -l)" 29 31
+TR "USER_NOTIFY=0-musl-find" "$(SPROUT_USER_NOTIFY=0 $S -r $A find /tmp/batf -type f 2>/dev/null | wc -l)" 3 3
 T "KEEP_UMASK"              "$(SPROUT_KEEP_UMASK=1 $S -r $B /bin/bash -c umask)" "0077"
 T "default-umask"           "$($S -r $B /bin/bash -c umask)" "0022"
 T "no-fakeroot-env"         "$($S -r $B --no-fakeroot /usr/bin/env 2>/dev/null | grep -c FAKEROOT)" "0"
 T "default-fakeroot-env"    "$($S -r $B /usr/bin/env 2>/dev/null | grep SPROUT_FAKEROOT)" "SPROUT_FAKEROOT=1"
-TR "musl-find"               "$($S -r $A find /usr/bin -type f 2>/dev/null | wc -l)" 29 31
+TR "musl-find"               "$($S -r $A find /tmp/batf -type f 2>/dev/null | wc -l)" 3 3
 T "missing-program-error"   "$($S -r $B /no-such-cmd 2>&1 | grep -c 'not found')" "1"
 T "tmux-clean"              "$($S -r $B /bin/bash /tmp/probe3.sh 2>/dev/null | grep -c 'access not allowed')" "0"
 T "statics-10-B"            "$(for i in $(seq 1 10); do $S -r $B /tmp/sp_asm >/dev/null 2>&1; [ $? -eq 42 ] || echo x; done | wc -l)" "0"
