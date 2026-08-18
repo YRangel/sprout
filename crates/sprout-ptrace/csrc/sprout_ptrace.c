@@ -2070,7 +2070,12 @@ static int sp_fake_proc_serve(unsigned long long id, const char *which,
              * plausible, non-zero, monotonically-ticking rows the way proot
              * synthesizes: chromium metrics sampling assumes populated
              * counters; all-zero rows crash it (helium +2f79c24). */
-            struct timespec ts; clock_gettime(CLOCK_BOOTTIME, &ts);
+            struct timespec ts;
+#ifdef CLOCK_BOOTTIME
+            clock_gettime(CLOCK_BOOTTIME, &ts);
+#else
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
             unsigned long long tick = (unsigned long long)ts.tv_sec * 100;
             unsigned long long ncpu = (unsigned long long)sp_fake_proc_cpu_count();
             unsigned long long idle = tick, usr = tick / 50 + 37,
