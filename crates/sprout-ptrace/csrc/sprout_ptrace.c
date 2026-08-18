@@ -2923,6 +2923,71 @@ int main(int argc, char **argv) {
                                 fp0 = (unsigned long long)pfp;
                             }
                         }
+                        /* object peek: dump [x19-16..+344] word-wise hex+ascii,
+                         * the +304 chase target, and the instruction window
+                         * around pc (loader-mismap / text-garbage observability) */
+                        {
+                            unsigned long long pc0 = (unsigned long long)rx.pc;
+                            unsigned char pcb[80]; int pco = 1;
+                            for (int off = -32; off < 48; off += 8) {
+                                errno = 0;
+                                long q = ptrace(PTRACE_PEEKDATA, w, (void *)(pc0 + off), NULL);
+                                if (errno) { pco = 0; break; }
+                                memcpy(pcb + off + 32, &q, 8);
+                            }
+                            if (pco) {
+                                for (int off = -32; off < 48; off += 16) {
+                                    char hx2[64];
+                                    for (int c = 0; c < 16; c++)
+                                        snprintf(hx2 + c * 3, 4, "%02x ", pcb[off + 32 + c]);
+                                    SP_OFT("  pc%+d: %s\n", off, hx2);
+                                }
+                            }
+                            unsigned long long base = rx.regs[19];
+                            if (base > 0x10000) {
+                                unsigned char buf[368]; int ok = 1;
+                                for (int off = -16; off < 352; off += 8) {
+                                    errno = 0;
+                                    long q = ptrace(PTRACE_PEEKDATA, w, (void *)(base + off), NULL);
+                                    if (errno) { ok = 0; break; }
+                                    memcpy(buf + off + 16, &q, 8);
+                                }
+                                if (ok) {
+                                    for (int off = -16; off < 352; off += 16) {
+                                        char hex[96], asc[24];
+                                        for (int c = 0; c < 16; c++) {
+                                            snprintf(hex + c * 3, 4, "%02x ", buf[off + 16 + c]);
+                                            asc[c] = (buf[off + 16 + c] >= 32 && buf[off + 16 + c] < 127)
+                                                     ? (char)buf[off + 16 + c] : '.';
+                                        }
+                                        asc[16] = 0;
+                                        SP_OFT("  x19%+d: %s |%s|\n", off, hex, asc);
+                                    }
+                                    unsigned long long chase;
+                                    memcpy(&chase, buf + 304 + 16, 8);
+                                    if (chase > 0x10000 && (chase >> 44) == 0) {
+                                        unsigned char s2[96]; int ok2 = 1;
+                                        for (int off = 0; off < 96; off += 8) {
+                                            errno = 0;
+                                            long q = ptrace(PTRACE_PEEKDATA, w, (void *)(chase + off), NULL);
+                                            if (errno) { ok2 = 0; break; }
+                                            memcpy(s2 + off, &q, 8);
+                                        }
+                                        if (ok2) {
+                                            char line2[320]; int pl = 0;
+                                            pl += snprintf(line2 + pl, sizeof(line2) - pl, "  x19+304 -> %llx bytes: ", chase);
+                                            for (int c = 0; c < 96; c++)
+                                                pl += snprintf(line2 + pl, sizeof(line2) - pl, "%02x", s2[c]);
+                                            SP_OFT("%s\n", line2);
+                                            char asc2[97];
+                                            for (int c = 0; c < 96; c++) asc2[c] = (s2[c] >= 32 && s2[c] < 127) ? (char)s2[c] : '.';
+                                            asc2[96] = 0;
+                                            SP_OFT("  asc: |%s|\n", asc2);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

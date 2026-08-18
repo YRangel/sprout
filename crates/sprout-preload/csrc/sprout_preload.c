@@ -25,7 +25,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <elf.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -273,6 +275,11 @@ extern gid_t g_fake_gid;
 extern gid_t g_fake_groups[64];
 extern int   g_fake_ngroups;
 
+/* synthesized /proc/self/auxv server (chromium-family compat: the loader
+ * chain's auxv describes the ldso, not the guest binary). Baked once at
+ * ctor into a memfd; open-family wrappers dup() it. -2 = not built. */
+static int g_auxv_fd = -2;
+
 __attribute__((constructor)) static void sprout_init(void) {
     sp_config_load(&g_cfg);
     /* --user anchor (proot -i / proot-distro --user parity): the resolved
@@ -288,6 +295,215 @@ __attribute__((constructor)) static void sprout_init(void) {
         g_fake_gid = (gid_t)g;
         g_fake_groups[0] = g_fake_gid;
         g_fake_ngroups = 1;
+    }
+    /* AT_EXECFN repair (chromium-family compat): the kernel exec'd the
+     * sanitized ld.so loader chain, so auxv carries the L O A D E R's host
+     * path at AT_EXECFN, not the guest binary (ld.so may also REGENERATE
+     * the auxv array when it chains the user program, defeating a live
+     * array walk). Helium's crashpad/db bootstrap slices path components
+     * off execfn-relative spellings and ends up calling mkdir() on
+     * TRUNCATED strings ("/root", "") — deterministic main-thread
+     * SIGSEGV at first crashpad init. Read /proc/self/auxv, find the
+     * execfn entry, and overwrite its STACK string in place: the loader's
+     * spelling (~60+ chars) is always >= the guest exe spelling, so it
+     * fits. proot presents the real binary; now we do too. */
+    {
+        const char *e = getenv("SPROUT_EXE");
+        if (e && *e) {
+            int af = open("/proc/self/auxv", O_RDONLY);
+            if (af >= 0) {
+                struct _AuxEnt { unsigned long long t, v; } av[64];
+                ssize_t n = read(af, av, sizeof(av));
+                close(af);
+                for (ssize_t i = 0; n > 0 && i * (ssize_t)sizeof(av[0]) + 16 <= n; i++) {
+                    if (av[i].t == 31 /*AT_EXECFN*/) {
+                        char *slot = (char *)(uintptr_t)av[i].v;
+                        size_t el = strlen(e);
+                        if (slot && (unsigned long long)slot > 0x1000) {
+                            /* only overwrite when the buffer looks like the
+                             * expected host loader path, and fits */
+                            if (strlen(slot) >= el && strstr(slot, "sprout/ldso-")) {
+                                memcpy(slot, e, el + 1);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            /* auxv program-identity repair (chromium-family compat, THE
+             * deterministic-helium-crash root cause): the kernel exec'd the
+             * sanitized ld.so loader chain, so the guest's LIVE auxv array
+             * describes the L O A D E R (AT_PHHDR abs-addr, PHNUM=ldso's,
+             * PHENT/ENTRY likewise), not the guest binary. Chromium reads
+             * AT_PHDR/PHNUM for self-image math (crashpad db path slicing
+             * etc.) and gets a skewed image map: truncated mkdir args
+             * ("/root", "") + deterministic main-thread SIGSEGV.
+             * proot presents the real binary's values; now we do too:
+             * locate the LIVE auxv (right after envp[]) and rewrite the
+             * program-identity slots from the GUEST ELF's OWN header. */
+            {
+                /* find the guest ELF: the file SPROUT_EXE points at */
+                char ehdr[64];
+                memset(ehdr, 0, sizeof(ehdr));
+                const char *rf = getenv("SPROUT_ROOTFS");
+                char hx[SP_PATH_MAX];
+                if (rf && *e == '/') snprintf(hx, sizeof(hx), "%s%s", rf, e);
+                else memcpy(hx, e, strlen(e) + 1);
+                int ef = open(hx, O_RDONLY);
+                if (getenv("SPROUT_DEBUG")) { int df = open("/tmp/sp-auxfix.log", O_WRONLY|O_CREAT|O_APPEND, 0644); if (df >= 0) { char lb[160]; int ll = snprintf(lb, sizeof(lb), "fx1 ef=%d hx=%.100s\n", ef, hx); write(df, lb, ll); close(df); } }
+                if (ef >= 0) { ssize_t en = read(ef, ehdr, sizeof(ehdr)); close(ef);
+                               if (en < (ssize_t)sizeof(Elf64_Ehdr)) ehdr[0] = 0; }
+                const Elf64_Ehdr *E = (const Elf64_Ehdr *)ehdr;
+                if (ehdr[0] == 0x7f && ehdr[1] == 'E' && ehdr[2] == 'L' && ehdr[3] == 'F' &&
+                    ehdr[4] == 2 /*64bit*/ &&
+                    (E->e_type == 2 /*EXEC*/ || E->e_type == 3 /*DYN*/)) {
+                    /* its runtime base = the FIRST r-x (or any) file-backed
+                     * mapping of this exact file in /proc/self/maps */
+                    unsigned long long base = 0;
+                    int mf = open("/proc/self/maps", O_RDONLY);
+                    if (getenv("SPROUT_DEBUG")) { int df = open("/tmp/sp-auxfix.log", O_WRONLY|O_CREAT|O_APPEND, 0644); if (df >= 0) { char lb[160]; int ll = snprintf(lb, sizeof(lb), "fx2 ehdr-ok mf=%d\n", mf); write(df, lb, ll); close(df); } }
+                    if (mf >= 0) {
+                        static char mb[65536]; ssize_t mn = read(mf, mb, sizeof(mb) - 1);
+                        close(mf);
+                        if (mn > 0) {
+                            mb[mn] = 0;
+                            for (char *l = mb, *le; l && *l; l = le + 1) {
+                                le = strchr(l, '\n'); if (!le) break; *le = 0;
+                                char *mm = strrchr(l, '/');
+                                if (mm && strstr(mm + 1, strrchr(e, '/') ? strrchr(e, '/') + 1 : e)) {
+                                    unsigned long long lo = strtoull(l, 0, 16);
+                                    if (lo && (!base || lo < base)) base = lo;
+                                }
+                            }
+                        }
+                    }
+                    if (base) {
+                        extern char **environ;
+                        char **ep = environ;
+                        size_t nenv = 0;
+                        if (ep) while (ep[nenv]) nenv++;
+                        struct _AuxEnt { unsigned long long t, v; } *live =
+                            ep ? (struct _AuxEnt *)&ep[nenv + 1] : 0;
+                        /* sanity: the LIVE array must at least contain what the
+                         * /proc mirror has (e.g. AT_UID is stable across both) */
+                        int sane = 0;
+                        if (live) {
+                            for (int q = 0; q < 64 && live[q].t; q++)
+                                if (live[q].t == 11 /*AT_UID*/) { sane = 1; break; }
+                        }
+                        if (getenv("SPROUT_DEBUG")) { int df = open("/tmp/sp-auxfix.log", O_WRONLY|O_CREAT|O_APPEND, 0644); if (df >= 0) { char lb[160]; int ll = snprintf(lb, sizeof(lb), "fx3 base=%llx live=%p sane=%d\n", base, (void*)live, sane); write(df, lb, ll); close(df); } }
+                        if (sane) {
+                            for (int q = 0; q < 64 && live[q].t; q++) {
+                                switch (live[q].t) {
+                                case 3:  live[q].v = base + E->e_phoff; break;      /* AT_PHDR   */
+                                case 4:  live[q].v = E->e_phentsize; break;          /* AT_PHENT  */
+                                case 5:  live[q].v = E->e_phnum; break;              /* AT_PHNUM  */
+                                case 9:  live[q].v = base + E->e_entry; break;       /* AT_ENTRY  */
+                                default: break;
+                                }
+                            }
+                        }
+                        /* ld.so-as-program RELOCATES initial-stack data: the
+                         * envp-adjacent array is NOT what /proc/self/auxv
+                         * (mm->saved_auxv) mirrors. Find the REAL array by
+                         * scanning [stack]'s top for our own signature
+                         * (contains AT_UID + AT_PHDR, terminated by AT_NULL). */
+                        {
+                            int mf2 = open("/proc/self/maps", O_RDONLY);
+                            if (mf2 >= 0) {
+                                static char mb2[65536]; ssize_t mn2 = read(mf2, mb2, sizeof(mb2) - 1);
+                                close(mf2);
+                                if (mn2 > 0) {
+                                    mb2[mn2] = 0;
+                                    for (char *l = mb2, *le; l && *l; l = le + 1) {
+                                        le = strchr(l, '\n'); if (!le) break; *le = 0;
+                                        if (getenv("SPROUT_DEBUG") && strstr(l, "stack")) { int df = open("/tmp/sp-auxfix.log", O_WRONLY|O_CREAT|O_APPEND, 0644); if (df >= 0) { char lb3[300]; int ll3 = snprintf(lb3, sizeof(lb3), "fxs |%.180s|\n", l); write(df, lb3, ll3); close(df); } }
+                                        if (!strstr(l, "[stack]")) continue;
+                                        unsigned long long slo = 0, shi = 0;
+                                        if (sscanf(l, "%llx-%llx", &slo, &shi) != 2 || shi <= slo) break;
+                                        struct _AuxEnt { unsigned long long t, v; } *q;
+                                        for (unsigned long long a = slo; a + 64 <= shi; a += 8) {
+                                            q = (struct _AuxEnt *)a;
+                                            if (q[0].t > 100 || q[1].t > 100) continue;
+                                            int uid_n = 0, phdr_n = 0, ends = 0;
+                                            for (int z = 0; z < 64; z++) {
+                                                if (q[z].t == 0) { ends = 1; break; }
+                                                if (q[z].t > 64) break;
+                                                if (q[z].t == 11) uid_n = 1;
+                                                if (q[z].t == 3) phdr_n = 1;
+                                            }
+                                            if (!uid_n || !phdr_n || !ends) continue;
+                                            /* identity check: AT_UID value must
+                                             * match our own getuid — guard
+                                             * against hash-colliding junk */
+                                            for (int z = 0; z < 64; z++) {
+                                                if (q[z].t == 0) break;
+                                                if (q[z].t == 11 && (uid_t)q[z].v != getuid()) { ends = 0; break; }
+                                            }
+                                            if (!ends) continue;
+                                            for (int z = 0; z < 64; z++) {
+                                                if (q[z].t == 0) break;
+                                                switch (q[z].t) {
+                                                case 3:  q[z].v = base + E->e_phoff; break;
+                                                case 4:  q[z].v = E->e_phentsize; break;
+                                                case 5:  q[z].v = E->e_phnum; break;
+                                                case 9:  q[z].v = base + E->e_entry; break;
+                                                default: break;
+                                                }
+                                            }
+                                            if (getenv("SPROUT_DEBUG")) { int df = open("/tmp/sp-auxfix.log", O_WRONLY|O_CREAT|O_APPEND, 0644); if (df >= 0) { char lb2[160]; int ll2 = snprintf(lb2, sizeof(lb2), "fx4 stacksig patched at %llx\n", a); write(df, lb2, ll2); close(df); } }
+                                            break;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        /* serve a SYNTHESIZED /proc/self/auxv to open-family
+                         * readers: the kernel's mm->saved_auxv belongs to the
+                         * loader chain and is never user-writable. Bake once
+                         * into a memfd; open()/openat* wrappers dup() it. */
+                        {
+                            int af2 = open("/proc/self/auxv", O_RDONLY);
+                            if (af2 >= 0) {
+                                static unsigned char ab[1024];
+                                ssize_t an = read(af2, ab, sizeof(ab));
+                                close(af2);
+                                if (an > 16) {
+                                    struct _AuxEnt { unsigned long long t, v; } *cp = (struct _AuxEnt *)ab;
+                                    for (ssize_t z = 0; z * 16 < an; z++) {
+                                        if (cp[z].t == 0) break;
+                                        switch (cp[z].t) {
+                                        case 3:  cp[z].v = base + E->e_phoff; break;
+                                        case 4:  cp[z].v = E->e_phentsize; break;
+                                        case 5:  cp[z].v = E->e_phnum; break;
+                                        case 9:  cp[z].v = base + E->e_entry; break;
+                                        default: break;
+                                        }
+                                    }
+                                    int mfd = (int)syscall(SYS_memfd_create, "sprout-auxv", 0L);
+                                    if (mfd < 0) {
+                                        /* very old kernels lack memfd —
+                                         * fall back to an anonymous temp */
+                                        char tnm[SP_PATH_MAX];
+                                        snprintf(tnm, sizeof(tnm), "%s/sp-auxv-XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+                                        mfd = mkstemp(tnm);
+                                        if (mfd >= 0) unlink(tnm);
+                                    }
+                                    if (mfd >= 0) {
+                                        if (write(mfd, ab, (size_t)an) == an &&
+                                            lseek(mfd, 0, SEEK_SET) == 0)
+                                            g_auxv_fd = mfd;
+                                        else
+                                            close(mfd);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -517,6 +733,18 @@ static const char *sp_translate_l(const char *path, char buf[SP_PATH_MAX]) {
 }
 
 /* open-family: const char* path */
+static int sp_auxv_match(const char *path) {
+    if (g_auxv_fd < 0 || !path || path[0] != '/') return -1;
+    int ok = !strcmp(path, "/proc/self/auxv");
+    if (!ok) {
+        char m[96];
+        snprintf(m, sizeof(m), "/proc/%ld/auxv", (long)getpid());
+        ok = !strcmp(path, m);
+    }
+    if (!ok) return -1;
+    return (int)syscall(SYS_dup, g_auxv_fd);
+}
+
 int open(const char *path, int flags, ...) {
     static int (*SP_REAL(open))(const char *, int, ...) = NULL;
     SP_RESOLVE(open);
@@ -525,6 +753,7 @@ int open(const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags);
         mode = va_arg(ap, mode_t); va_end(ap);
     }
+    { int af = sp_auxv_match(path); if (af >= 0) return af; }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("open", path, p);
@@ -539,6 +768,7 @@ int open64(const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags);
         mode = va_arg(ap, mode_t); va_end(ap);
     }
+    { int af = sp_auxv_match(path); if (af >= 0) return af; }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("open64", path, p);
@@ -559,6 +789,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
     if (!path) { errno = EFAULT; return -1; }
     if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(openat)(dirfd, path, flags, mode);
+    if (dirfd == -100) { int af = sp_auxv_match(path); if (af >= 0) return af; }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("openat", path, p);
@@ -576,6 +807,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     if (!path) { errno = EFAULT; return -1; }
     if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(openat64)(dirfd, path, flags, mode);
+    if (dirfd == -100) { int af = sp_auxv_match(path); if (af >= 0) return af; }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("openat64", path, p);
