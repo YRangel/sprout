@@ -1,6 +1,6 @@
 [package]
 name = "sprout-cli"
-version = "0.4.8"
+version = "0.4.9"
 description = "Rootless glibc Linux runtime for Android — proot-compatible launcher (LD_PRELOAD fast path, ptrace fallback)"
 edition.workspace = true
 license.workspace = true
