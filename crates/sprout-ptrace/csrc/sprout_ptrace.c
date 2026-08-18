@@ -2858,6 +2858,10 @@ int main(int argc, char **argv) {
                     SP_OFT("x1-8 %llx %llx %llx %llx %llx %llx %llx %llx\n",
                            rx.regs[1], rx.regs[2], rx.regs[3], rx.regs[4],
                            rx.regs[5], rx.regs[6], rx.regs[7], rx.regs[8]);
+                    SP_OFT("x9-18 %llx %llx %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                           rx.regs[9], rx.regs[10], rx.regs[11], rx.regs[12],
+                           rx.regs[13], rx.regs[14], rx.regs[15], rx.regs[16],
+                           rx.regs[17], rx.regs[18]);
                     SP_OFT("x19-25 %llx %llx %llx %llx %llx %llx %llx lr=%llx fp=%llx\n",
                            rx.regs[19], rx.regs[20], rx.regs[21], rx.regs[22],
                            rx.regs[23], rx.regs[24], rx.regs[25],
@@ -2885,6 +2889,10 @@ int main(int argc, char **argv) {
                                            &off, mod) < 1) off = 0;
                                 if (pc >= lo && pc < hi)
                                     SP_OFT("crash mod: %s +%llx\n", mod, pc - lo + off);
+                                /* full module inventory for the crashing binary
+                                 * (wd-init kept failing to bracket the slot) */
+                                if (strstr(mod, "helium/helium"))
+                                    SP_OFT("  hbmap %llx-%llx off=%llx %s\n", lo, hi, off, mod);
                                 for (int a = 0; a < 3; a++)
                                     if (want[a] && want[a] >= lo && want[a] < hi) {
                                         static const char *lbl[3] = { "lr", "fp", "sp" };
