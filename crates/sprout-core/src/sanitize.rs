@@ -32,6 +32,15 @@ use std::path::{Path, PathBuf};
 const PAT_SVC: [u8; 4] = [0x01, 0x00, 0x00, 0xd4];
 /// aarch64 `mov x0, xzr` (emulated success)     — little endian
 const PATCH_MOV_X0_XZR: [u8; 4] = [0xe0, 0x03, 0x1f, 0xaa];
+/// movn x0, #37 (== mov x0, -38 == -ENOSYS). AVAILABLE via patch_for()
+/// as an experiment knob; rseq-ENOSYS vs rseq-fake-success was tested
+/// 2026-08-18 against helium's slot-registration bug: made NO difference
+/// (helium crash persists under both) — policy remains fake-success.
+#[allow(dead_code)]
+const PATCH_MOVN_X0_37: [u8; 4] = [0xa0, 0x04, 0x80, 0x92];
+fn patch_for(_sysno: u32) -> [u8; 4] {
+    PATCH_MOV_X0_XZR
+}
 
 /// Syscall numbers Android's untrusted_app policy blocks (SIGSYS) that
 /// glibc startup calls unconditionally and whose return value is ignored
@@ -127,7 +136,7 @@ fn exec_ranges(bytes: &[u8]) -> Option<Vec<(usize, usize)>> {
 /// setup of any length between the mov and the svc is fine. Stops scanning
 /// each site at the first unconditional control-flow instruction (an
 /// `svc` in a different call site behind a branch is never ours).
-fn find_sites_for(bytes: &[u8], ranges: &[(usize, usize)], sysnos: &[u32]) -> Vec<usize> {
+fn find_sites_for(bytes: &[u8], ranges: &[(usize, usize)], sysnos: &[u32]) -> Vec<(usize, u32)> {
     let mut sites = Vec::new();
     for &(start, end) in ranges {
         let seg = &bytes[start..end];
@@ -144,7 +153,7 @@ fn find_sites_for(bytes: &[u8], ranges: &[(usize, usize)], sysnos: &[u32]) -> Ve
                         }
                         let next = u32::from_le_bytes(seg[j..j + 4].try_into().unwrap());
                         if next.to_le_bytes() == PAT_SVC {
-                            sites.push(start + j);
+                            sites.push((start + j, imm));
                             break;
                         }
                         // stop at unconditional control flow: call target
@@ -229,8 +238,9 @@ fn sanitize_impl(
     }
 
     let mut patched = src;
-    for site in &sites {
-        patched[*site..*site + 4].copy_from_slice(&PATCH_MOV_X0_XZR);
+    for &(site, sysno) in &sites {
+        let p = patch_for(sysno);
+        patched[site..site + 4].copy_from_slice(&p);
     }
 
     let tmp = cache_dir.join(format!(".tmp-{}-{hash:016x}", std::process::id()));
@@ -341,7 +351,7 @@ mod tests {
         let ranges = exec_ranges(&bytes).unwrap();
         assert_eq!(ranges, vec![(256, 320)]);
         let sites = find_sites_for(&bytes, &ranges, &EMULATED_SYSNOS_GLIBC);
-        assert_eq!(sites, vec![268]);
+        assert_eq!(sites, vec![(268, 99)]);
     }
 
     #[test]
@@ -353,7 +363,7 @@ mod tests {
         b[256..260].copy_from_slice(&mov293.to_le_bytes());
         let ranges = exec_ranges(&b).unwrap();
         let sites = find_sites_for(&b, &ranges, &EMULATED_SYSNOS_GLIBC);
-        assert_eq!(sites, vec![268]);
+        assert_eq!(sites, vec![(268, 293)]);
     }
 
     #[test]
