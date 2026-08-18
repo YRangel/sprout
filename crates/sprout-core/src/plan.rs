@@ -274,7 +274,15 @@ impl LaunchPlan {
                 // pre-binding every PLT entry on load prevents a class of
                 // stationary hangs observed in dash's variable-hashing
                 // paths under the lazy loader (≣`cqc` in bug reports).
-                ("LD_BIND_NOW".into(), if std::env::var_os("SPROUT_NO_BINDNOW").is_some() { "0" } else { "1" }.into()),
+                (
+                    "LD_BIND_NOW".into(),
+                    if std::env::var_os("SPROUT_NO_BINDNOW").is_some() {
+                        "0"
+                    } else {
+                        "1"
+                    }
+                    .into(),
+                ),
             ];
             if !rootfs.bindings.is_empty() {
                 env.push(("SPROUT_BIND".into(), rootfs.binds_env()));
@@ -380,7 +388,15 @@ impl LaunchPlan {
              * chains re-stamp it per child exec. */
             ("SPROUT_EXE".into(), exe_guest_spelling(rootfs, &guest_prog)),
             // See musl branch note above: avoids conftest-hang class.
-            ("LD_BIND_NOW".into(), if std::env::var_os("SPROUT_NO_BINDNOW").is_some() { "0" } else { "1" }.into()),
+            (
+                "LD_BIND_NOW".into(),
+                if std::env::var_os("SPROUT_NO_BINDNOW").is_some() {
+                    "0"
+                } else {
+                    "1"
+                }
+                .into(),
+            ),
         ];
         if !rootfs.bindings.is_empty() {
             env.push(("SPROUT_BIND".into(), rootfs.binds_env()));
