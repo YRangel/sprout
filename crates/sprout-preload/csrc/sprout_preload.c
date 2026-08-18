@@ -2723,6 +2723,40 @@ int lstat64(const char *path, struct stat64 *st) {
     if (rc == 0) { sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid); if (sp_hreg_hit(path) && ((struct stat *)st)->st_nlink == 1) ((struct stat *)st)->st_nlink = 2; }
     return rc;
 }
+
+/* glibc's backwards-compat FROZEN stat ABI (__xstat family) is a LIVE
+ * export: programs may call __lxstat64@plt DIRECTLY (crashpad's
+ * IsDirectory does). Without an interposer the call lands in glibc's own
+ * raw-syscall implementation with the UNTRANSLATED guest path → ENOENT
+ * → crashpad init aborts → its SignalHandler singleton never installs →
+ * the later FirstChance-handler store targets NULL+0x2620 → SIGSEGV
+ * (helium 0.15.5.1 root cause; traced with build-id-matched symbols).
+ * The _ver argument only encodes the struct-stat layout; arm64 has one
+ * ABI, so forward straight to our translators. */
+int __lxstat64(int ver, const char *path, struct stat64 *st) {
+    (void)ver; return lstat64(path, st);
+}
+int __lxstat(int ver, const char *path, struct stat *st) {
+    (void)ver; return lstat(path, st);
+}
+int __xstat64(int ver, const char *path, struct stat64 *st) {
+    (void)ver; return stat64(path, st);
+}
+int __xstat(int ver, const char *path, struct stat *st) {
+    (void)ver; return stat(path, st);
+}
+int __fxstat64(int ver, int fd, struct stat64 *st) {
+    (void)ver; return fstat64(fd, st);
+}
+int __fxstat(int ver, int fd, struct stat *st) {
+    (void)ver; return fstat(fd, st);
+}
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *st, int flags) {
+    (void)ver; return fstatat64(dirfd, path, st, flags);
+}
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags) {
+    (void)ver; return fstatat(dirfd, path, st, flags);
+}
 #endif /* __GLIBC__ */
 
 
