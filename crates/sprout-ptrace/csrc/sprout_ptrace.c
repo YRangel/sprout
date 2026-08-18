@@ -1923,12 +1923,45 @@ static int sp_fake_proc_serve(unsigned long long id, const char *which,
     char buf[4096];
     int n = 0;
     if (is_stat) {
-        int ncpu = sp_fake_proc_cpu_count();
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "cpu 0 0 0 0 0 0 0 0 0 0\n");
-        for (int i = 0; i < ncpu && n < (int)sizeof(buf) - 96; i++)
-            n += snprintf(buf + n, sizeof(buf) - (size_t)n, "cpu%d 0 0 0 0 0 0 0 0 0 0\n", i);
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-            "intr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 0\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0\n");
+        /* Mirror the HOST /proc/stat when readable (supervisor can, guest
+         * apps can't on Android builds where /proc/stat is UID-restricted).
+         * Zero-faked rows have been observed to crash chromium metrics
+         * sampling (helium +2f79c24 under sprout, alive under proot which
+         * feeds real counters). Fall back to zero rows if the host read
+         * is denied. */
+        int hf = open("/proc/stat", O_RDONLY);
+        if (hf >= 0) {
+            ssize_t rn = read(hf, buf, sizeof(buf) - 1);
+            close(hf);
+            if (rn > 0) {
+                n = (int)rn;
+                if (buf[n - 1] != '\n') buf[n++] = '\n';
+            }
+        }
+        if (n == 0) {
+            /* No readable host counter source (Android SELinux). Emit
+             * plausible, non-zero, monotonically-ticking rows the way proot
+             * synthesizes: chromium metrics sampling assumes populated
+             * counters; all-zero rows crash it (helium +2f79c24). */
+            struct timespec ts; clock_gettime(CLOCK_BOOTTIME, &ts);
+            unsigned long long tick = (unsigned long long)ts.tv_sec * 100;
+            unsigned long long ncpu = (unsigned long long)sp_fake_proc_cpu_count();
+            unsigned long long idle = tick, usr = tick / 50 + 37,
+                               sys = tick / 34 + 51, irq = tick / 200,
+                               softirq = tick / 375, iowait = tick / 150;
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          "cpu %llu 0 %llu %llu %llu %llu %llu 0 0 0\n",
+                          usr, sys, idle, iowait, irq, softirq);
+            for (unsigned long long i = 0; i < ncpu && n < (int)sizeof(buf) - 96; i++)
+                n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                              "cpu%llu %llu 0 %llu %llu %llu %llu %llu 0 0 0\n",
+                              i, usr / ncpu, sys / ncpu, idle / ncpu,
+                              iowait / ncpu, irq / ncpu, softirq / ncpu);
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          "intr %llu\nctxt %llu\nbtime %lld\nprocesses %llu\nprocs_running 1\nprocs_blocked 0\nsoftirq %llu 0 0 0 0 0 0 0 0 0 0\n",
+                          tick * 4, tick * 12, (long long)(time(NULL) - (long long)ts.tv_sec),
+                          tick / 20 + 123, tick * 8);
+        }
     } else if (is_overflow) {
         /* bwrap/pressure-vessel reads these to validate uid range mapping;
          * Android SELinux hides them. 65534 = unmapped-nobody default. */
@@ -2838,6 +2871,8 @@ int main(int argc, char **argv) {
 {
                         unsigned long long want[3] = { rx.regs[30], rx.regs[29], rx.sp };
                         snprintf(mapfile, sizeof(mapfile), "/proc/%d/maps", w);
+                        unsigned long long m_lo[256], m_hi[256], m_off[256];
+                        char m_mod[256][512]; int m_n = 0;
                         FILE *mf = fopen(mapfile, "r");
                         if (mf) {
                             char line[1024];
@@ -2857,8 +2892,36 @@ int main(int argc, char **argv) {
                                                lbl[a], mod, want[a] - lo + off, (hi - lo) / 1024);
                                         want[a] = 0;
                                     }
+                                if (m_n < 256) {
+                                    m_lo[m_n] = lo; m_hi[m_n] = hi; m_off[m_n] = off;
+                                    strncpy(m_mod[m_n], mod, 511); m_mod[m_n][511] = 0;
+                                    m_n++;
+                                }
                             }
                             fclose(mf);
+                        }
+                        /* fp-chain backtrace: walk [fp,fp+8] = {prev_fp, lr} frames.
+                         * Tracee is ptrace-stopped -> PEEKDATA works in both lanes. */
+                        {
+                            unsigned long long fp0 = rx.regs[29];
+                            SP_OFT("backtrace start fp=%llx sp=%llx\n", fp0, (unsigned long long)rx.sp);
+                            for (int fr = 0; fr < 16 && fp0 && fp0 % 8 == 0; fr++) {
+                                errno = 0;
+                                long pfp = ptrace(PTRACE_PEEKDATA, w, (void *)fp0, NULL);
+                                if (errno) break;
+                                long plr = ptrace(PTRACE_PEEKDATA, w, (void *)(fp0 + 8), NULL);
+                                if (errno) break;
+                                unsigned long long ulr = (unsigned long long)plr;
+                                const char *mod = "?"; unsigned long long rel = 0;
+                                for (int e = 0; e < m_n; e++)
+                                    if (ulr >= m_lo[e] && ulr < m_hi[e]) {
+                                        mod = m_mod[e]; rel = ulr - m_lo[e] + m_off[e]; break;
+                                    }
+                                const char *bm = strrchr(mod, '/'); if (bm) mod = bm + 1;
+                                SP_OFT("  bt#%d lr=%llx %s +%llx\n", fr, ulr, mod, rel);
+                                if ((unsigned long long)pfp == fp0) break;
+                                fp0 = (unsigned long long)pfp;
+                            }
                         }
                     }
                 }
