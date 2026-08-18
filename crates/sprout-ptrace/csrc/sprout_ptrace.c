@@ -165,6 +165,14 @@ static const sp_emul_rule SP_EMULATE_BASE[] = {
     { 421, -38 }, { 422, -38 }, { 423, -38 },
     { 439, -38 },  /* faccessat2 raw callers -> -ENOSYS (libc falls back) */
     { 452, -38 },  /* fchmodat2 (GNU tar >= 1.35) -> -ENOSYS (fallback to fchmodat) */
+    { 264, -38 },  /* name_to_handle_at: AOSP app-seccomp blocks it (container-
+                      escape class) ALWAYS, on every kernel; fontconfig/GLib
+                      probes SIGSYS-die on kernels without the call's fallback
+                      availability (4.14 POCO: whole-Thunar main + firefox-esr
+                      main). -ENOSYS maps to the designated fallback (plain
+                      open/statfs path). */
+    { 265, -38 },  /* open_by_handle_at: same family, capability-gated even on
+                      full kernels -> -ENOSYS selects the non-handle path. */
     /* --- Modern-syscall family: app-domain seccomp delivers SIGSYS for
      * numbers the running kernel predates (observed on 4.14 phone #2:
      * dpkg-deb's posix_spawn child dies with SIGSYS via clone3=435). The
