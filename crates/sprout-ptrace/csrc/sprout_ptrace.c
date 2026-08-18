@@ -2830,22 +2830,36 @@ int main(int argc, char **argv) {
                            rx.regs[23], rx.regs[24], rx.regs[25],
                            rx.regs[30], rx.regs[29]);
                     char mapfile[64];
-                    snprintf(mapfile, sizeof(mapfile), "/proc/%d/maps", w);
-                    FILE *mf = fopen(mapfile, "r");
-                    if (mf) {
-                        char line[1024];
-                        unsigned long long pc = (unsigned long long)rx.pc;
-                        while (fgets(line, sizeof(line), mf)) {
-                            unsigned long long lo, hi;
-                            if (sscanf(line, "%llx-%llx", &lo, &hi) == 2 && pc >= lo && pc < hi) {
+                    snprintf(mapfile, sizeof(mapfile), "/proc/%d/task/%d/comm", w, w);
+                    { FILE *cf = fopen(mapfile, "r");
+                      if (cf) { char comm[64] = "?";
+                        if (fgets(comm, sizeof comm, cf)) { comm[strcspn(comm, "\n")] = 0; SP_OFT("crash comm: %s\n", comm); }
+                        fclose(cf); } }
+{
+                        unsigned long long want[3] = { rx.regs[30], rx.regs[29], rx.sp };
+                        snprintf(mapfile, sizeof(mapfile), "/proc/%d/maps", w);
+                        FILE *mf = fopen(mapfile, "r");
+                        if (mf) {
+                            char line[1024];
+                            unsigned long long pc = (unsigned long long)rx.pc;
+                            while (fgets(line, sizeof(line), mf)) {
+                                unsigned long long lo, hi;
+                                if (sscanf(line, "%llx-%llx", &lo, &hi) != 2) continue;
                                 unsigned long long off; char mod[512] = "?";
                                 if (sscanf(line, "%*x-%*x %*s %llx %*s %*s %511[^\n]",
                                            &off, mod) < 1) off = 0;
-                                SP_OFT("crash mod: %s +%llx\n", mod, pc - lo + off);
-                                break;
+                                if (pc >= lo && pc < hi)
+                                    SP_OFT("crash mod: %s +%llx\n", mod, pc - lo + off);
+                                for (int a = 0; a < 3; a++)
+                                    if (want[a] && want[a] >= lo && want[a] < hi) {
+                                        static const char *lbl[3] = { "lr", "fp", "sp" };
+                                        SP_OFT("  %s region: %s +%llx (sz=%lluKB)\n",
+                                               lbl[a], mod, want[a] - lo + off, (hi - lo) / 1024);
+                                        want[a] = 0;
+                                    }
                             }
+                            fclose(mf);
                         }
-                        fclose(mf);
                     }
                 }
             }
