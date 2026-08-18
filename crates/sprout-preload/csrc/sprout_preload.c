@@ -408,6 +408,17 @@ static void sp_xcache_put(const char *g, const char *h) {
  * RTLD_NEXT syscalls keep us free of interposer recursion. */
 static int (*sp_real_lstat)(const char *, struct stat *) = NULL;
 static ssize_t (*sp_real_readlink)(const char *, char *, size_t) = NULL;
+/* Per-thread scratch for xf's big path buffers: moved off the native stack
+ * so the interposer stops eating 20KB+ frames per translate call — small
+ * guest thread stacks (firefox background-IO pool threads at ~64KB) were
+ * guard-page-probed by the stack-clash setup of the old frame (notify-lane
+ * SIGSEGVs at sp+1024 below a fresh 0x5090-sub). Safe against reentrancy:
+ * xf never recurses (the .l2s walk iterates in-loop). */
+static __thread char t_xf_joined[SP_PATH_MAX];
+static __thread char t_xf_dir[SP_PATH_MAX];
+static __thread char t_xf_tmp[SP_PATH_MAX];
+static __thread char t_xf_lnk[SP_PATH_MAX];
+static __thread char t_xf_back[SP_PATH_MAX];
 /* -Wreturn-local-addr false-positive: every return path carries either
  * caller storage (path/buf) or `buf`; `joined` only flows into buf via
  * memcpy. GCC's points-to for the array params can't prove that. */
@@ -416,11 +427,12 @@ static ssize_t (*sp_real_readlink)(const char *, char *, size_t) = NULL;
 #pragma GCC diagnostic ignored "-Wreturn-local-addr"
 #endif
 static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int follow_final) {
+    if (!path) { errno = EFAULT; return NULL; }
     /* Relative paths: hang onto the real cwd in HOST view, then run the
      * normal absolute translation (apk's db-write mix of absolute charm +
      * relative journal journaling across mixed cwd changes lands at the
      * right rootfs location under any cwd). */
-    char joined[SP_PATH_MAX];
+    char *joined = t_xf_joined;
     if (path && path[0] != '/') {
         char cw[SP_PATH_MAX];
         ssize_t cn = readlink("/proc/self/cwd", cw, sizeof(cw) - 1);
@@ -456,7 +468,7 @@ static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int 
     static int l2s_off = -1;
     if (l2s_off < 0) l2s_off = getenv("SPROUT_DISABLE_L2S") ? 1 : 0;
     if (l2s_off) return out;
-    char dir[SP_PATH_MAX], tmp[SP_PATH_MAX], lnk[SP_PATH_MAX];
+    char *dir = t_xf_dir, *tmp = t_xf_tmp, *lnk = t_xf_lnk;
     int hop;
     for (hop = 0; hop < 8; hop++) {
         struct stat st;
@@ -469,16 +481,16 @@ static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int 
         if (n < 0) break;
         lnk[n] = '\0';
         if (lnk[0] == '/') {
-            char back[SP_PATH_MAX];
+            char *back = t_xf_back;
             if (!sp_translate(&g_cfg, lnk, back)) break;
             snprintf(buf, SP_PATH_MAX, "%s", back);
         } else {
-            snprintf(dir, sizeof(dir), "%s", buf);
+            snprintf(dir, SP_PATH_MAX, "%s", buf);
             char *sl = strrchr(dir, '/');
             if (!sl) break;
             *sl = '\0';
-            int w = snprintf(tmp, sizeof(tmp), "%s/%s", dir, lnk);
-            if (w <= 0 || (size_t)w >= sizeof(tmp)) break;
+            int w = snprintf(tmp, SP_PATH_MAX, "%s/%s", dir, lnk);
+            if (w <= 0 || (size_t)w >= SP_PATH_MAX) break;
             w = snprintf(buf, SP_PATH_MAX, "%s", tmp);
             if (w <= 0 || (size_t)w >= SP_PATH_MAX) break;
         }
@@ -544,7 +556,8 @@ int openat(int dirfd, const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags);
         mode = va_arg(ap, mode_t); va_end(ap);
     }
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(openat)(dirfd, path, flags, mode);
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
@@ -560,7 +573,8 @@ int openat64(int dirfd, const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags);
         mode = va_arg(ap, mode_t); va_end(ap);
     }
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(openat64)(dirfd, path, flags, mode);
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
@@ -1094,7 +1108,8 @@ int chmod(const char *path, mode_t mode) {
 int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
     static int (*SP_REAL(fchmodat))(int, const char *, mode_t, int) = NULL;
     SP_RESOLVE(fchmodat);
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(fchmodat)(dirfd, path, mode, flags);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
@@ -1227,7 +1242,8 @@ int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
     static int fake_root3 = -1;
     if (fake_root3 < 0) fake_root3 = getenv("SPROUT_FAKEROOT") != NULL;
     SP_RESOLVE(fchownat);
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(fchownat)(dirfd, path, uid, gid, flags);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
@@ -1411,7 +1427,8 @@ int utimes(const char *path, const struct timeval times[2]) {
 int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags) {
     static int (*SP_REAL(utimensat))(int, const char *, const struct timespec *, int) = NULL;
     SP_RESOLVE(utimensat);
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(utimensat)(dirfd, path, times, flags);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
@@ -1554,7 +1571,8 @@ int lremovexattr(const char *path, const char *name) {
 int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
     static int (*SP_REAL(fstatat))(int, const char *, struct stat *, int) = NULL;
     SP_RESOLVE(fstatat);
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(fstatat)(dirfd, path, st, flags);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
@@ -1566,7 +1584,8 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
 int newfstatat(int dirfd, const char *path, struct stat *st, int flags) {
     static int (*SP_REAL(newfstatat))(int, const char *, struct stat *, int) = NULL;
     SP_RESOLVE(newfstatat);
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(newfstatat)(dirfd, path, st, flags);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
@@ -1680,7 +1699,8 @@ int setfsgid(gid_t fsgid) {
 int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *buf) {
     static int (*SP_REAL(statx))(int, const char *, int, unsigned int, struct statx *) = NULL;
     SP_RESOLVE(statx);
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(statx)(dirfd, path, flags, mask, buf);
     char x[SP_PATH_MAX];
     const char *p = (flags & AT_SYMLINK_FOLLOW) ? sp_translate_x(path, x) : sp_translate_l(path, x);
@@ -1693,7 +1713,8 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
 int mkdirat(int dirfd, const char *path, mode_t mode) {
     static int (*SP_REAL(mkdirat))(int, const char *, mode_t) = NULL;
     SP_RESOLVE(mkdirat);
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(mkdirat)(dirfd, path, mode);
     char x[SP_PATH_MAX];
     const char *p = sp_translate_l(path, x);
@@ -1704,7 +1725,8 @@ int mkdirat(int dirfd, const char *path, mode_t mode) {
 int unlinkat(int dirfd, const char *path, int flags) {
     static int (*SP_REAL(unlinkat))(int, const char *, int) = NULL;
     SP_RESOLVE(unlinkat);
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(unlinkat)(dirfd, path, flags);
     char x[SP_PATH_MAX];
     const char *p = sp_translate_l(path, x);
@@ -1738,7 +1760,8 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
         int se = sp_self_exe_answer(path, buf, bufsiz);
         if (se > 0) return se;
     }
-    if (dirfd != -100 /*AT_FDCWD*/ && path && path[0] != '/')
+    if (!path) { errno = EFAULT; return -1; }
+    if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(readlinkat)(dirfd, path, buf, bufsiz);
     if (bufsiz == 0) return SP_REAL(readlinkat)(dirfd, path, buf, bufsiz);
     char x[SP_PATH_MAX];
@@ -3188,16 +3211,24 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
     if (depth > 4) return sp_chain_fail(path, depth, ELOOP, "depth");
     envp = (char *const *)sp_chain_env(envp);
     {
-        char gabs[SP_PATH_MAX];
+        /* Frame diet: five SP_PATH_MAX locals (~20KB) live in one malloc
+         * slab instead of the native frame. Small-stack guests (firefox
+         * BgIO/StreamTrans pool threads at ~64KB) were clashing on the old
+         * 53KB-per-level frame during exec-chains. Freed before the body
+         * continues; sp_stamp_exe copies gabs into its own static. */
+        char *sl = malloc(SP_PATH_MAX * 5);
+        if (!sl) { errno = ENOMEM; return -1; }
+        char *gabs = sl;
+        char *cw = gabs + SP_PATH_MAX, *gcw = cw + SP_PATH_MAX;
+        char *hx = gcw + SP_PATH_MAX, *gcan = hx + SP_PATH_MAX;
         if (path[0] == '/') {
-            snprintf(gabs, sizeof(gabs), "%s", path);
+            snprintf(gabs, SP_PATH_MAX, "%s", path);
         } else {
-            char cw[SP_PATH_MAX], gcw[SP_PATH_MAX];
-            ssize_t cn = readlink("/proc/self/cwd", cw, sizeof(cw) - 1);
-            if (cn <= 0 || (size_t)cn >= sizeof(cw)) snprintf(cw, sizeof(cw), "/");
+            ssize_t cn = readlink("/proc/self/cwd", cw, SP_PATH_MAX - 1);
+            if (cn <= 0 || (size_t)cn >= SP_PATH_MAX) snprintf(cw, SP_PATH_MAX, "/");
             else cw[cn] = '\0';
-            sp_reverse(&g_cfg, cw, gcw, sizeof(gcw));
-            snprintf(gabs, sizeof(gabs), "%s/%s", gcw, path);
+            sp_reverse(&g_cfg, cw, gcw, SP_PATH_MAX);
+            snprintf(gabs, SP_PATH_MAX, "%s/%s", gcw, path);
         }
         /* SP_SCRIPT recurses with the interpreter; the recursion deep-stamps
          * the interpreter's own gabs — matching kernel semantics where
@@ -3210,9 +3241,8 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
             /* Canonicalize BEFORE stamping: resolve the symlink chain and
              * squeeze '..' (via host-translate + reverse) so /proc/self/exe
              * answers the REAL image path, not its launch alias. */
-            char hx[SP_PATH_MAX], gcan[SP_PATH_MAX];
             const char *habs = sp_translate_x(gabs, hx);
-            if (habs && sp_reverse(&g_cfg, habs, gcan, sizeof(gcan)) > 0
+            if (habs && sp_reverse(&g_cfg, habs, gcan, SP_PATH_MAX) > 0
                 && gcan[0] == '/') {
                 sp_normalize_abs(gcan);
                 size_t gn = strlen(gcan);
@@ -3220,6 +3250,7 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
             }
             sp_stamp_exe((char **)envp, gabs);
         }
+        free(sl);
     }
     char x[SP_PATH_MAX];
     const char *host_raw = sp_translate_x(path, x);
