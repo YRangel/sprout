@@ -1500,7 +1500,12 @@ static void sp_notify_reply_open(unsigned long long id,
  *               the tracee's cwd is already a host path because the
  *               supervisor's chdir/execve always ran through translation.
  * Returns 1 when host[] holds a usable path. */
-static int sp_notify_hostpath(pid_t pid, const char *guest, char *host, size_t cap) {
+/* follow: chase the FINAL symlink at translate time. NOFOLLOW-semantic
+ * syscalls (readlinkat/unlinkat/mkdirat/mknodat/renameat/lstat-when-
+ * AT_SYMLINK_NOFOLLOW...) must translate the LINK itself: chasing made
+ * readlinkat() of .l2s stubs report EINVAL and 'rm <link>' delete the
+ * payload (v0.4.5 regression, found 2026-08-17). */
+static int sp_notify_hostpath_f(pid_t pid, const char *guest, char *host, size_t cap, int follow) {
     if (!guest || !host || cap == 0) return 0;
     if (guest[0] == '/') {
         /* /proc/self/root: Android SELinux denies untrusted apps opendir()
@@ -1512,7 +1517,7 @@ static int sp_notify_hostpath(pid_t pid, const char *guest, char *host, size_t c
         if (strncmp(guest, SROOT, sl) == 0 && (guest[sl] == '\0' || guest[sl] == '/')) {
             return snprintf(host, cap, "%s%s", g_cfg.rootfs, guest + sl) < (int)cap ? 1 : 0;
         }
-        return sp_translate(&g_cfg, guest, host) ? 1 : 0;
+        return sp_translate_f(&g_cfg, guest, host, follow) ? 1 : 0;
     }
     char cw[SP_PATH_MAX];
     {
@@ -1524,6 +1529,10 @@ static int sp_notify_hostpath(pid_t pid, const char *guest, char *host, size_t c
     }
     int n = snprintf(host, cap, "%s/%s", cw, guest);
     return (n > 0 && (size_t)n < cap) ? 1 : 0;
+}
+
+static int sp_notify_hostpath(pid_t pid, const char *guest, char *host, size_t cap) {
+    return sp_notify_hostpath_f(pid, guest, host, cap, 1);
 }
 
 /* ---- AF_UNIX notify-serve via pidfd_getfd (ADR-0013 M3) ----------------
@@ -2017,7 +2026,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         int sflags = (int)args[3];
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, guest, host, sizeof host, !(sflags & 0x100))) { sp_notify_continue(resp); return; }
         struct stat st;
         int rc = (sflags & 0x100 /*AT_SYMLINK_NOFOLLOW*/) ? lstat(host, &st) : stat(host, &st);
         if (rc < 0) { resp->error = -errno; return; }
@@ -2032,7 +2041,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         /* relative: native retry sees the same cwd; "" hits bionic SIGSYS
          * and the musl EMULATE table swallows it the same way either way */
         if (guest[0] != '/') { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, guest, host, sizeof host, !((int)args[3] & 0x100))) { sp_notify_continue(resp); return; }
         int rc = access(host, (int)args[2]);
         if (rc < 0) { resp->error = -errno; return; }
         resp->error = 0; resp->val = 0;
@@ -2041,7 +2050,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         int dirfd = (int)args[0];
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, guest, host, sizeof host, !((int)args[2] & 0x100))) { sp_notify_continue(resp); return; }
         struct statx sx;
         memset(&sx, 0, sizeof(sx));
         int rc = sp_statx(-100, host, (int)args[2], (unsigned)args[3], &sx);
@@ -2053,7 +2062,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         int dirfd = (int)args[0];
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, guest, host, sizeof host, 0)) { sp_notify_continue(resp); return; }
         char lnk[SP_PATH_MAX];
         ssize_t n = readlink(host, lnk, sizeof(lnk) - 1);
         if (n < 0) { resp->error = -errno; return; }
@@ -2067,7 +2076,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
         if (guest[0] != '/') { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, guest, host, sizeof host, 0)) { sp_notify_continue(resp); return; }
         if (g_debug) SP_TRACE("[notify] mkdirat guest='%s' host='%s'\n", guest, host);
         int rc = mkdir(host, (mode_t)args[2]);
         if (rc < 0) { resp->error = -errno; return; }
@@ -2087,7 +2096,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         int dirfd = (int)args[0];
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, guest, host, sizeof host, !((int)args[3] & 0x100))) { sp_notify_continue(resp); return; }
         /* args[3] observed WILD (7fe1… junk) in some guests — glibc
          * __chmod(fchmodat) reaches the trap with x3 un-zeroed: the kernel
          * tolerates any flags value ≠ AT_-mask, but OUR forwarded bionic
@@ -2110,7 +2119,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         int dirfd = (int)args[0];
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, guest, host, sizeof host, !((int)args[4] & 0x100))) { sp_notify_continue(resp); return; }
         int rc = fchownat(-100, host, (uid_t)args[2], (gid_t)args[3], (int)args[4]);
         if (rc < 0) { resp->error = -errno; return; }
         resp->error = 0; resp->val = 0; return; }
@@ -2123,7 +2132,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (args[1] == 0) { sp_notify_continue(resp); return; } /* NULL path: fd-based futimens */
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, guest, host, sizeof host, !((int)args[3] & 0x100))) { sp_notify_continue(resp); return; }
         struct timespec ts[2];
         const struct timespec *tsp = NULL;
         if (args[2] != 0) {
@@ -2140,7 +2149,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (dirfd != -100) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[1], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
         if (guest[0] != '/') { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, guest, host, sizeof host, 0)) { sp_notify_continue(resp); return; }
         int rc = mknod(host, (mode_t)args[2], (dev_t)args[3]);
         if (rc < 0) { resp->error = -errno; return; }
         resp->error = 0; resp->val = 0; return; }
@@ -2152,7 +2161,7 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (sp_notify_read_str(pid, args[2], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
         if (guest[0] != '/') { sp_notify_continue(resp); return; }
         char lhost[SP_PATH_MAX];
-        if (!sp_notify_hostpath(pid, guest, lhost, sizeof lhost)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, guest, lhost, sizeof lhost, 0)) { sp_notify_continue(resp); return; }
         int rc = symlink(target, lhost);
         if (rc < 0) { resp->error = -errno; return; }
         resp->error = 0; resp->val = 0; return; }
@@ -2180,10 +2189,10 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         char rp[SP_PATH_MAX], oh[SP_PATH_MAX], nh[SP_PATH_MAX];
         if (sp_notify_read_str(pid, args[1], rp, sizeof(rp)) <= 0) { sp_notify_continue(resp); return; }
         if (rp[0] != '/') { sp_notify_continue(resp); return; }   /* relative: native cwd is host-real */
-        if (!sp_notify_hostpath(pid, rp, oh, sizeof oh)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, rp, oh, sizeof oh, 0)) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[3], rp, sizeof(rp)) <= 0) { sp_notify_continue(resp); return; }
         if (rp[0] != '/') { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, rp, nh, sizeof nh)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, rp, nh, sizeof nh, 0)) { sp_notify_continue(resp); return; }
         int rc = rename(oh, nh);
         if (rc < 0) { resp->error = -errno; return; }
         resp->error = 0; resp->val = 0; return; }
@@ -2193,10 +2202,10 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         char rp[SP_PATH_MAX], oh[SP_PATH_MAX], nh[SP_PATH_MAX];
         if (sp_notify_read_str(pid, args[1], rp, sizeof(rp)) <= 0) { sp_notify_continue(resp); return; }
         if (rp[0] != '/') { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, rp, oh, sizeof oh)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, rp, oh, sizeof oh, 0)) { sp_notify_continue(resp); return; }
         if (sp_notify_read_str(pid, args[3], rp, sizeof(rp)) <= 0) { sp_notify_continue(resp); return; }
         if (rp[0] != '/') { sp_notify_continue(resp); return; }
-        if (!sp_notify_hostpath(pid, rp, nh, sizeof nh)) { sp_notify_continue(resp); return; }
+        if (!sp_notify_hostpath_f(pid, rp, nh, sizeof nh, 0)) { sp_notify_continue(resp); return; }
         int rc = (int)syscall(276, -100, oh, -100, nh, (unsigned)args[4]);
         if (rc < 0) { resp->error = -errno; return; }
         resp->error = 0; resp->val = 0; return; }
