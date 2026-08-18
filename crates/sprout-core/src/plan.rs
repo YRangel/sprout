@@ -209,7 +209,7 @@ fn ensure_dev_shm(rootfs: &Rootfs) {
 /// out of it ("Couldn't load XPCOM").
 fn exe_guest_spelling(rootfs: &Rootfs, guest_prog: &std::path::Path) -> String {
     match guest_prog.strip_prefix(&rootfs.root) {
-        Ok(rel) if rel.as_os_str().len() > 0 => format!("/{}", rel.display()),
+        Ok(rel) if !rel.as_os_str().is_empty() => format!("/{}", rel.display()),
         _ => guest_prog.display().to_string(),
     }
 }
