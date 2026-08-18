@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e408c899.js";
+            window.path_to_searchindex_js = "../searchindex-e71ed169.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-1f510b02.js"></script>
@@ -202,10 +202,19 @@ is one of these rules moving a variable through the boundary.</p>
 <tr><td><code>SPROUT_BINFMT_ALWAYS</code></td><td>unset</td><td><code>=1</code> wraps even native aarch64 ELFs into the emulator (proot <code>-q</code> parity for whole-rootfs x86 usage)</td></tr>
 <tr><td><code>SPROUT_SYSVIPC_OFF</code></td><td>unset</td><td><code>=1</code> disables BOTH userspace SysV emulations: the ADR-0018 sysvipc shim DSO (<code>/usr/lib/sprout-sysvipc/{i386,x86_64}/libsprout-sysvipc.so</code>) injected into <code>BOX64_LD_PRELOAD</code> of wrapped x86 guests (steam’s startup semaphores), AND the ADR-0020 <code>shmget/shmat/shmctl/shmdt</code> emulation in <code>libsprout-core.so</code> for native guests (needed by mesa’s XShm present path; disabled shm family then ENOSYS as before)</td></tr>
 <tr><td><code>SPROUT_SYSVIPC_DIR</code></td><td><code>/tmp/sprout-sysvipc</code></td><td>guest-path directory backing the emulated SysV objects (must be reachable by EVERY wrapped process — keep it the Termux-shared <code>/tmp</code> bind for cross-session reach)</td></tr>
+<tr><td><code>SPROUT_SYSVIPC_EMU_OFF</code></td><td>unset</td><td><code>=1</code> disables JUST the host-emulator arm64 SysV-IPC shim lane (session-level <code>shmget/shmat/shmctl/shmdt</code>), leaving the in-guest ADR-0020 emulation active</td></tr>
+<tr><td><code>SPROUT_EMU_SYSVIPC_PATH</code></td><td>unset</td><td>explicit host path of the arm64 sysvipc-shim .so (defaults to the shipped artifact under the loader path)</td></tr>
 <tr><td><code>SPROUT_KERNEL_RELEASE</code></td><td>unset</td><td><code>uname(2)</code> override applied by the preloaded uname wrapper; set via <code>-k/--kernel-release</code> (proot parity)</td></tr>
+<tr><td><code>SPROUT_USER_NOTIFY</code></td><td>(auto)</td><td><code>=0</code> forces the classic ptrace-only supervise lane even on kernels with seccomp user-notify — the debugging switch that reproduces every notify-less-kernel report locally (v0.4.x learnings)</td></tr>
+<tr><td><code>SPROUT_ALLOW_LOOSE</code></td><td>unset</td><td><code>=1</code> lets <code>install.sh</code> install loose <code>$SRC/&lt;file&gt;</code> artifacts inside a git checkout (v0.4.5+ default OFF — loose slots are tarball-only); dev-rehearsal escape hatch</td></tr>
 <tr><td><code>SPROUT_PORTMAP</code></td><td>unset</td><td><code>=1</code> (set by <code>-p/--port-mapping</code>) makes<code>bind(2)</code> on ports &lt;1024 use <code>1024+port</code> instead (proot parity for guests binding privileged ports without CAP_NET_BIND_SERVICE)</td></tr>
 <tr><td><code>SPROUT_ASHMEM_MEMFD</code></td><td>unset</td><td><code>=1</code> (set by <code>--ashmem-memfd</code>) makes the preloaded <code>memfd_create()</code> fall back to <code>/dev/ashmem</code> when the kernel says ENOSYS/ENODEV/EINVAL; tracked fd ring feeds the fstat st_size simulation (proot parity)</td></tr>
 <tr><td><code>SPROUT_KILL_TAG</code></td><td>unset</td><td><code>=&lt;sprout-pid&gt;</code> (set by <code>--kill-on-exit</code>) marks every descendant env; the post-run proc-sweep SIGKILLs any process whose environ carries it</td></tr>
+<tr><td><code>SPROUT_NO_SHADOW</code></td><td>unset</td><td>disables the supervisor’s notify-shadow fastlane (classic ptrace supervision for everything — the ultimate proot-parity fallback)</td></tr>
+<tr><td><code>SPROUT_FAKE_UID</code> / <code>SPROUT_FAKE_GID</code></td><td>unset</td><td>numeric ids used by the preload fakeroot synthetics when <code>--fake-id N</code> is in use (<code>-0</code> ⇒ 0/0)</td></tr>
+<tr><td><code>SPROUT_CACHE_DIR</code></td><td><code>$HOME/.cache/sprout</code></td><td>sanitized ld.so/libc cache.root (tmp fallback)</td></tr>
+<tr><td><code>SPROUT_KEEP_UMASK</code></td><td>unset</td><td><code>=1</code> stops sprout from re-asserting its default umask for the guest</td></tr>
+<tr><td><code>SPROUT_PRELOAD_PATH</code></td><td>unset</td><td>explicit path to <code>libsprout-core.so</code> (dev); the default picks the sibling artifact</td></tr>
 <tr><td><code>BOX64_LD_LIBRARY_PATH</code></td><td>(unset ⇒ box defaults injected when routing x86_64)</td><td>overrides the box64 runtime library search path</td></tr>
 <tr><td><code>BOX32_LD_LIBRARY_PATH</code></td><td>(unset ⇒ box defaults injected when routing i386)</td><td>overrides the box32 runtime library search path</td></tr>
 <tr><td><code>TMPDIR</code></td><td><code>/tmp</code></td><td>host TMPDIR escapes the guest view</td></tr>

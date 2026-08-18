@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e408c899.js";
+            window.path_to_searchindex_js = "searchindex-e71ed169.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-1f510b02.js"></script>
@@ -277,6 +277,25 @@ That is why a “guest” cargo build prints the same <code>skipping libsprout-c
 Prefer guest-native cargo (<code>apt install cargo rustc</code>), or simply let
 <code>./install.sh</code> fetch the prebuilt interposers.</p>
 </blockquote>
+<h3 id="installsh-artifact-selection-rules-v045"><a class="header" href="#installsh-artifact-selection-rules-v045">install.sh artifact-selection rules (v0.4.5+)</a></h3>
+<p><code>install.sh</code> picks each artifact from the first available slot and refuses
+stale candidates:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>slot tried (in order)</th><th>rule</th></tr>
+</thead>
+<tbody>
+<tr><td><code>target/{release,debug}/&lt;file&gt;</code> (binaries)</td><td>always trusted — cargo wrote it</td></tr>
+<tr><td><code>target/*/build/*/out/&lt;file&gt;</code> (crates’ build.rs exports)</td><td>newest slot wins, but <strong>rejected when its mtime is older than the newest file in <code>crates/&lt;crate&gt;/csrc/</code></strong> — stale out/ slots used to silently ship pre-fix bytes (deploy-discipline law)</td></tr>
+<tr><td><code>$SRC/&lt;file&gt;</code>, <code>$SRC/target/&lt;file&gt;</code> (loose)</td><td><strong>ignored inside a git checkout</strong> (tarball use only); override with <code>SPROUT_ALLOW_LOOSE=1</code> for dev rehearsals</td></tr>
+</tbody>
+</table>
+</div>
+<p>When no acceptable slot exists, the glibc/musl interposer pair is <strong>fetched
+from the latest GitHub release, sha256-verified against the release’s own
+SHA256SUMS</strong>; <code>--verify</code> then re-checks every installed file’s md5 and prints
+a self-test command.</p>
 <p>The release workflow builds the exact same interposer artifacts on
 <code>ubuntu-24.04-arm</code> and ships them as release downloads; local musl / bionic
 hosts must always use the in-guest route (see <code>development.md</code>).</p>
@@ -354,6 +373,15 @@ touching inodes, and hardlink clones of artifacts become symlinks</li>
 the Post-Invoke shell — users don’t need any special flags:
 <code>sprout -r &lt;debian&gt; apt-get update</code> works out of the box, no proot-distro
 plugin needed.</p>
+<h3 id="reading-proot-distros-l2s-stubs"><a class="header" href="#reading-proot-distros-l2s-stubs">Reading proot-distro’s <code>.l2s</code> stubs</a></h3>
+<p>proot-distro rootfses often contain <code>--link2symlink</code> relics from older
+boots: symlink targets spelled into <code>$ROOT/.l2s/.l2s.&lt;name&gt;.&lt;nonce&gt;</code>
+(dpkg’s <code>status-old</code>/<code>diversions-old</code>, alpine’s <code>/usr/bin/{ar,as,ld,...}</code>
+binutils, <code>/etc/alternatives</code> chains). Both stub species load correctly
+since v0.4.5: <code>sp_translate</code> (preload + supervisor) walks the link chain
+at translate time and <code>guest_real()</code> strips the rootfs prefix from
+host-absolute targets. Plain <code>readlink(2)</code> guests still see the stub
+spelling, matching proot’s own view.</p>
 <h2 id="differences-worth-knowing"><a class="header" href="#differences-worth-knowing">Differences worth knowing</a></h2>
 <ol>
 <li><strong>Errors are noisier on purpose.</strong> If a guest binary is static and
@@ -480,10 +508,19 @@ is one of these rules moving a variable through the boundary.</p>
 <tr><td><code>SPROUT_BINFMT_ALWAYS</code></td><td>unset</td><td><code>=1</code> wraps even native aarch64 ELFs into the emulator (proot <code>-q</code> parity for whole-rootfs x86 usage)</td></tr>
 <tr><td><code>SPROUT_SYSVIPC_OFF</code></td><td>unset</td><td><code>=1</code> disables BOTH userspace SysV emulations: the ADR-0018 sysvipc shim DSO (<code>/usr/lib/sprout-sysvipc/{i386,x86_64}/libsprout-sysvipc.so</code>) injected into <code>BOX64_LD_PRELOAD</code> of wrapped x86 guests (steam’s startup semaphores), AND the ADR-0020 <code>shmget/shmat/shmctl/shmdt</code> emulation in <code>libsprout-core.so</code> for native guests (needed by mesa’s XShm present path; disabled shm family then ENOSYS as before)</td></tr>
 <tr><td><code>SPROUT_SYSVIPC_DIR</code></td><td><code>/tmp/sprout-sysvipc</code></td><td>guest-path directory backing the emulated SysV objects (must be reachable by EVERY wrapped process — keep it the Termux-shared <code>/tmp</code> bind for cross-session reach)</td></tr>
+<tr><td><code>SPROUT_SYSVIPC_EMU_OFF</code></td><td>unset</td><td><code>=1</code> disables JUST the host-emulator arm64 SysV-IPC shim lane (session-level <code>shmget/shmat/shmctl/shmdt</code>), leaving the in-guest ADR-0020 emulation active</td></tr>
+<tr><td><code>SPROUT_EMU_SYSVIPC_PATH</code></td><td>unset</td><td>explicit host path of the arm64 sysvipc-shim .so (defaults to the shipped artifact under the loader path)</td></tr>
 <tr><td><code>SPROUT_KERNEL_RELEASE</code></td><td>unset</td><td><code>uname(2)</code> override applied by the preloaded uname wrapper; set via <code>-k/--kernel-release</code> (proot parity)</td></tr>
+<tr><td><code>SPROUT_USER_NOTIFY</code></td><td>(auto)</td><td><code>=0</code> forces the classic ptrace-only supervise lane even on kernels with seccomp user-notify — the debugging switch that reproduces every notify-less-kernel report locally (v0.4.x learnings)</td></tr>
+<tr><td><code>SPROUT_ALLOW_LOOSE</code></td><td>unset</td><td><code>=1</code> lets <code>install.sh</code> install loose <code>$SRC/&lt;file&gt;</code> artifacts inside a git checkout (v0.4.5+ default OFF — loose slots are tarball-only); dev-rehearsal escape hatch</td></tr>
 <tr><td><code>SPROUT_PORTMAP</code></td><td>unset</td><td><code>=1</code> (set by <code>-p/--port-mapping</code>) makes<code>bind(2)</code> on ports &lt;1024 use <code>1024+port</code> instead (proot parity for guests binding privileged ports without CAP_NET_BIND_SERVICE)</td></tr>
 <tr><td><code>SPROUT_ASHMEM_MEMFD</code></td><td>unset</td><td><code>=1</code> (set by <code>--ashmem-memfd</code>) makes the preloaded <code>memfd_create()</code> fall back to <code>/dev/ashmem</code> when the kernel says ENOSYS/ENODEV/EINVAL; tracked fd ring feeds the fstat st_size simulation (proot parity)</td></tr>
 <tr><td><code>SPROUT_KILL_TAG</code></td><td>unset</td><td><code>=&lt;sprout-pid&gt;</code> (set by <code>--kill-on-exit</code>) marks every descendant env; the post-run proc-sweep SIGKILLs any process whose environ carries it</td></tr>
+<tr><td><code>SPROUT_NO_SHADOW</code></td><td>unset</td><td>disables the supervisor’s notify-shadow fastlane (classic ptrace supervision for everything — the ultimate proot-parity fallback)</td></tr>
+<tr><td><code>SPROUT_FAKE_UID</code> / <code>SPROUT_FAKE_GID</code></td><td>unset</td><td>numeric ids used by the preload fakeroot synthetics when <code>--fake-id N</code> is in use (<code>-0</code> ⇒ 0/0)</td></tr>
+<tr><td><code>SPROUT_CACHE_DIR</code></td><td><code>$HOME/.cache/sprout</code></td><td>sanitized ld.so/libc cache.root (tmp fallback)</td></tr>
+<tr><td><code>SPROUT_KEEP_UMASK</code></td><td>unset</td><td><code>=1</code> stops sprout from re-asserting its default umask for the guest</td></tr>
+<tr><td><code>SPROUT_PRELOAD_PATH</code></td><td>unset</td><td>explicit path to <code>libsprout-core.so</code> (dev); the default picks the sibling artifact</td></tr>
 <tr><td><code>BOX64_LD_LIBRARY_PATH</code></td><td>(unset ⇒ box defaults injected when routing x86_64)</td><td>overrides the box64 runtime library search path</td></tr>
 <tr><td><code>BOX32_LD_LIBRARY_PATH</code></td><td>(unset ⇒ box defaults injected when routing i386)</td><td>overrides the box32 runtime library search path</td></tr>
 <tr><td><code>TMPDIR</code></td><td><code>/tmp</code></td><td>host TMPDIR escapes the guest view</td></tr>

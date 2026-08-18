@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e408c899.js";
+            window.path_to_searchindex_js = "../searchindex-e71ed169.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-1f510b02.js"></script>
@@ -239,6 +239,15 @@ touching inodes, and hardlink clones of artifacts become symlinks</li>
 the Post-Invoke shell — users don’t need any special flags:
 <code>sprout -r &lt;debian&gt; apt-get update</code> works out of the box, no proot-distro
 plugin needed.</p>
+<h3 id="reading-proot-distros-l2s-stubs"><a class="header" href="#reading-proot-distros-l2s-stubs">Reading proot-distro’s <code>.l2s</code> stubs</a></h3>
+<p>proot-distro rootfses often contain <code>--link2symlink</code> relics from older
+boots: symlink targets spelled into <code>$ROOT/.l2s/.l2s.&lt;name&gt;.&lt;nonce&gt;</code>
+(dpkg’s <code>status-old</code>/<code>diversions-old</code>, alpine’s <code>/usr/bin/{ar,as,ld,...}</code>
+binutils, <code>/etc/alternatives</code> chains). Both stub species load correctly
+since v0.4.5: <code>sp_translate</code> (preload + supervisor) walks the link chain
+at translate time and <code>guest_real()</code> strips the rootfs prefix from
+host-absolute targets. Plain <code>readlink(2)</code> guests still see the stub
+spelling, matching proot’s own view.</p>
 <h2 id="differences-worth-knowing"><a class="header" href="#differences-worth-knowing">Differences worth knowing</a></h2>
 <ol>
 <li><strong>Errors are noisier on purpose.</strong> If a guest binary is static and

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e408c899.js";
+            window.path_to_searchindex_js = "../searchindex-e71ed169.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-1f510b02.js"></script>
@@ -247,6 +247,25 @@ That is why a “guest” cargo build prints the same <code>skipping libsprout-c
 Prefer guest-native cargo (<code>apt install cargo rustc</code>), or simply let
 <code>./install.sh</code> fetch the prebuilt interposers.</p>
 </blockquote>
+<h3 id="installsh-artifact-selection-rules-v045"><a class="header" href="#installsh-artifact-selection-rules-v045">install.sh artifact-selection rules (v0.4.5+)</a></h3>
+<p><code>install.sh</code> picks each artifact from the first available slot and refuses
+stale candidates:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>slot tried (in order)</th><th>rule</th></tr>
+</thead>
+<tbody>
+<tr><td><code>target/{release,debug}/&lt;file&gt;</code> (binaries)</td><td>always trusted — cargo wrote it</td></tr>
+<tr><td><code>target/*/build/*/out/&lt;file&gt;</code> (crates’ build.rs exports)</td><td>newest slot wins, but <strong>rejected when its mtime is older than the newest file in <code>crates/&lt;crate&gt;/csrc/</code></strong> — stale out/ slots used to silently ship pre-fix bytes (deploy-discipline law)</td></tr>
+<tr><td><code>$SRC/&lt;file&gt;</code>, <code>$SRC/target/&lt;file&gt;</code> (loose)</td><td><strong>ignored inside a git checkout</strong> (tarball use only); override with <code>SPROUT_ALLOW_LOOSE=1</code> for dev rehearsals</td></tr>
+</tbody>
+</table>
+</div>
+<p>When no acceptable slot exists, the glibc/musl interposer pair is <strong>fetched
+from the latest GitHub release, sha256-verified against the release’s own
+SHA256SUMS</strong>; <code>--verify</code> then re-checks every installed file’s md5 and prints
+a self-test command.</p>
 <p>The release workflow builds the exact same interposer artifacts on
 <code>ubuntu-24.04-arm</code> and ships them as release downloads; local musl / bionic
 hosts must always use the in-guest route (see <code>development.md</code>).</p>
