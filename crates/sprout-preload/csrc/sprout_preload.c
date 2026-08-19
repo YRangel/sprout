@@ -1549,6 +1549,11 @@ int fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags) {
     if (fake_root3 < 0) fake_root3 = getenv("SPROUT_FAKEROOT") != NULL;
     SP_RESOLVE(fchownat);
     if (!path) { errno = EFAULT; return -1; }
+    /* proot -0 parity: under fake-root ANY chown succeeds (incl. fts dirfd
+     * walks like coreutils `chown -R` on the 4.14-class phone, where the
+     * classic-ptrace supervisor cannot pivot these syscalls for shadowed
+     * tracees). */
+    if (fake_root3) return 0;
     if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(fchownat)(dirfd, path, uid, gid, flags);
     char x[SP_PATH_MAX];
