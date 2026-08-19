@@ -602,6 +602,58 @@ static void sp_tracee_free(pid_t pid) {
         if (g_tracees[i].pid == pid) { g_tracees[i].pid = 0; return; }
 }
 
+/* ORPHAN REAPER: when the CLI's direct child (MAIN-CHILD) exits, supervisor
+ * previously returned and left every OTHER tracee (firefox content procs,
+ * dbus helpers, thunar, crashhelper, ...) alive-but-traced. On the classic
+ * lane those orphans then hold profile locks (.parentlock) and block the
+ * user's next launch (POCO X3 GT firefox reopen bug). proot parity: kill
+ * the whole traced tree when the main process dies. Implementation notes:
+ *   - ptrace(PTRACE_KILL) is the clean primitive for OUR tracees; for
+ *     notify-lane tracees (not ptrace-attached) plain kill(2)+CONT works,
+ *     so fire both best-effort.
+ *   - reap with a bounded wait loop: supervision semantics require the
+ *     supervisor to exit after all its tracees left it. */
+static void sp_reap_all_children(void) {
+    int live = 0;
+    for (int i = 0; i < SP_MAX_TRACEES; i++) {
+        pid_t p = g_tracees[i].pid;
+        if (!p) continue;
+        live++;
+        kill(p, SIGKILL);
+        ptrace(PTRACE_KILL, p, NULL, NULL); /* no-op on non-tracees; fine */
+        ptrace(PTRACE_CONT, p, NULL, NULL); /* wakes ptrace-stopped tracees */
+    }
+    if (g_debug && live) SP_TRACE("[ptrace] orphan reaper: %d live tracees killed\n", live);
+    /* bounded drain: don't ever hang the exit path. Re-parented orphans
+     * can't be waitpid()'d by us (not our children anymore), so measure
+     * liveness via kill(pid, 0): ESRCH = gone. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        int st;
+        pid_t w = waitpid(-1, &st, WNOHANG);
+        if (w > 0) {
+            sp_tracee_free(w);
+            continue;
+        }
+        int any = 0;
+        for (int i = 0; i < SP_MAX_TRACEES; i++) {
+            pid_t p = g_tracees[i].pid;
+            if (!p) continue;
+            errno = 0;
+            int sk = kill(p, 0);
+            if (sk == 0 || errno != ESRCH) { any = 1; break; }
+        }
+        if (!any) break;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if ((long long)(t1.tv_sec - t0.tv_sec) * 1000 +
+            (long long)(t1.tv_nsec - t0.tv_nsec) / 1000000 > 1500 /*1.5s upper bound*/) {
+            break;
+        }
+        usleep(20000);
+    }
+}
+
 /* helpers */
 
 static int set_ret_0(pid_t pid) {
@@ -3139,6 +3191,7 @@ int main(int argc, char **argv) {
         if (WIFEXITED(status)) {
             if (w == child) {
                 if (g_debug) fprintf(stderr, "[ptrace] MAIN-CHILD %d EXITED rc=%d (status=0x%x)\n", w, WEXITSTATUS(status), status);
+                sp_reap_all_children();
                 if (g_notify_n || g_notify_poller)
                     SP_OFT("notify stats: recv=%llu served=%llu cont=%llu recverr=%llu poller=%llu\n",
                            g_notify_n, g_notify_serv, g_notify_cont, g_notify_err, g_notify_poller);
@@ -3149,6 +3202,7 @@ int main(int argc, char **argv) {
         }
         if (WIFSIGNALED(status) && w == child) {
             if (g_debug) fprintf(stderr, "[ptrace] MAIN-CHILD %d SIGNALED sig=%d (status=0x%x)\n", w, WTERMSIG(status), status);
+            sp_reap_all_children();
             return 128 + WTERMSIG(status);
         }
         if (WIFSIGNALED(status)) {
