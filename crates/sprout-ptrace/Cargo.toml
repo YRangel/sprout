@@ -1,6 +1,6 @@
 [package]
 name = "sprout-ptrace"
-version = "0.4.10"
+version = "0.5.0"
 description = "ptrace supervisor for sprout: spawns the guest under seccomp emulation, rewrites blocked or guest-relative syscalls"
 edition.workspace = true
 license.workspace = true
