@@ -1332,6 +1332,32 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
         return;
     }
 
+    /* FAKEROOT chown-family → no-op success, ENTRY-side (proot -0 parity).
+     * The EXIT-stop rewrite above works only with PTRACE_GET_SYSCALL_INFO
+     * (kernel >= 5.3); PTRACE_SET_SYSCALL returns EIO at seccomp-stops of
+     * this kernel (4.14 POCO X3 GT probe: 440/440 fail). Rewrite x8
+     * directly: fchownat(54)/fchown(55) become sched_yield(124) whose
+     * return value 0 libc reads as chown success. Without this, dpkg
+     * postinsts like helium-bin's `chown -Rh root /opt/helium` EPERM and
+     * mark the package broken. */
+    if (sysno == 54 || sysno == 55) {
+        if (getenv("SPROUT_FAKEROOT")) {
+            struct user_pt_regs rfp;
+            struct iovec iovfp = { &rfp, sizeof(rfp) };
+            errno = 0;
+            long prc = ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iovfp);
+            if (prc == 0) {
+                rfp.regs[8] = 124 /*sched_yield*/;
+                prc = ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovfp);
+            }
+            if (prc != 0 && g_debug)
+                fprintf(stderr, "[ptrace] %d chown x8-pivot errno=%d\n", pid, errno);
+            if (prc == 0 && g_debug)
+                SP_TRACE("[ptrace] %d chown(%ld) x8→sched_yield under -0\n", pid, sysno);
+            return;
+        }
+    }
+
     /* Lazy classification: the initial exec stop (post-TRACEME) is consumed
      * by the bare waitpid that precedes PTRACE_SETOPTIONS, so the main
      * program never produces a PTRACE_EVENT_EXEC we can see. The first
@@ -3405,6 +3431,20 @@ int main(int argc, char **argv) {
                         r.regs[0] = 0;
                         ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
                     }
+                }
+                /* FAKEROOT chown-family fake success on the CLASSIC lane
+                 * (preload + notify already mirror this): coreutils chown -R
+                 * walks fts over DIRFDs so the preload bails (dirfd!=AT_FDCWD),
+                 * the syscall enters the kernel and returns EPERM under the
+                 * Android seccomp uid realm. Postinst scripts like helium's
+                 * (`chown -R root:root /opt/helium`) then fail the whole dpkg.
+                 * proot answers success; we mirror proot here: rewrite the
+                 * return register at the syscall EXIT stop. */
+                if (getenv("SPROUT_FAKEROOT") && (v.nr == 54 /*fchownat*/ || v.nr == 55 /*fchown*/) &&
+                    ((long)r.regs[0] == -1 /*-EPERM*/ || (long)r.regs[0] == -13 /*-EACCES*/)) {
+                    r.regs[0] = 0;
+                    ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
+                    if (g_debug) SP_TRACE("[ptrace] %d chown(%lld) fake-success under -0\n", w, (long long)v.nr);
                 }
                 if (t->rev_sysno) reverse_pending_addr(w, t);
                 goto cont;
