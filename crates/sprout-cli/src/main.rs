@@ -759,7 +759,7 @@ fn cache_dir() -> PathBuf {
     candidates
         .into_iter()
         .next()
-        .unwrap_or_else(|| std::env::temp_dir())
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Probe: the dir must accept a transient file (some mounts are

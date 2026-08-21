@@ -318,7 +318,54 @@ extern int   g_fake_ngroups;
  * ctor into a memfd; open-family wrappers dup() it. -2 = not built. */
 static int g_auxv_fd = -2;
 
+/* env -i wipe survival (2026-08-21, resolute xfce4-panel crash -> glycin
+ * spawn chain): coreutils `env -i` replaces the entire `environ` global
+ * with the (empty) opinion the user asked for BEFORE calling execve.
+ * Our execve interposer then sees BOTH an empty caller envp AND an
+ * emptied environ: the argv-build finds no SPROUT_LOADER and dies with
+ * EIO, and sp_chain_env cannot merge any SPROUT_- or LD_-prefixed row
+ * either, so every key (LOADER, PRELOAD, ROOTFS, BIND_*, LIBRARY_PATH,
+ * FAKE_UID) vanishes for the child chain. gdk-pixbuf/glycin spawn their sandboxed
+ * loaders exactly this way (`env -i glycin-image-rs --dbus-fd N`), which
+ * aborted the xfce4 panel via Gtk:ERROR ensure_surface_for_gicon.
+ * Snapshot every SPROUT_/LD_ row at ctor (the launcher's values, set
+ * before the first exec, immutable for all descendants); every getenv
+ * site that feeds the chain falls back to the snapshot. */
+#define SP_SNAP_MAX_ROWS 160
+#define SP_SNAP_ROW_CAP  (SP_PATH_MAX + 2)
+static char s_snap_blob[SP_SNAP_MAX_ROWS][SP_SNAP_ROW_CAP];
+static char *s_snap_rows[SP_SNAP_MAX_ROWS];
+static int s_snap_nrows = 0;
+
+static void sp_snapshot_chain_env(void) {
+    extern char **environ;
+    for (int i = 0; environ && environ[i] && s_snap_nrows < SP_SNAP_MAX_ROWS; i++) {
+        const char *row = environ[i];
+        if (strncmp(row, "SPROUT_", 7) && strncmp(row, "LD_", 3)) continue;
+        size_t rl = strlen(row);
+        if (rl >= SP_SNAP_ROW_CAP) continue; /* pathological row: skip, never truncate a path */
+        memcpy(s_snap_blob[s_snap_nrows], row, rl + 1);
+        s_snap_rows[s_snap_nrows] = s_snap_blob[s_snap_nrows];
+        s_snap_nrows++;
+    }
+}
+
+/* snapshot lookup: returns the VALUE of `key` captured at ctor, NULL if absent */
+static const char *sp_snap_get(const char *key) {
+    size_t kl = strlen(key);
+    for (int i = 0; i < s_snap_nrows; i++)
+        if (!strncmp(s_snap_rows[i], key, kl) && s_snap_rows[i][kl] == '=')
+            return s_snap_rows[i] + kl + 1;
+    return NULL;
+}
+
+static const char *sp_loader_path(void)   { const char *e = getenv("SPROUT_LOADER");        return (e && *e) ? e : sp_snap_get("SPROUT_LOADER"); }
+static const char *sp_preload_path(void)  { const char *e = getenv("SPROUT_PRELOAD_PATH");   return (e && *e) ? e : sp_snap_get("SPROUT_PRELOAD_PATH"); }
+static const char *sp_library_path_v(void){ const char *e = getenv("SPROUT_LIBRARY_PATH");   return (e && *e) ? e : sp_snap_get("SPROUT_LIBRARY_PATH"); }
+static const char *sp_libc_kind(void)     { const char *e = getenv("SPROUT_LIBC");           return (e && *e) ? e : sp_snap_get("SPROUT_LIBC"); }
+
 __attribute__((constructor)) static void sprout_init(void) {
+    sp_snapshot_chain_env();
     sp_config_load(&g_cfg);
     /* --user anchor (proot -i / proot-distro --user parity): the resolved
      * guest identity is forwarded by the launcher as SPROUT_FAKE_UID/GID;
@@ -3209,9 +3256,9 @@ static int sp_build_loader_argv(char **v, size_t vmax,
                                 int extra, int *outc, const char *lp_override) {
     int argc = 0;
     while (argv[argc]) argc++;
-    const char *loader = getenv("SPROUT_LOADER");
-    const char *lp = lp_override ? lp_override : getenv("SPROUT_LIBRARY_PATH");
-    const char *libc_kind = getenv("SPROUT_LIBC"); /* "musl" or "glibc" (default) */
+    const char *loader = sp_loader_path();
+    const char *lp = lp_override ? lp_override : sp_library_path_v();
+    const char *libc_kind = sp_libc_kind();
     if (!loader) {
         fprintf(stderr, "[sprout] argv-build fail: SPROUT_LOADER unset (argc=%d)\n", argc);
         return -2; /* -2: missing loader — different from cap overflow */
@@ -3338,6 +3385,22 @@ static char **sp_chain_env(char *const envp[]) {
             } else e2[n++] = environ[i];
         }
     }
+    /* env -i wipe recovery: if the caller shipped an empty envp AND the
+     * ambient environ was emptied too, none of the SPROUT_/LD_ rows exist
+     * anywhere in e2 — append every ctor-snapshotted row whose key is
+     * still missing. Rows the wisdom chain already carries keep winning
+     * (deep-exec chains regenerate values like SPROUT_FAKE_UID at each
+     * hop; those must not be overwritten by grandparent snapshots). */
+    for (int si = 0; si < s_snap_nrows && n < 505; si++) {
+        const char *row = s_snap_rows[si];
+        const char *eq = strchr(row, '=');
+        if (!eq) continue;
+        size_t kl = (size_t)(eq - row);
+        int have = 0;
+        for (int j = 0; j < n; j++)
+            if (!strncmp(e2[j], row, kl) && e2[j][kl] == '=') { have = 1; break; }
+        if (!have) e2[n++] = (char *)row;
+    }
     e2[n] = NULL;
     {
         const char *logf = getenv("SPROUT_TRACELOG");
@@ -3377,7 +3440,7 @@ static const char *sp_abi_cleanse(const char *host) {
             int dirty = 0;
             for (int k = 8; k < 16; k++) dirty |= id[k];
             if (dirty) {
-                const char *ld = getenv("SPROUT_LOADER");
+                const char *ld = sp_loader_path();
                 if (ld && *ld) {
                     const char *sl = strrchr(ld, '/');
                     size_t dl = sl ? (size_t)(sl - ld) : 0;
@@ -3864,7 +3927,7 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
                 }
             }
         }
-        int rc = sp_real_execve(getenv("SPROUT_LOADER"), vstack, envp);
+        int rc = sp_real_execve(sp_loader_path(), vstack, envp);
         if (rc < 0) return sp_chain_fail(path, depth, errno, "loader-execve");
         return rc;
     }
@@ -4026,7 +4089,7 @@ int fexecve(int fd, char *const argv[], char *const envp[]) {
         int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL, NULL);
         if (b == -2) { errno = EIO; return -1; }
         if (b != 0) { errno = E2BIG; return -1; }
-        return sp_real_execve(getenv("SPROUT_LOADER"), vstack, envp);
+        return sp_real_execve(sp_loader_path(), vstack, envp);
     }
     default:
         errno = ENOEXEC;
