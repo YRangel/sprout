@@ -32,3 +32,15 @@ v0.4. The rootfs model is libc-agnostic so this is additive.
 **x86_64 on arm64?**
 Outside v1.0 scope (an emulation problem, not a path problem). Watch
 Box64 integration after 1.0.
+
+**An app SEGFAULTs in my guest — sprout's fault?**
+Check the control lane first: if the same binary under `proot` (or
+`proot-distro login ...`) crashes identically, the app is simply broken in
+containerized environments and no interposer can fix that. Confirmed
+upstream-broken examples (2026-08, ubuntu-resolute guest, crash identical in
+both lanes): `kcm-touchpad-list-devices` (null-deref when no display/dbus),
+`glxdemo`/`glxinfo`-family without `DISPLAY`, `aa-features-abi --version`
+(misuse path), all the `aa-*` AppArmor tools on kernels without AppArmor
+FS. The other proot-distro control-lane doctrine (`proot` is the
+is-functional baseline) is the canonical split: identical-in-proot ⇒
+not a sprout bug; clean-in-proot ⇒ file it on us.
