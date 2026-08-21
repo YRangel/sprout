@@ -250,9 +250,28 @@ int sp_translate(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX]
 }
 
 size_t sp_reverse(const sp_config_t *cfg, const char *host, char *out, size_t outsz) {
+    /* Longest-host-prefix WINS across binds ∪ {rootfs}: a bind whose host
+     * side merely ANCESTORS the rootfs (the proot-distro PREFIX-bind shape
+     * `--bind=/data/.../usr`, under which ROOTFS lives) must not hijack the
+     * reverse-mapping of every guest-root path — that surfaced as the
+     * host-PWD/cwd-anchor flip: the guest's getcwd() suddenly spelled the
+     * FULL HOST rootfs path (/data/.../containers/ubuntu/rootfs/root)
+     * instead of /root. Bind vs bind stays guest-longest-sorted (the
+     * config-ingest order); bind on deeper paths than the rootfs still win
+     * exactly like before (the /tmp→/dev/shm shim). */
+    const sp_bind_t *best = NULL;
     for (int i = 0; i < cfg->nbinds; i++) {
         const sp_bind_t *b = &cfg->binds[i];
         if (!path_within(b->host, b->host_len, host)) continue;
+        /* binds are guest-prefix longest-first; host-length order differs,
+         * so scan all and keep the deepest host match */
+        if (best == NULL || b->host_len > best->host_len)
+            best = b;
+    }
+    if (best != NULL &&
+        !(cfg->rootfs_len > best->host_len &&
+          path_within(cfg->rootfs, cfg->rootfs_len, host))) {
+        const sp_bind_t *b = best;
         size_t rest = strlen(host + b->host_len);
         size_t total = b->guest_len + rest;
         if (total + 1 > outsz) { total = outsz - 1; }

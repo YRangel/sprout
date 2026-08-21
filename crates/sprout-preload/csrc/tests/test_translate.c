@@ -56,6 +56,7 @@ static int failures = 0;
         }                                                       \
     } while (0)
 
+static int main_ancestor_bind(void);
 static sp_config_t make_cfg(void) {
     sp_config_t c;
     memset(&c, 0, sizeof(c));
@@ -133,10 +134,60 @@ int main(void) {
     CHECK("idempotent load", a.nbinds == b.nbinds && a.nbinds == 1);
     CHECK("rootfs len", a.rootfs_len == 2);
 
+    if (main_ancestor_bind() != 0) {
+        failures++;
+        printf("FAIL ancestor_bind suite\n");
+    }
     if (failures == 0) {
         puts("test_translate: all OK");
         return 0;
     }
     printf("test_translate: %d failure(s)\n", failures);
     return failures;
+}
+
+/* regression: a bind whose HOST side merely ANCESTORS the rootfs
+ * (the proot-distro "--bind=$PREFIX" shape, where the rootfs lives
+ * INSIDE $PREFIX/var/...) must not hijack the reverse-mapping of
+ * guest-root paths */
+static int main_ancestor_bind(void) {
+    sp_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    strcpy(cfg.rootfs, "/pfx/var/lib/containers/ubuntu/rootfs");
+    cfg.rootfs_len = strlen(cfg.rootfs);
+
+    strcpy(cfg.binds[0].host, "/pfx");
+    cfg.binds[0].host_len = strlen(cfg.binds[0].host);
+    strcpy(cfg.binds[0].guest, "/pfx");
+    cfg.binds[0].guest_len = strlen(cfg.binds[0].guest);
+    cfg.nbinds = 1;
+
+    char out[SP_PATH_MAX];
+    int f = 0;
+    size_t n;
+    /* rootfs path must win over the shallow ancestor bind: */
+    n = sp_reverse(&cfg, "/pfx/var/lib/containers/ubuntu/rootfs/root"
+                    , out, sizeof(out));
+    if (n == 0 || strcmp(out, "/root") != 0) {
+        f++;
+        printf("FAIL reverse(rootfs-root) -> \"%s\", want \"/root\"\n", out);
+    }
+    /* path OUTSIDE the rootfs still reverses through the identity bind: */
+    n = sp_reverse(&cfg, "/pfx/bin/ls", out, sizeof(out));
+    if (n == 0 || strcmp(out, "/pfx/bin/ls") != 0) {
+        f++;
+        printf("FAIL reverse(/pfx/bin/ls) -> \"%s\", want identity\n", out);
+    }
+    /* the specific-in-rootfs bind still beats rootfs: */
+    cfg.nbinds = 2;
+    strcpy(cfg.binds[1].host, "/pfx/var/lib/containers/ubuntu/rootfs/tmp");
+    cfg.binds[1].host_len = strlen(cfg.binds[1].host);
+    strcpy(cfg.binds[1].guest, "/dev/shm");
+    cfg.binds[1].guest_len = strlen(cfg.binds[1].guest);
+    n = sp_reverse(&cfg, "/pfx/var/lib/containers/ubuntu/rootfs/tmp/x.shm", out, sizeof(out));
+    if (n == 0 || strcmp(out, "/dev/shm/x.shm") != 0) {
+        f++;
+        printf("FAIL reverse(shm) -> \"%s\", want \"/dev/shm/x.shm\"\n", out);
+    }
+    return f;
 }
