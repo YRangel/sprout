@@ -28,7 +28,7 @@ median() {
     # NUMBER ONLY on stdout (consumed via $(median ...)); this keeps
     # run_case's awk speedup division well-defined.
     label=$1; shift
-    "$@" >/dev/null 2>&1 || { printf '%-34s FAILED\n' "$label" >&2; return 1; }
+    "$@" >/dev/null 2>&1 || { printf '%-34s FAILED\n' "$label" >&2; echo ""; return 0; }
     ms=$(i=0; while [ "$i" -lt "$N" ]; do
         t0=$(date +%s%N); "$@" >/dev/null 2>&1; t1=$(date +%s%N)
         echo $(( (t1 - t0) / 1000000 )); i=$((i + 1))
@@ -94,7 +94,19 @@ if [ "$MODE" = full ]; then
     echo "== compute (should be ~1x parity) =="
     run_case "awk sum 1..200000" /bin/bash -c 'seq 200000 | awk "{s+=\$1} END {print s}"'
 
-    echo "== git local (repo pre-seeded at /tmp/bench-repo) =="
+    echo "== git local (repo seeded in both lanes at /tmp/bench-repo) =="
+    seed_repo() { # seed from HOST git into each lane's /tmp
+        repo=$1
+        [ -d "$repo/.git" ] && return 0
+        rm -rf "$repo"; mkdir -p "$repo"
+        git -C "$repo" init -q
+        i=0; while [ "$i" -lt 50 ]; do echo "$i" > "$repo/f$i.txt"; i=$((i+1)); done
+        git -C "$repo" add -A >/dev/null 2>&1
+        git -C "$repo" -c user.name=bench -c user.email=bench@local commit -qm seed
+    }
+    seed_repo "$ROOTFS/tmp/bench-repo"
+    PDROOT="$PREFIX/var/lib/proot-distro/containers/$DISTRO/rootfs"
+    seed_repo "$PDROOT/tmp/bench-repo"
     run_case "git -C bench-repo status" /usr/bin/git -C /tmp/bench-repo status --porcelain
     run_case "git -C bench-repo log --oneline" /usr/bin/git -C /tmp/bench-repo log --oneline --all
 

@@ -360,11 +360,18 @@ impl Rootfs {
     /// when the kernel follows it mid-open, so NEEDED libs behind such
     /// chains fail ENOENT (ffplay -> libblas.so.3 repro). The interposer's
     /// 8-hop readlink loop fixes app-stage opens but can never run here,
-    /// so each launch we rewrite absolute guest-internal symlinks in the
-    /// loader dirs + /etc/alternatives to RELATIVE ones — guest semantics
-    /// identical, kernel-side resolution stays inside the rootfs.
-    /// Cheap: one readdir + lstat per existing dir.
-    pub fn library_path(&self) -> String {
+    /// so on first touch per dir-content-revision we rewrite absolute
+    /// guest-internal symlinks in the loader dirs + /etc/alternatives to
+    /// RELATIVE ones — guest semantics identical, kernel-side resolution
+    /// stays inside the rootfs.
+    ///
+    /// Perf: the lib dirs carry ~1.5K symlinks (debian aarch64), so a
+    /// blanket re-scan per launch paid ~1.4K readlinkat + two canonicalize
+    /// per dir (~25-30ms of launcher constant). Dir mtime bumps exactly
+    /// when a symlink is added/removed/renamed — dpkg/apk can't touch
+    /// links without it — so a stamp file lets later launches skip the
+    /// reactors entirely when nothing changed.
+    pub fn library_path(&self, cache_dir: &Path) -> String {
         const DIRS: [&str; 6] = [
             "/lib/aarch64-linux-gnu",
             "/usr/lib/aarch64-linux-gnu",
@@ -373,9 +380,7 @@ impl Rootfs {
             "/lib",
             "/usr/lib",
         ];
-        for d in DIRS.iter().copied().chain(["/etc/alternatives"]) {
-            self.normalize_absolute_symlinks(d);
-        }
+        self.normalize_stamped(cache_dir, &DIRS, "/etc/alternatives");
         DIRS.iter()
             .map(Path::new)
             .map(|d| self.to_host(d))
@@ -383,6 +388,52 @@ impl Rootfs {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join(":")
+    }
+
+    /// Stamped-driver for normalize_absolute_symlinks: readdir+lstat per
+    /// dir only if that dir's mtime advanced since the last normalize
+    /// pass. Rootfs content changes (apt install growing a new absolute
+    /// symlink under /usr/lib) bump the dir mtime -> renormalize.
+    /// Concurrent launches race harmless: the rewrite is idempotent.
+    fn normalize_stamped(&self, cache_dir: &Path, dirs: &[&str], extra: &str) {
+        use std::io::Write;
+        let stamp_dir = cache_dir.join("norm-stamps");
+        if std::fs::create_dir_all(&stamp_dir).is_err() {
+            for d in dirs.iter().copied().chain([extra]) {
+                self.normalize_absolute_symlinks(d);
+            }
+            return;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&self.root.to_string_lossy().as_bytes(), &mut h);
+        let stamp = stamp_dir.join(format!("{:016x}.stamp", std::hash::Hasher::finish(&h)));
+        let cur: Vec<Option<std::time::SystemTime>> = dirs
+            .iter()
+            .copied()
+            .chain([extra])
+            .map(|d| {
+                std::fs::metadata(self.to_host(Path::new(d)))
+                    .and_then(|m| m.modified())
+                    .ok()
+            })
+            .collect();
+        let stale: String = format!(
+            "{:?}",
+            cur.iter()
+                .map(|m| m
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|dur| (dur.as_secs(), dur.subsec_nanos())))
+                .collect::<Vec<_>>()
+        );
+        if std::fs::read_to_string(&stamp).ok().as_deref() == Some(stale.as_str()) {
+            return; /* all 7 mtimes unchanged since last normalize pass */
+        }
+        for d in dirs.iter().copied().chain([extra]) {
+            self.normalize_absolute_symlinks(d);
+        }
+        if let Ok(mut f) = std::fs::File::create(&stamp) {
+            let _ = f.write_all(stale.as_bytes());
+        }
     }
 
     /// Rewrite absolute symlinks under guest dir `gdir` (guest spelling)

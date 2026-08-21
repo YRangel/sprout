@@ -230,7 +230,7 @@ impl LaunchPlan {
     ) -> Result<Self, Error> {
         let flavor = rootfs.libc_flavor();
         let loader = rootfs.guest_loader()?;
-        let library_path = rootfs.library_path();
+        let library_path = rootfs.library_path(cache_dir);
         /* AppImage-ecosystem EXEC binaries pollute e_ident padding
          * (EI_ABIVERSION) with signature junk; glibc's ld.so in program
          * role then refuses them ("ELF file ABI version invalid"). Serve
@@ -518,7 +518,7 @@ impl LaunchPlan {
                     format!(
                         "{}:{}",
                         loader.parent().unwrap().display(),
-                        rootfs.library_path()
+                        rootfs.library_path(cache_dir)
                     ),
                 ));
                 env.push(("SPROUT_LIBC".into(), "musl".into()));
@@ -533,7 +533,7 @@ impl LaunchPlan {
                 crate::sanitize::ensure_sanitized_libc(&libc, cache_dir),
             ) {
                 env.push(("SPROUT_LOADER".into(), loader_s.display().to_string()));
-                env.push(("SPROUT_LIBRARY_PATH".into(), rootfs.library_path()));
+                env.push(("SPROUT_LIBRARY_PATH".into(), rootfs.library_path(cache_dir)));
                 env.push((
                     "SPROUT_GUEST_PRELOAD".into(),
                     format!("{}:{}", preload_so.display(), libc_s.display()),
