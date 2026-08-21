@@ -109,6 +109,25 @@ void sp_config_load(sp_config_t *cfg) {
         *eq = '\0';
         if (tok[0] != '/' || eq[1] != '/') continue;
 
+        const char *g = eq + 1;
+        /* proot-distro shims pass --bind=/proc (identity mapping). For an
+         * identity bind on a pseudo-fs root (/proc,/sys,/dev) the translated
+         * host string is IDENTICAL to the guest string — but on the
+         * notify lane a bind hit takes the ADDFD path: the SUPERVISOR
+         * opens the target, so /proc/self/* resolves to the SUPERVISOR's
+         * own process state and the tracee (whose preload reads its own
+         * /proc/self/maps + auxv during init) dies of self-confusion
+         * (SIGSEGV, zero diagnostic output). The passthrough+CONT lane is
+         * what /proc must ride; an identity bind adds nothing anyway —
+         * skip it at config ingest. */
+        {
+            size_t tl = strlen(tok), gl = strlen(g);
+            if (tl == gl && strcmp(tok, g) == 0 &&
+                (strcmp(tok, "/proc") == 0 || strcmp(tok, "/sys") == 0 ||
+                 strcmp(tok, "/dev") == 0))
+                continue;
+        }
+
         sp_bind_t *b = &cfg->binds[cfg->nbinds];
         copy_str(b->host, sizeof(b->host), tok);
         copy_str(b->guest, sizeof(b->guest), eq + 1);
