@@ -2808,6 +2808,46 @@ int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags)
 #endif /* __GLIBC__ */
 
 
+/* __realpath_chk is the FORTIFY twin of realpath(3): Qt-family binaries
+ * (Qt6Core, KDE, GL-stack tools) link it INSTEAD of the plain symbol. Its
+ * internal openat2()/fd-chase loop resolves through the supervisor's
+ * ADDFD-virtual-fd plane, whose /proc/self/fd targets are HOST-Spelled
+ * strings — so its canonical-path output leaks host paths
+ * ("/bin/sh" → "/system/bin/sh"), breaking QPluginLoader's locatePlugin()
+ * (canonicalFilePath=="" → metaData()==empty → KDE/Qt/Qi scanning falls
+ * over). Wrap it like readlink: chase-forward via sp_translate_x, run the
+ * REAL fortified call on a scratch buffer, then sp_reverse the result so
+ * callers receive a guest-spelled canonical path. */
+char *__realpath_chk(const char *path, char *resolved, size_t resolvedlen) {
+    static char *(*SP_REAL_CHK)(const char *, char *, size_t) = NULL;
+    if (!SP_REAL_CHK) {
+        union { void *raw; char *(*fn)(const char *, char *, size_t); } u = { NULL };
+        u.raw = sp_sym("__realpath_chk");
+        SP_REAL_CHK = u.fn;
+    }
+    if (!SP_REAL_CHK) { errno = ENOSYS; return NULL; }
+    if (!path) { errno = EFAULT; return NULL; }
+    char x[SP_PATH_MAX];
+    const char *p = sp_translate_x(path, x);
+    /* glibc's realpath_chk validates: resolvedlen >= PATH_MAX+1 */
+    char host_buf[SP_PATH_MAX + 8];
+    char *r = SP_REAL_CHK(p, host_buf, sizeof(host_buf) - 1);
+    if (!r) return NULL;
+    host_buf[sizeof(host_buf) - 1] = '\0';
+    char guest[SP_PATH_MAX + 8];
+    size_t n = sp_reverse(&g_cfg, r, guest, sizeof(guest) - 1);
+    guest[n] = '\0';
+    if (resolved) {
+        if (resolvedlen < n + 1) { errno = ENOMEM; return NULL; }
+        memcpy(resolved, guest, n + 1);
+        return resolved;
+    }
+    char *heap = (char *)malloc(n + 1);
+    if (!heap) { errno = ENOMEM; return NULL; }
+    memcpy(heap, guest, n + 1);
+    return heap;
+}
+
 ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
     static ssize_t (*SP_REAL(readlink))(const char *, char *, size_t) = NULL;
     SP_RESOLVE(readlink);

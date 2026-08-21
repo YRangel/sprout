@@ -26,7 +26,15 @@ jobs:
       - name: install native C toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          # gcc-14 REQUIRED (2026-08): the ubuntu-24.04 default gcc-13's codegen
+          # produced a libsprout-core.so whose stat-path wrappers null-deref'd in
+          # glibc-2.43-era binaries at startup (md5sum/sha*/b2sum/glxdemo et al,
+          # ubuntu-resolute guest; si_code=1 addr=0x0). The same source rebuilt
+          # with gcc-15 (resolute-native) healed 100% of the deterministic-crash
+          # family. Keep the lane on the newest available guest-gcc forever.
+          sudo apt-get install -y build-essential gcc-14 g++-14
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=gcc-14" >> "$GITHUB_ENV"
 
       # Smoke: the usual linux-gnu workspace build (keeps this workflow a
       # CI lane too, and produces the GUEST-side glibc interposer .so).
