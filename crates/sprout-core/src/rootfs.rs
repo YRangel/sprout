@@ -212,6 +212,10 @@ impl Rootfs {
         Ok((uid, gid, name.to_string(), home, shell))
     }
 
+    /* sp_reverse() tests live on the C side: crates/sprout-preload/
+     * csrc/tests/test_translate.c covers the parse, translate, and reverse
+     * paths against synthetic configs (host plain build, no interpose). */
+
     /// Guest-spelled path → host path (root prefixing only; bindings are
     /// resolved inside the guest by the preload core).
     pub fn to_host(&self, guest: &Path) -> PathBuf {

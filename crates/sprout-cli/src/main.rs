@@ -752,12 +752,14 @@ fn cache_dir() -> PathBuf {
     eprintln!(
         "sprout: warning: no writable cache dir found (tried: {}); continuing with {}",
         tried.join(", "),
-        candidates.first().map_or_else(
-            || "<none>".to_string(),
-            |p| p.display().to_string()
-        )
+        candidates
+            .first()
+            .map_or_else(|| "<none>".to_string(), |p| p.display().to_string())
     );
-    candidates.into_iter().next().unwrap_or_else(|| std::env::temp_dir())
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| std::env::temp_dir())
 }
 
 /// Probe: the dir must accept a transient file (some mounts are
