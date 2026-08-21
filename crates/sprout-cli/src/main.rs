@@ -717,16 +717,67 @@ extern "C" {
 }
 
 /// Where the sanitized-libc cache lives (ADR-0007). Override with
-/// SPROUT_CACHE_DIR; defaults to $HOME/.cache/sprout, or the system temp
-/// dir when HOME is unset.
+/// SPROUT_CACHE_DIR (authoritative: returned verbatim, any error
+/// surfaces at use). Otherwise walk a writability-probed cascade:
+///
+///   1. $HOME/.cache/sprout
+///   2. $TMPDIR/sprout-$UID   (or the crate temp_dir when TMPDIR unset)
+///   3. /tmp/sprout-$UID
+///
+/// First candidate that both `create_dir_all`s and takes a probe-file
+/// write wins. Each step logs a one-line notice so an EROFS primer
+/// (seen on a friend's device with a read-only $HOME) is diagnosable
+/// instead of fatal.
 fn cache_dir() -> PathBuf {
     if let Ok(p) = std::env::var("SPROUT_CACHE_DIR") {
         return PathBuf::from(p);
     }
+    let uid = unsafe { getuid() };
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".cache").join("sprout");
+        candidates.push(PathBuf::from(home).join(".cache").join("sprout"));
     }
-    std::env::temp_dir().join("sprout")
+    candidates.push(std::env::temp_dir().join(format!("sprout-{uid}")));
+    candidates.push(PathBuf::from(format!("/tmp/sprout-{uid}")));
+    let mut tried: Vec<String> = Vec::new();
+    for cand in &candidates {
+        tried.push(cand.display().to_string());
+        if cache_dir_writable(cand) {
+            return cand.clone();
+        }
+    }
+    /* Nothing writable: return the HOME candidate anyway so downstream
+     * `create_dir_all` produces the *real* errno at the *real* path,
+     * with the cascade note prepended for the user's layer-8. */
+    eprintln!(
+        "sprout: warning: no writable cache dir found (tried: {}); continuing with {}",
+        tried.join(", "),
+        candidates.first().map_or_else(
+            || "<none>".to_string(),
+            |p| p.display().to_string()
+        )
+    );
+    candidates.into_iter().next().unwrap_or_else(|| std::env::temp_dir())
+}
+
+/// Probe: the dir must accept a transient file (some mounts are
+/// mkdir-capable yet write-denied; the EROFS primer was exactly that).
+fn cache_dir_writable(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Parse a guest script's shebang line: `#!/path/to/interp [one-opt-arg]`.

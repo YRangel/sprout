@@ -321,8 +321,21 @@ __attribute__((constructor)) static void sprout_init(void) {
                         size_t el = strlen(e);
                         if (slot && (unsigned long long)slot > 0x1000) {
                             /* only overwrite when the buffer looks like the
-                             * expected host loader path, and fits */
-                            if (strlen(slot) >= el && strstr(slot, "sprout/ldso-")) {
+                             * expected host loader path, and fits. Match
+                             * SPROUT_LOADER exactly first: the earlier
+                             * "sprout/ldso-" substring heuristic silently
+                             * skipped the rewrite whenever the cache dir was
+                             * NOT named .../sprout/ (SPROUT_CACHE_DIR, the
+                             * uid-suffixed temp cascade), leaving the
+                             * multicall-resolving uutils family to dispatch
+                             * on the ldso's basename. Keep the basename
+                             * family as a fallback (no SPROUT_LOADER env). */
+                            const char *ldr = getenv("SPROUT_LOADER");
+                            int looks_loader =
+                                (ldr && *ldr && strcmp(slot, ldr) == 0) ||
+                                strstr(slot, "sprout/ldso-") != NULL ||
+                                strstr(slot, "ldso-sanitized-") != NULL;
+                            if (looks_loader && strlen(slot) >= el) {
                                 memcpy(slot, e, el + 1);
                             }
                         }
