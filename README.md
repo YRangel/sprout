@@ -2,39 +2,91 @@
 
 **Rootless glibc/musl Linux userspace for Android. Fast, auditable, open.**
 
-`sprout` runs full Linux userspaces — interactive shells, apt/apk, Python, Node,
-toolchains, **XFCE4 desktops and Firefox ESR** — on Android without root. It is a
-drop-in replacement for [proot](https://proot-me.github.io/)/proot-distro with an
-`LD_PRELOAD` fast path that avoids ptrace syscall-stop overhead, plus automatic
-fallback lanes for static/Go binaries (ptrace supervisor, or the pure-notify
-`sprout-stub` when the kernel allows it).
+`sprout` runs full Linux userspaces — shells, `apt`/`apk`, Python, Node,
+gcc/rust toolchains, **XFCE4 desktops, Firefox ESR, LibreOffice** — on stock
+Android, no root. It is a drop-in replacement for
+[proot](https://proot-me.github.io)/[proot-distro](https://github.com/termux/proot-distro)
+that replaces ptrace-every-syscall with an `LD_PRELOAD` fast path, keeping
+proot's semantics everywhere it's observable.
 
-MIT OR Apache-2.0. Every architectural decision documented in ADRs.
+MIT OR Apache-2.0. Every architectural decision documented in `docs/src/adr/`.
 
 - **Docs**: `docs/src` (mdBook — `cd docs && mdbook build`)
-- **Benchmarks**: `docs/src/benchmarks.md` (vkmark GPU/CPU suites + syscall hyperfine pairs)
-- **GitHub**: <https://github.com/YRangel/sprout>
+- **Repo**: <https://github.com/YRangel/sprout>
 
-## Quick start
+---
+
+## Table of contents
+
+1. [Why sprout exists](#why-sprout-exists)
+2. [How it works (30 seconds)](#how-it-works-30-seconds)
+3. [Install](#install)
+4. [Quick start](#quick-start)
+5. [Command-line reference](#command-line-reference)
+6. [Migrating from proot / proot-distro](#migrating-from-proot--proot-distro)
+7. [Desktops & GPU (X11)](#desktops--gpu-x11)
+8. [x86 apps under box64 (-q)](#x86-apps-under-box64--q)
+9. [What sprout fakes for you](#what-sprout-fakes-for-you)
+10. [Fundamental limits](#fundamental-limits)
+11. [Performance](#performance)
+12. [Status & support](#status--support)
+13. [Project layout](#project-layout)
+14. [License](#license)
+
+---
+
+## Why sprout exists
+
+- **Performance.** proot pays ~2 context switches per guest syscall (ptrace
+  freeze + re-arm). sprout's preload lane answers path translation at the
+  PLT with zero traps, and uses seccomp-user-notify only where the kernel
+  makes a cheap round trip possible. On a HyperOS/Android-16 device: git
+  4–4.6×, `find /usr` 27×, `tar czf` 7×, statics 14–15× vs proot (see
+  [docs/src/benchmarks.md](docs/src/benchmarks.md)).
+- **Notable proot-era pain is gone by construction.** proot-distro
+  [#567](https://github.com/termux/proot-distro/issues/567) ("extreme
+  slowdown after Android 16, all desktop environments", Oct 2025 → live in
+  2026) is a ptrace-class overhead spiral on newer GKI kernels — sprout's
+  hot path doesn't pay it. proot [#122](https://github.com/termux/proot/issues/122)
+  (statx unsupported) — sprout serves statx with an emulated
+  answer when policy blocks the raw call, and fakes the HyperOS `EACCES`
+  `/proc` table (the LibreOffice "ERROR: /proc not mounted" abort).
+- **Auditable.** No binary patching of installed files (content-addressed
+  derivatives in `~/.cache/sprout` only), ADRs for every design choice,
+  C + Rust only for the two hot artifacts.
+
+## How it works (30 seconds)
+
+Three lanes, picked per ELF at exec:
+
+1. **preload (fast)** — a glibc `LD_PRELOAD` interposer rewrites
+   open/exec/stat/chdir/* paths from guest spelling to host-resolved ones.
+   Zero ptrace traps.
+2. **supervisor (ptrace)** — static or Go binaries can't carry the `.so`;
+   a supervisor with `seccomp-user-notify` translates at syscall level,
+   answering fakes (`/proc/*`, statx, overflows) inline when it can.
+3. **`sprout-stub` (pure notify)** — when the kernel is new enough for the
+   whole fast path from userspace alone.
+
+Details: [docs/src/architecture](docs/src/architecture/).
+
+---
+
+## Install
 
 **Prerequisites**: Termux on Android (aarch64), a guest rootfs (e.g.
 `pkg install proot-distro && proot-distro install debian`).
 
-### Fastest: prebuilt release tarball
-
-Tagged releases ship a self-contained Termux tarball (host launcher +
-supervisor built on-device by the maintainer + both guest interposers +
-installer):
+### Prebuilt tarball (recommended)
 
 ```sh
-cd "$(mktemp -d)"  # fresh dir: older downloads lying around with the SAME names
-                   # (e.g. from a previous release) make sha256sum --ignore-missing
-                   # legitimately fail — always checksum in an empty directory
+cd "$(mktemp -d)"  # empty dir: same-named old downloads make
+                    # sha256sum --ignore-missing legitimately fail
 curl -sLO https://github.com/YRangel/sprout/releases/latest/download/sprout-termux-host-aarch64.tar.xz
 curl -sLO https://github.com/YRangel/sprout/releases/latest/download/SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing   # must print: sprout-termux-host-aarch64.tar.xz: OK
+sha256sum -c SHA256SUMS --ignore-missing   # must print: ... tar.xz: OK
 tar -xJf sprout-termux-host-aarch64.tar.xz
-./install.sh --verify          # installs into ${PREFIX:-$HOME/.local}/bin, verifies hashes
+./install.sh --verify          # installs into ${PREFIX:-$HOME/.local}/bin + verifies hashes
 ```
 
 ### From source
@@ -42,170 +94,228 @@ tar -xJf sprout-termux-host-aarch64.tar.xz
 ```sh
 git clone https://github.com/YRangel/sprout.git
 cd sprout
-cargo build --release --workspace  # needs: pkg install rust (pinned toolchain)
-./install.sh --verify              # installs into $PREFIX/bin; fetches the two
-                                   # guest interposer DSOs from the latest release
-                                   # (sha256-verified) when absent from the tree
+cargo build --release --workspace   # needs: pkg install rust
+./install.sh --verify
 ```
 
-Tagged releases also ship the two **guest-side** interposer DSOs standalone
-(`sprout-guest-interposers-aarch64.tar.xz`; no launcher, no installer) for
-source builds that want to skip the in-guest interposer compile step
-(`cargo build --release` alone covers only the host .so).
+Requires a glibc guest for the `.so` subprocess stage (`glibc gcc` inside
+the guest is enough — no toolchain on the host needed).
 
-Then run anything:
+---
+
+## Quick start
 
 ```sh
-# interactive shell in the debian rootfs
-sprout -r $PREFIX/var/lib/proot-distro/containers/debian/rootfs /bin/sh
+# interactive shell in a debian rootfs
+D=$PREFIX/var/lib/proot-distro/containers/debian/rootfs    # or ~/roots/debian
+sprout -r "$D" --user=0:0 -- /bin/bash -l
 
-# GUI desktop over termux-x11 (DISPLAY/PULSE_SERVER preset)
-sprout -r $PREFIX/var/lib/proot-distro/containers/debian/rootfs --shared-tmp --termux-x11 startxfce4
+# full GUI desktop over termux-x11 (DISPLAY + PULSE_SERVER preset)
+sprout -r "$D" --shared-tmp --termux-x11 --user=0:0 -- startxfce4
+
+# run an x86_64 binary under box64 (guest box64 installed via apt)
+sprout -r "$D" -q /usr/bin/box64 -- ./my-x86-program
+
+# plan-only, no execution (debugging)
+sprout -r "$D" --dry-run --user=0:0 -- /bin/echo hi
 ```
 
-Desktop-capable today: xfce4-session, firefox-esr, Thunar, etc. See
-`QUICKSTART.md` and `docs/src/guide/x11-gpu.md`.
+**Rule #1 — sprout options go BEFORE the guest command.** clap now
+hard-errors on unknown `-`/`--` tokens instead of silently feeding them to
+the guest (friend-reported; was the worst of the old UX bugs). Separate
+with `--` when the guest command itself starts with a dash or as a habit:
+
+```sh
+sprout -r "$D" --user=0:0 -- /bin/sh -c 'ls -la /root'
+```
+
+---
 
 ## Command-line reference
 
-Rule #1: **sprout options go BEFORE the guest command**. The guest command is
-everything after the last option; use `--` when the command itself begins
-with a dash or when you want to be explicit:
-
-```sh
-sprout -r ROOTFS --user=0:0 -- /bin/sh -c 'echo hello'
-```
+### Core
 
 | flag | what it does |
 |---|---|
 | `-r, --rootfs PATH` | guest root directory (the fake chroot) — REQUIRED |
-| `-w, --cwd DIR` | cwd inside the guest |
-| `-b, --bind HOST[:GUEST]` | bind a host path into the guest (repeatable) |
-| `COMMAND [ARGS...]` | program + args, guest-spelled (PATH-searched) |
+| `-w, --cwd DIR` | working directory inside the guest |
+| `-b, --bind H[:G]` | bind a host path into the guest (repeatable) |
+| `COMMAND [ARGS...]` | program + args, guest-spelled (PATH-searched inside the rootfs) |
 
 ### Identity
+
 | `-u, --user USER[:GROUP]` | fake uid/gid to a named guest user (implies fakeroot at that anchor) |
 | `-i, --change-id USER[:GROUP]` | proot compat alias of `--user` |
-| `-0, --root-id` | fake uid/gid 0 — the DEFAULT |
+| `-0, --root-id` | fake uid/gid 0 — DEFAULT |
 | `--no-fakeroot` | kernel-truthful identities (mostly EPERM for privileged ops) |
-| `--host-home`, `--host-path` | pass host $HOME / append $PREFIX/bin to guest PATH |
+| `--host-home` | pass host `$HOME` into the guest |
+| `--host-path` | append `$PREFIX/bin` to the guest PATH |
 
 ### Rootfs & layout
-| `--shared-tmp` | bind host `$PREFIX/tmp` at guest `/tmp` (proot-distro parity; X11/audio/ssh-agent sockets transfer) |
-| `--link2symlink` / `--no-link2symlink` | hardlink → symlink fallback for SELinux (DEFAULT ON) |
-| `--kill-on-exit` | kill launched processes when the command exits (proot parity) |
+
+| `--shared-tmp` | bind host `$PREFIX/tmp` at guest `/tmp` (X11/audio/ssh-agent sockets carry) |
+| `--link2symlink` / `--no-link2symlink` | hardlink→symlink fallback for SELinux (DEFAULT ON) |
+| `--kill-on-exit` | kill launched processes when the command exits |
 
 ### Desktop
-| `--termux-x11` | preset DISPLAY=:0 + PULSE_SERVER=127.0.0.1 — combine with `--shared-tmp` |
+
+| `--termux-x11` | export `DISPLAY=:0` + `PULSE_SERVER=127.0.0.1` preset (best with `--shared-tmp`) |
 
 ### Networking
-| `-p / -P, --port-mapping / --redirect-ports / --fix-low-ports` | bind(2) on ports <1024 hops to 1024+port (all four spellings are one knob) |
 
-### Emulation & compat
-| `-q, --qemu PATH` | wrap x86_64 (and i386 via box32) ELF execs through this emulator; PATH resolves guest-first, then host (bionic box64/qemu-user allowed — sprout detects bionic emulators and direct-spawns them) |
-| `-k, --kernel-release RELEASE` | what `uname(2)` reports |
-| `-L, --loader-fix` | proot compat: OBSOLETE — accepted with a note, does nothing (loader resolution is always correct) |
-| `--mixed-syscall` | proot compat: no-op note (glibc wrappers are preload-native) |
-| `--sysvipc`, `--ashmem-memfd` | acceptance no-ops (sprout's equivalents are always-on; knobs: `SPROUT_SYSVIPC_OFF=1` etc) |
+| `-p / -P, --port-mapping, --redirect-ports, --fix-low-ports` | bind(2) on ports <1024 hops to port+1024 (all spellings = one knob) |
+
+### Emulation
+
+| `-q, --qemu PATH` | route x86_64 (and i386 via box32) ELF execs through this emulator binary; PATH is resolved **guest-first, host-second** — termux-native bionic box64/qemu-user outside the rootfs is detected and direct-spawned |
+| `-k, --kernel-release R` | what `uname(2)` reports to guests |
+| `-L, --loader-fix` | proot compat: obsolete, accepted with a note |
+| `--mixed-syscall` | proot compat: no-op note |
+| `--sysvipc`, `--ashmem-memfd` | accepted compat no-ops (always-on equivalents; the knobs are `SPROUT_SYSVIPC_OFF=1` etc.) |
 
 ### Debugging
+
 | `-v, --verbose [LEVEL]` | path-translation tracing |
-| `--fallback preload\|ptrace` | force a strategy (default auto) |
-| `--dry-run` | print the launch plan without executing |
+| `--fallback preload\|ptrace` | force the interception strategy |
+| `--dry-run` | print the resolved launch plan without executing |
 
-Unknown flags **fail loudly** with a clap "unexpected argument" hint —
-they are never silently eaten into the guest argv (that was a real reported
-confusing-UX bug class; fixed by removing trailing-hyphen capture).
+### Env knobs
 
-### Migrating from proot / proot-distro
+| var | effect |
+|---|---|
+| `SPROUT_PRELOAD_PATH`, `SPROOT_PTRACE_PATH` | override paths for dev A/B (`*.so` gloss-over itch: a missing override falls back silently) |
+| `SPROUT_CACHE_DIR` | pin the derivative/param cache root (default `~/.cache/sprout`) |
+| `SPROUT_BINFMT_X86_64` / `_I386` / `_ALWAYS=1` | binfmt lanes per arch; ALWAYS wraps even native aarch64 |
+| `SPROUT_SYSVIPC_OFF=1`, `SPROUT_SYSVIPC_EMU_OFF=1` | disable shims (full or emulator-only) |
+| `MOZ_DISABLE_WASM_SIGHANDLERS=1` | required for Firefox ESR under sprout (wasm callee-saved regs ABI mismatch class, documented) |
 
-| proot/proot-distro habit | sprout equivalent | status |
+---
+
+## Migrating from proot / proot-distro
+
+| proot habit | sprout equivalent | status |
 |---|---|---|
-| `proot -0 -r R -b /dev -b /proc bash` | `sprout -r R --user=0:0 -- bash` (+`-b` binds as needed) | native |
-| `proot-distro login debian` | `sprout -r $PREFIX/var/lib/proot-distro/containers/debian/rootfs --user=0:0 -- /bin/bash` | native |
+| `proot -0 -r R -b /dev -b /proc bash` | `sprout -r R --user=0:0 -- bash -l` (+`-b` binds as needed) | native |
+| `proot-distro login debian` | `sprout -r $PREFIX/var/lib/proot-distro/containers/debian/rootfs --user=0:0 -- /bin/bash -l` | native |
 | `proot-distro login debian --shared-tmp` | add `--shared-tmp --termux-x11` | native |
-| `proot -q qemu-aarch64 cmd` | `sprout -q /usr/bin/box64 -- cmd` | native (+host-bionic detectors) |
-| `proot -k 6.6.0 cmd` | `-k/--kernel-release` | native |
-| `proot -p` / `--fix-low-ports` | `-p/--port-mapping` (all spellings) | native |
-| `proot -i 0` / `--change-id 0:0` | `-i/--change-id` (alias of `--user`) | alias |
-| `proot -L` | `-L` accepted, note printed, no action | compat-no-op |
-| `proot --mixed-syscall` | `--mixed-syscall` accepted as no-op | compat-no-op |
-| `proot --sysvipc` / `--ashmem-memfd` | accepted; always-on in sprout | compat-no-op |
+| `proot -q qemu-aarch64 cmd` | `sprout -q /usr/bin/box64 -- cmd` | native (+host-bionic detection) |
+| `proot -i 0` / `--change-id 0:0` | `-i/--change-id` | alias |
+| `proot -k 6.6 cmd` | `-k/--kernel-release` | native |
+| `proot -p` / `--redirect-ports` | `-p/--port-mapping` (all 4 spellings) | native |
+| `proot -L`, `--mixed-syscall`, `--sysvipc`, `--ashmem-memfd` | accepted as no-ops with notes (sprout's equivalents are structural/always-on) | compat-no-op |
 
-## Features
+---
 
-- **Three interception lanes, chosen at launch**: LD_PRELOAD (glibc, fastest),
-  ptrace supervisor (static/Go/mixed trees), pure-notify stub (AArch64 statics).
-- **Zero `.text` patching** of installed files; cached *derivative* ld.so/libc
-  (in `~/.cache/sprout`) carry the Android seccomp workarounds.
-- **proot-compatible CLI**: `-r -b -w -0 --link2symlink --shared-tmp
-  --termux-x11 --kill-on-exit --dry-run`; ADR-0019 parity flags:
-  `-k/--kernel-release` (uname release spoof), `-p/--port-mapping`
-  (bind(2) ports <1024 -> 1024+p), `-v [LEVEL]`, `-V` (version+license
-  banner), `-h` (usage), `--sysvipc` (accepted no-op: emulation always-on
-  per ADR-0018 + ADR-0020), `--ashmem-memfd` (memfd_create fallback to
-  /dev/ashmem + fstat st_size simulation).
-- **-q / x86 emulation without root**: userspace binfmt adapter (ADR-0017)
-  sniffs x86_64/i386 ELFs at exec and routes them through a guest emulator
-  (`/usr/local/bin/box64` by default; set `SPROUT_BINFMT_X86_64` /
-  `SPROUT_BINFMT_I386`, or `-q PATH`); the emulator may equally be a
-  HOST-side absolute path (Termux-native qemu/box builds outside the
-  rootfs) — guest resolution is tried first, the host path second.
-  `SPROUT_BINFMT_ALWAYS=1` wraps every exec proot-`-q`-style for
-  whole-rootfs emulation.
-- **SysV IPC, userspace-emulated (Android has none)**: for native guests,
-  `libsprout-core.so` interposes `shmget/shmat/shmdt/shmctl` using the termux
-  libandroid-shmem wire contract (ashmem segments + `/dev/shm/<sockid>`
-  SCM_RIGHTS fd-hydration; ADR-0020) — that makes mesa's XShm present path
-  work, un-freezing llvmpipe Vulkan/GL under termux-x11. For x86+binfmt
-  guests (steam's live runtime), a guest-ABI `libsprout-sysvipc.so` injected
-  into `BOX64_LD_PRELOAD` additionally emulates `semget/semop/semctl/shm*`
-  (ADR-0018). Both disable with `SPROUT_SYSVIPC_OFF=1`; the arm64-host
-  emulator lane ({FEX,qemu-*,box64,box32} basenames) disables separately
-  with `SPROUT_SYSVIPC_EMU_OFF=1`.
-- **Environment policy**: never invents vars; `HOME` defaults guest when you ask
-  to live inside; `--termux-x11` is the explicit preset for GUI sessions.
-- **Reproducible batteries**: `bench/flags-matrix.sh` (34 cells),
-  `bench/flags-matrix-extended.sh` (73), hyperfine benchmark pairs.
-- **Audited surface**: every major decision written down in `docs/src/adr/`.
+## Desktops & GPU (X11)
 
-## Found a bug?
+XFCE4 on the debian guest is the reference desktop (validated daily on the
+dev machines). Minimum envelope:
 
-Issues welcome: <https://github.com/YRangel/sprout/issues>. If sprout can be
-observably falsified by a workload that worked under proot, the harness to
-prove it is usually `bench/run-statics.sh`, `bench/run-hyperfine.sh` or
-(GUI/GPU regressions) `bench/run-vkmark.sh`.
+```sh
+am start -S   # native termux-x11 app first (or it'll swallow the display)
+sprout -r "$D" --shared-tmp --termux-x11 --user=0:0 -- startxfce4
+```
+
+- **GPU**: Adreno hardware GL/Vulkan via turnip/zink Mesa — install the
+  lfdevs android-container Mesa build inside the guest and pin
+  `VK_ICD_FILENAMES` (guide: [docs/src/guide/x11-gpu.md](docs/src/guide/x11-gpu.md)).
+- **Zombie X displays**: `x11-rescue.sh` (shell) rescues a dead-display
+  socket/lock pair; never `rm` an `.X11-unix/XN` file whose server thread
+  is alive.
+- **Audio**: pulse+AAudio TCP server on the host, guest targets it at
+  `PULSE_SERVER=127.0.0.1`; `pulse-guard.sh` watchdog heals HyperOS pulse
+  rot automatically.
+
+## x86 apps under box64 (-q)
+
+- Install box64 **inside the guest** (`apt install box64` in debian) and
+  point: `sprout -r $D -q /usr/bin/box64 -- ./x86-app`.
+- Host-Termux box64 also works via the same path (bionic emulator detected
+  and direct-spawned), but two old walls stay: static x86 guests die
+  against Android's `set_robust_list` policy block, and dynamic ones need
+  the rootfs's `ld-linux-x86-64.so.2` discoverable. Guest-installed box64
+  is the lane that fully works today.
+  Details: [docs/src/adr/0017](docs/src/adr/0017-userspace-binfmt-adapter.md).
+- Env knobs: `SPROUT_BINFMT_X86_64`, `SPROUT_BINFMT_I386`,
+  `SPROUT_BINFMT_ALWAYS=1`, `BOX64_LD_PRELOAD` forwarding for arch-shim
+  injection (`/usr/lib/sprout-sysvipc/x86_64/...`).
+
+## What sprout fakes for you
+
+`/proc` (HyperOS policy hides it from untrusted uids):
+`/proc/stat`, `/proc/loadavg`, `/proc/version`, `/proc/uptime`,
+`/proc/sys/kernel/overflowuid`, `/proc/sys/kernel/overflowgid` — served as
+parseable content at every enforcement level (`LD_PRELOAD` PLT, notify
+ADDFD, classic scratch-file, memfd, materialized-file reroute). This is
+what unbreaks LibreOffice (proot-reagent for that class: issue
+[termux/proot#175](https://github.com/termux/proot/issues/175)).
+
+`statx(2)` — answered from `newfstatat(262)` when the raw call is policy-
+degraded/`ENOSYS` off the stack; `stx_mask` advertises exactly the fields
+populated (no btime on pre-4.16 kernels).
+
+Identity (uid/gid/groups/env), `/etc/{hostname,resolv.conf}` housework,
+hardlink→symlink translation for SELinux paths, SysV IPC in userspace.
+
+## Fundamental limits
+
+Not bugs, walls every rootless runner shares:
+
+- **The Android filter is the final word.** `RET_KILL`-policy syscalls
+  (e.g. raw `riscv`/`sys_pidfd-good-timing` classes on some devices)
+  out-rank any refusal answer from us. Only PLT interception (preload lane,
+  i.e. *glibc-dynamic guests*) can be rescued; raw `svc` callers die exactly
+  as under proot.
+- **No nested ptrace debuggers.** `gdb/strace -p` INSIDE a guest is
+  impossible by design (the supervisor owns ptrace).
+- **No mount(2)/loop devices/namespaces.** Kernel-level: apps that require
+  them (docker, some systemd apps) are out of this model's reach.
+- **64-bit only** (aarch64 host + 64-bit guests; 32-bit via box32 in the
+  emulation lane only).
+
+## Performance
+
+Measured on-device, pre-warm cache; `×` = sprout/proot speedup:
+
+| workload | × |
+|---|---|
+| `git status` / `git log` (dwarfs repo) | 4.1–4.6× |
+| `find /usr -type f` | 27.5× |
+| `tar czf` on /usr | 7.1× |
+| statics lane (`run-statics.sh`) | up to 15.3× |
+| spawn-heavy traversal (notify ± ptrace) | ~1.1× (spam-class bound) |
+
+Full tables + methodologies: [docs/src/benchmarks.md](docs/src/benchmarks.md),
+including `bench/run{,-statics,-hyperfine,-alpine,-vkmark}.sh` harnesses.
+
+## Status & support
+
+- **Works daily on the dev machines**: Debian trixie guest w/ XFCE4,
+  Firefox ESR, LibreOffice, flatpak. POCO X3-class 4.14 kernel phone
+  validates the classic ptrace lane every tag.
+- **Not a sandbox**: [docs/src/architecture/threat-model.md](docs/src/architecture/threat-model.md).
+- **Issues**: <https://github.com/YRangel/sprout/issues>. First diagnostic:
+  pair the failure against the `proot` control lane (`proot-control.sh`)
+  — identical-under-proot = app broken, not sprout.
+- **Batteries**: `cargo test` + `test_translate` + `bench/*` +
+  `~/projeto/flagmatrix.sh` + `~/projeto/healthcheck.sh` (3-layer gate).
 
 ## Project layout
 
 ```
-crates/
-  sprout-cli/     CLI + argv0 dispatch (Rust)
-  sprout-core/    ELF classification, strategy, plan builder (Rust)
-  sprout-preload/ C11 LD_PRELOAD interposer + GLIBC ABI capture (Rust + C)
-  sprout-ptrace/  supervisor + statics stub (Rust + C)
-bench/            benchmark suites + guarded matrices
-docs/             mdBook — user guide, architecture, ADRs, benchmarks
-install.sh        install/self-verify (<10 s)
+sprout/                 # launcher (rust, spawns the supervisor inside the guest)
+├── crates/
+│   ├── sprout-cli/     # CLI + plan assembly
+│   ├── sprout-core/    # rootfs, translate, upsert, sanitization, ELF classes
+│   ├── sprout-preload/ # glibc .so interposer (crates/sprout-preload/csrc)
+│   └── sprout-ptrace/  # supervisor (notify-loop, classic ptrace, stub)
+├── csrc/sprout-sysvipc/
+├── bench/              # all numbers: harnesses + raw results
+├── docs/src/           # mdBook: guide/architecture/ADR
+├── install.sh
+└── .github/workflows/  # self-hosted termux CI
 ```
-
-## Benchmarks (vkmark 2025.01, 1280x720, default present mode, live X11)
-
-| lane | sprout | proot-distro | delta |
-|------|--------|--------------|-------|
-| Adreno 840 (Turnip, real GPU) | **7883** | 755 | **10.4×** |
-| llvmpipe (CPU / XShm)         | **339**  | 190 | **1.8×**  |
-
-Repro: `bench/run-vkmark.sh`. Full per-scene tables + old hyperfine pairs
-(4.88×–16.03× on syscall-heavy workloads) in `docs/src/benchmarks.md`.
-
-## Status
-
-Post-v0.1: glibc guest shells, static/Go binaries, musl, apt/apk, X11 desktop,
-Firefox ESR and GPU-rendered Vulkan (Turnip native + llvmpipe via ADR-0020
-sysv-shm emulation) all work on-device; performance beats proot-distro on
-every published cell. See **Roadmap** in `docs/src/roadmap.md` for what's next.
 
 ## License
 
-Dual-licensed under MIT OR Apache-2.0, at your option.
+MIT OR Apache-2.0, at your option. `LICENSE-MIT` and `LICENSE-APACHE`.

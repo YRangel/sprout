@@ -120,9 +120,45 @@ fast path covers (static binaries route
 through the supervisor automatically).
 
 Known deltas vs `proot-distro login`: sprout does not (yet) -b system
-paths by default (pass `-b /dev -b /proc -b /sys` if a tool needs them)
-and does not fake `/proc/...` contents (loadavg/stat/uptime files that
-proot-distro bind-mounts from its own `sysdata/`).
+paths by default (pass `-b /dev -b /proc -b /sys` if a tool needs them).
+
+## What sprout fakes for you (new in the 2026-08 cycle)
+
+/proc entries HyperOS (SDK-36-era) hides behind `EACCES` from untrusted
+uids — served through EVERY enforcement level (preload memfd answers,
+translate-level materialized-file reroute, notify ADDFD inject, classic
+scratch-file) so whichever lane carries the process, the file opens:
+
+| path | content | consumer class |
+|---|---|---|
+| `/proc/version` | `Linux version R (sprout-build) (gcc (sprout)) #1 SMP PREEMPT M` (host `uname(2)` painted) | LibreOffice oosplash probe → this was proot#175's full fix |
+| `/proc/stat`, `/proc/loadavg`, `/proc/uptime` | synthetic but parseable/moving | htop/top/ps class, glibc sysinfo() fallback |
+| `/proc/sys/kernel/overflowuid`, `/proc/sys/kernel/overflowgid` | `65534` | bwrap/pressure-vessel range validation |
+
+statx(2) emulation: raw `syscall(291)` is policy-killed or ENOSYS-able
+on policy-strict devices (HyperOS: `RET_KILL` outranks our notify answer —
+all rootless runners die identically), but glibc `statx(3)` callers are
+interposed at PLT and answered via newfstatat(262) emulation, stx_mask
+advertising exactly the populated fields.
+
+## CLI parity additions (2026-08-22, friend-reported class)
+
+| proot habit | sprout | status |
+|---|---|---|
+| `-i NUM` / `--change-id UID:GROUP` | `-i/--change-id` | **ALIAS of `--user`** (numeric + named both; conflicts_with=user) |
+| `-L` (obsolete ld loader-fix) | `-L/--loader-fix` | accepted with one-line note, no action — loader resolution is always correct |
+| `--mixed-syscall` | `--mixed-syscall` | accepted as no-op note; preload lane handles glibc wrappers natively |
+| `--redirect-ports`, `--fix-low-ports`, `-P` | same three spellings + `-p/--port-mapping` | all four are ONE knob |
+
+### Unknown-flag discipline (same change)
+
+Older builds let any unrecognized dash-token "slide through" and
+the whole rest of argv: `sprout -L --rootfs=R bash` ended with clap
+mystifyingly saying *rootfs was missing* (the token had eaten it);
+`sprout -r R -L bash` treated `-L` as the guest program name. Today: hard
+errored on contact WITH the `--` hint; only tokens after an EXPLICIT
+`--` are allowed to start with dashes. `sprout --help` prints the full
+compat map at its tail.
 
 ## CLI parity table
 

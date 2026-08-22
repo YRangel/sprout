@@ -1,5 +1,24 @@
 # Benchmarks
 
+### 2026-08-22 — exec-era improvements (post-#2023365/#9e1592a)
+
+Lane gains applied across the board on the HyperOS host, Debian trixie
+guest — initial exec-name memo + library-stamp normalize + the ptrace
+canonical tdso fix — the table below is kept as the reference era:
+
+| workload | sprout vs proot |
+|---|---|
+| `git status` / `git log` (50-file repo in-guest, MODE=full) | 4.1–4.6× |
+| `find /usr -type f` | 27.5× |
+| start-to-spawn jitter (20 subprocess spawns) | 69 ms total |
+| apt/dpkg transaction lane (install+purge) | PASS (class-closing, ADR-0012) |
+
+Also: statx answers now come from emulation on policy-strict lanes (no
+app-visible delta on this HyperOS class; documented for the 4.14 POCO
+device where answers were already native-only).
+
+---
+
 Method: wall-clock medians, on-device (Android 16, aarch64, kernel
 6.12.23). Same guest rootfs and same command lines on both sides;
 `proot-distro v5 ... login` is the incumbent baseline. Reproduce with

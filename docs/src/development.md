@@ -118,3 +118,38 @@ them silently regresses musl/X11/exec-chain behavior:
    (preload-governed), 1 static, 2 dynamic-Go, 3 musl-dynamic.
 7. `--shared-tmp` is sugar for a single `Binding`; do not add side
    effects to it.
+
+## Batteries (run before ANY claim "done")
+
+Every contributor-visible "ship" fan-out = this exact cycle (the
+`~/projeto/` scripts are maintainer-side helpers pinned in-memory; the
+canon is replicated here for CI and docs):
+
+```
+cargo test --workspace
+cd crates/sprout-preload/csrc/tests && gcc -std=c11 -O2 -Wall -Wextra -Wpedantic \
+    -D_GNU_SOURCE -o /tmp/ttr test_translate.c ../sprout_preload.c -ldl && /tmp/ttr
+cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+bench/run.sh $ROOTFS    bench/run-statics.sh $ROOTFS
+~/projeto/flagmatrix.sh           # 11/11 expected
+~/projeto/healthcheck.sh          # 3-layer gate, 0 fails expected; both lanes
+```
+
+`healthcheck.sh` covers: git clean, fmt, clippy, cargo test, canonical
+test_translate, deployment md5 identity (sprout/super vs the freshest
+target build + an in-guest canonical `.so` rebuild), the full runtime
+probe set, the six-path fake-proc readback, glibc statx probe, flagmatrix,
+AND a cross-phone mode comparing against expected md5 goldens.
+
+**Canonical `.so` recipe (hard requirement; deviations = half-inert
+artifacts)**: in a glibc guest (debian rootfs on the dev phone),
+`gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -fPIC -shared \
+-DSPROUT_INTERPOSE -o libsprout-core.so sprout_preload.c -ldl` — with the
+source staged as EXACTLY `/tmp/sprout_preload.c`. The filename is part of
+the contractual identity (`symtab+build-id bake-in` — another name yields
+different bytes for identical code, proven 2026-08-22).
+
+**Control-lane doctrine** alongside: every app-crash hypothesis must first
+run `~/proot-control.sh` — the same binary under raw `proot`. Identical
+crash = app broken (sprout can't fix that); differing = bug against us.
