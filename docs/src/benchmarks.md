@@ -1,5 +1,32 @@
 # Benchmarks
 
+### 2026-08-22 — comprehensive suite (`bench/run-all.sh`)
+
+Full-suite workspace: one command, one `summary.md` + `machine-info.md`
+provenance block (host SKU/kernel/git SHA/artifact md5s). Cells: smoke
+gates → CPU/workload (MODE=full medians) → statics lane → vkmark GPU
+matrix (Turnip hardware + llvmpipe CPU lanes). Result dir:
+`bench/results/comprehensive-20260822-102619/` on the HyperOS 6.12 phone,
+Debian trixie guest vs proot-distro control.
+
+Highlights:
+
+| section | numbers (vs proot) |
+|---|---|
+| CPU `find /usr -type f` | **33.2×** |
+| CPU `git status` / `git log` (50-file repo) | 7.4× / 3.6× |
+| CPU `tar czf /etc` | 7.8× |
+| CPU `bash -c true`, `sh-loop true 500x` | 5.3× / 5.9× |
+| statics notify lane (spawn/open/fstatat/self-exec/dyn) | **13.5–15.4×** |
+| statics ptrace-vs-notify overhead | 1.3–1.7× (the ptrace tax we dodge) |
+| vkmark Turnip (GPU, 1280x720, default PM) | **sprout 5555 vs proot 559 = 9.9×** |
+| vkmark lavapipe (CPU render) | 267 vs 143 = 1.9× |
+
+Reproduce: `DISPLAY=:0 MODE=full bench/run-all.sh [rootfs] [iterations]`.
+GPU cells require a live X display; every cell logs under the result dir
++ a guest vkmark binary on BOTH sides (proot-distro's container needs one
+apt-installed: `proot-distro login debian -- apt install vkmark`).
+
 ### 2026-08-22 — exec-era improvements (post-#2023365/#9e1592a)
 
 Lane gains applied across the board on the HyperOS host, Debian trixie

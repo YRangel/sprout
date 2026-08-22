@@ -279,11 +279,13 @@ Measured on-device, pre-warm cache; `×` = sprout/proot speedup:
 
 | workload | × |
 |---|---|
-| `git status` / `git log` (dwarfs repo) | 4.1–4.6× |
-| `find /usr -type f` | 27.5× |
-| `tar czf` on /usr | 7.1× |
-| statics lane (`run-statics.sh`) | up to 15.3× |
-| spawn-heavy traversal (notify ± ptrace) | ~1.1× (spam-class bound) |
+| `find /usr` (comprehensive suite, 2026-08) | **33.2×** |
+| `tar czf /etc` | 7.8× |
+| `git status` / `git log` | 7.4× / 3.6× |
+| `bash -c true` spawn; `sh true 500x` | 5.3× / 5.9× |
+| statics lane (5 exec/io cells) | 13.5–15.4× |
+| **vkmark Turnip (GPU)** | **9.9×** (5555 vs 559) |
+| vkmark lavapipe (CPU) | 1.9× |
 
 Full tables + methodologies: [docs/src/benchmarks.md](docs/src/benchmarks.md),
 including `bench/run{,-statics,-hyperfine,-alpine,-vkmark}.sh` harnesses.
