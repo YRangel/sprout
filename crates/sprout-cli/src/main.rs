@@ -24,7 +24,8 @@ use sprout_core::{
     version,
     long_version = concat!(env!("CARGO_PKG_VERSION"), "\nCopyright (c) 2026 sprout contributors\nLicense: MIT OR Apache-2.0 (dual).\nGitHub: https://github.com/YRangel/sprout"),
     about,
-    long_about = None
+    long_about = None,
+    after_help = "RULE #1: sprout options go BEFORE the guest command. Separate with -- when needed:\n  sprout -r ROOTFS --user=0:0 -- /bin/sh -c 'ls -la /root'\nEXAMPLES:\n  sprout -r ~/roots/debian --user=0:0 -- /bin/bash\n  sprout -r ~/roots/debian --shared-tmp --termux-x11 --user=0:0 -- startxfce4\n  sprout -r ~/roots/debian -q /usr/bin/box64 -- ./x86_64-app\nPROOT/PROOT-DISTRO COMPAT MAP (old -> sprout):\n  -i, --change-id UID:GROUP -> -u, --user (alias)\n  -0 -> -0/--root-id (native)\n  -L -> obsolete: accepted, ignored (note printed)\n  -k, --kernel-release R -> native\n  -q, --qemu PATH -> native\n  -b, --bind H[:G] -> native\n  -w, --cwd DIR -> native\n  -p/-P/--redirect-ports/--fix-low-ports -> -p/--port-mapping (native)\n  --shared-tmp, --termux-x11, --sysvipc, --ashmem-memfd, --mixed-syscall\n    -> native or acceptance no-op (always-on semantics)\n  --link2symlink -> default ON; --no-link2symlink disables\nUnknown flags fail loudly — they are NEVER silently passed to the guest."
 )]
 struct Cli {
     /// Guest root directory (the "fake chroot").
@@ -102,6 +103,29 @@ struct Cli {
     )]
     user: Option<String>,
 
+    /// proot `-i/--change-id` compat alias: identical contract to `-u/--user`
+    /// (faked uid[:gid]; proot-distro muscle memory).
+    #[arg(
+        short = 'i',
+        long = "change-id",
+        value_name = "USER[:GROUP]",
+        conflicts_with = "user"
+    )]
+    change_id: Option<String>,
+
+    /// proot `-L` compat ACCEPTANCE: proot's `-L` re-pinned dynamic loader
+    /// search paths (obsolete there since years too). sprout's loader chain
+    /// always resolves the guest's real ld.so, so there is nothing to fix —
+    /// the flag parses silently and a one-line note is printed at plan time.
+    #[arg(short = 'L', long = "loader-fix", default_value_t = false)]
+    loader_fix: bool,
+
+    /// proot `--mixed-syscall` compat acceptance: no-op (sprout's preload
+    /// interposer handles glibc wrappers natively; supervisor translation is
+    /// per-tracee anyway). Printed as a note at plan time.
+    #[arg(long = "mixed-syscall", default_value_t = false)]
+    mixed_syscall: bool,
+
     /// Append the host $PREFIX/bin to the guest PATH (default: the clean
     /// guest-only PATH).
     #[arg(long = "host-path")]
@@ -136,11 +160,7 @@ struct Cli {
     verbose: Option<u32>,
 
     /// Command and arguments, guest-spelled.
-    #[arg(
-        value_name = "COMMAND [ARGS...]",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
+    #[arg(value_name = "COMMAND [ARGS...]", trailing_var_arg = true)]
     cmd: Vec<OsString>,
 
     /// proot --kill-on-exit parity: kill launched processes when the
@@ -231,7 +251,13 @@ fn run() -> Result<u8, Error> {
     rootfs.host_home = cli.host_home;
     rootfs.host_path = cli.host_path;
     rootfs.qemu = cli.qemu;
-    if let Some(spec) = &cli.user {
+    if cli.loader_fix {
+        eprintln!("sprout: note: '-L' is obsolete — the guest ld.so is always resolved correctly (accepted for proot compatibility).");
+    }
+    if cli.mixed_syscall {
+        eprintln!("sprout: note: '--mixed-syscall' is a no-op — the preload interposer handles glibc wrappers natively (accepted for proot compatibility).");
+    }
+    if let Some(spec) = cli.user.as_ref().or(cli.change_id.as_ref()) {
         let (uid, gid, name, home, shell) = rootfs.resolve_user(spec)?;
         /* `--user` implies the fake-id machinery at a non-root anchor
          * (proot -i works identically: id-family faked, kernel untouched). */
