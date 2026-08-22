@@ -3761,6 +3761,41 @@ static void sp_stamp_exe(char **env, const char *gabs) {
 #define EM_X86_64  62
 #define EM_AARCH64 183
 
+/* Host-Termux box64 (or qemu-user) is a BIONIC binary: PT_INTERP reads
+ * "/system/bin/linker64". Tell it apart from a guest-glibc emulator —
+ * from then on the env around the wrap is a HOST contract (guest's
+ * glibc-tuned LD_LIBRARY_PATH/LD_PRELOAD are lethal to it). */
+static int sp_elf_interp_bionic(const char *host_abs) {
+    unsigned char eh[64];
+    int f = open(host_abs, O_RDONLY);
+    if (f < 0) return 0;
+    if (read(f, eh, sizeof eh) != 64) { close(f); return 0; }
+    if (eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F') { close(f); return 0; }
+    if (eh[4] != 2 /*ELFCLASS64*/) { close(f); return 0; }
+    unsigned long long phoff = *(unsigned long long *)(eh + 32);
+    unsigned short phentsize = *(unsigned short *)(eh + 54);
+    unsigned short phnum = *(unsigned short *)(eh + 56);
+    if (phnum > 16) phnum = 16;
+    for (int i = 0; i < phnum; i++) {
+        unsigned long long off = phoff + (unsigned long long)i * phentsize;
+        unsigned int p_type, p_offset0, p_filesz;
+        unsigned char ph[56];
+        if (lseek(f, (off_t)off, SEEK_SET) < 0 || read(f, ph, 56) != 56) break;
+        p_type = *(unsigned int *)ph;
+        if (p_type != 3 /*PT_INTERP*/) continue;
+        p_offset0 = *(unsigned int *)(ph + 8); /* offset lo (arm64 ABI little-end) */
+        p_filesz = *(unsigned int *)(ph + 32);
+        if (p_filesz > 220) p_filesz = 220;
+        char in[224];
+        if (lseek(f, (off_t)p_offset0, SEEK_SET) < 0 || read(f, in, p_filesz) != (ssize_t)p_filesz) break;
+        in[p_filesz] = 0;
+        close(f);
+        return strstr(in, "/system/bin/linker") != NULL;
+    }
+    close(f);
+    return 0;
+}
+
 static int sp_execve_chain(const char *path, char *const argv[], char *const envp[], int depth);
 
 static int sp_binfmt_always(void) {
@@ -3840,7 +3875,7 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
     int has_interp = 0;
     int is_elf = sp_elf_meta(host_abs, &e_class, &e_machine, &has_interp);
     if (!is_elf) return 0; /* scripts etc. — ordinary chain */
-
+    int emu_bionic = 0;
     const char *emu = NULL, *libenv = NULL, *libdef = NULL;
     if (e_class == 2 && e_machine == EM_X86_64) {
         emu = getenv("SPROUT_BINFMT_X86_64");
@@ -3880,33 +3915,43 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
                 (unsigned)e_class, (unsigned)e_machine, guest_path);
             return -1;
         }
+        emu_bionic = sp_elf_interp_bionic(ehost);
     }
 
     /* argv: [emu, guest_path, argv[1], argv[2], ... NULL] — guest_path stays
-     * guest-spelled: box64's own open() rides the preload translation. */
+     * guest-spelled: box64's own open() rides the preload translation.
+     * EXCEPT for bionic host emulators: they see the HOST filesystem, so
+     * the target must be HOST-spelled. */
     int ac = 0;
     while (argv[ac]) ac++;
     char **nv = malloc(((size_t)ac + 2) * sizeof(char *));
     if (!nv) { errno = ENOMEM; return -1; }
     nv[0] = (char *)emu;
-    nv[1] = (char *)guest_path;
+    nv[1] = emu_bionic ? (char *)host_abs : (char *)guest_path;
     for (int i = 1; argv[i]; i++) nv[1 + i] = argv[i];
     nv[1 + ac] = NULL;
 
     /* env: append the loader library path default iff absent (copy of the
      * already-chain-merged envp; recursion re-merges our chain vars, that's
-     * cheap and safe). */
+     * cheap and safe). BIONIC emu: LD_PRELOAD + LD_LIBRARY_PATH (guest
+     * glibc spellings) are scrubbed and the x86 libdirs default switches
+     * to ROOTFS-PREFIXED host spellings. */
     int ec = 0;
     while (merged_envp[ec]) ec++;
-    char **nev = malloc(((size_t)ec + 3) * sizeof(char *));
+    char **nev = malloc(((size_t)ec + 5) * sizeof(char *));
     if (!nev) { free(nv); errno = ENOMEM; return -1; }
-    int have_lib = 0, have_pre = 0;
+    int have_lib = 0, have_pre = 0, j = 0;
     size_t le = strlen(libenv);
     for (int i = 0; i < ec; i++) {
-        nev[i] = merged_envp[i];
-        if (!have_lib && strncmp(nev[i], libenv, le) == 0 && nev[i][le] == '=') have_lib = 1;
-        if (!have_pre && strncmp(nev[i], "BOX64_LD_PRELOAD=", 17) == 0) have_pre = 1;
+        if (emu_bionic && (!strncmp(merged_envp[i], "LD_PRELOAD=", 11) ||
+                           !strncmp(merged_envp[i], "LD_LIBRARY_PATH=", 16)))
+            continue;
+        nev[j] = merged_envp[i];
+        if (!have_lib && strncmp(nev[j], libenv, le) == 0 && nev[j][le] == '=') have_lib = 1;
+        if (!have_pre && strncmp(nev[j], "BOX64_LD_PRELOAD=", 17) == 0) have_pre = 1;
+        j++;
     }
+    ec = j;
     /* ADR-0018 sysvipc shim: box64's PLT resolution is the ONLY lane the
      * emulated guest's SysV libc calls traverse — preload interception via
      * BOX64_LD_PRELOAD works for BOTH 64-bit and box32 children. The shim
@@ -3932,7 +3977,7 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
     {
         const char *ebase = strrchr(emu, '/');
         ebase = ebase ? ebase + 1 : emu;
-        if (!getenv("SPROUT_SYSVIPC_EMU_OFF") && sp_host_emu_sysvipc_shim(ebase)
+        if (!emu_bionic && !getenv("SPROUT_SYSVIPC_EMU_OFF") && sp_host_emu_sysvipc_shim(ebase)
             && access("/usr/lib/sprout-sysvipc/arm64/libsprout-sysvipc.so", R_OK) == 0) {
             /* find LD_PRELOAD= entry -> prepend shim path; else add fresh */
             const char *sh = "/usr/lib/sprout-sysvipc/arm64/libsprout-sysvipc.so";
@@ -3965,10 +4010,33 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
         ec++;
     }
     if (!have_lib) {
-        nev[ec] = malloc(le + 1 + strlen(libdef) + 1);
-        if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
-        sprintf(nev[ec], "%s=%s", libenv, libdef);
-        ec++;
+        if (emu_bionic) {
+            /* host-emu needs ROOTFS-PREFIXED host spellings; guest-spelled
+             * ':'-entries would die against bionic's host '/' view. */
+            char hl[SP_PATH_MAX * 2];
+            hl[0] = 0;
+            char d[SP_PATH_MAX];
+            const char *p = libdef, *q;
+            while ((q = strchr(p, ':')) || *p) {
+                size_t nn = q ? (size_t)(q - p) : strlen(p);
+                if (nn && nn < sizeof d) {
+                    snprintf(hl + strlen(hl), sizeof hl - strlen(hl),
+                             "%s%s%.*s", hl[0] ? ":" : "", g_cfg.rootfs,
+                             (int)nn, p);
+                }
+                if (!q) break;
+                p = q + 1;
+            }
+            nev[ec] = malloc(le + 1 + strlen(hl) + 1);
+            if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
+            sprintf(nev[ec], "%s=%s", libenv, hl);
+            ec++;
+        } else {
+            nev[ec] = malloc(le + 1 + strlen(libdef) + 1);
+            if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
+            sprintf(nev[ec], "%s=%s", libenv, libdef);
+            ec++;
+        }
     }
     nev[ec] = NULL;
 

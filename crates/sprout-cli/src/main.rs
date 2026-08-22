@@ -419,6 +419,61 @@ fn run() -> Result<u8, Error> {
                         emu: emu.clone(),
                     });
                 }
+                /* Host-bionic emulator lane (box64/qemu-user installed into
+                 * TERMUX, not the rootfs): the glibc loader-chain plan cannot
+                 * carry a bionic image — bionic's libc.so lookup trips over
+                 * the guest's glibc libdirs injected via LD_LIBRARY_PATH and
+                 * dies with 'invalid ELF header'. Direct-spawn instead with a
+                 * HOST env contract: scrub LD_PRELOAD/LD_LIBRARY_PATH and
+                 * give the arch libdirs in HOST spellings. */
+                if let Ok(GuestClass::Dynamic { interp }) = classify(&emu_host) {
+                    if interp.starts_with("/system/bin/linker") {
+                        let root_host = rootfs.to_host(std::path::Path::new("/"));
+                        let mut cmd_args: Vec<std::ffi::OsString> = Vec::new();
+                        cmd_args.push(sniff_target.clone().into_os_string());
+                        cmd_args.extend(full_cmd.iter().skip(1).cloned());
+                        let mut cmd = std::process::Command::new(&emu_host);
+                        cmd.args(&cmd_args);
+                        /* forward host env minus the glibc rows box64 chokes on */
+                        for (k, v) in std::env::vars_os() {
+                            if k == "LD_PRELOAD" || k == "LD_LIBRARY_PATH" {
+                                continue;
+                            }
+                            cmd.env(&k, &v);
+                        }
+                        if std::env::var_os("BOX64_LD_LIBRARY_PATH").is_none() {
+                            let libs: Vec<std::ffi::OsString> = [
+                                "/usr/lib/x86_64-linux-gnu",
+                                "/lib/x86_64-linux-gnu",
+                                "/usr/x86_64-linux-gnu/lib",
+                            ]
+                            .iter()
+                            .filter_map(|g| {
+                                let h = root_host.join(&g[1..]);
+                                h.is_dir().then(|| h.into_os_string())
+                            })
+                            .collect();
+                            if !libs.is_empty() {
+                                let joined = std::env::join_paths(
+                                    libs.iter()
+                                        .map(std::path::PathBuf::from)
+                                        .collect::<Vec<_>>(),
+                                );
+                                if let Ok(j) = joined {
+                                    cmd.env("BOX64_LD_LIBRARY_PATH", j);
+                                }
+                            }
+                        }
+                        let rc = cmd.status().map_err(|e| {
+                            Error::BadBinding(format!("exec {}: {e}", emu_host.display()))
+                        })?;
+                        return Ok(if rc.success() {
+                            0
+                        } else {
+                            rc.code().unwrap_or(128).clamp(0, 255) as u8
+                        });
+                    }
+                }
                 /* Kernel argv semantics preserved: prepend the emulator to
                  * the ALREADY-resolved argv — [emu, interp?, script?, args]
                  * for scripts, [emu, target, args] for direct ELFs. */
