@@ -1295,9 +1295,9 @@ static int sp_fd_target_guest(pid_t pid, int dfd, const char *rel,
 }
 
 static int sp_fake_proc_cpu_count(void);
-static char g_fakeproc_paths[5][SP_PATH_MAX]; /* 0=/proc/stat 1=loadavg 2=ofuid 3=ofgid 4=version */
+static char g_fakeproc_paths[6][SP_PATH_MAX]; /* 0=/proc/stat 1=loadavg 2=ofuid 3=ofgid 4=version 5=uptime */
 static const char *sp_fakeproc_classic_ensure(int which) {
-    if (which < 1 || which > 5) return NULL;
+    if (which < 1 || which > 6) return NULL;
     if (g_fakeproc_paths[which - 1][0]) return g_fakeproc_paths[which - 1];
     /* compose content */
     char buf[4096];
@@ -1360,6 +1360,11 @@ static const char *sp_fakeproc_classic_ensure(int which) {
         n = snprintf(buf, sizeof(buf),
                      "Linux version %s (sprout-build) (gcc (sprout)) #1 SMP PREEMPT %s\n",
                      un.release, un.machine);
+    } else if (which == 6) {
+        /* /proc/uptime: HyperOS host-blocked too; uptime(1)/sysinfo class. */
+        struct timespec b; double up = 0.0;
+        if (clock_gettime(CLOCK_BOOTTIME, &b) == 0) up = (double)b.tv_sec;
+        n = snprintf(buf, sizeof(buf), "%.2f %.2f\n", up, up);
     } else {
         /* overflowuid / overflowgid */
         n = snprintf(buf, sizeof(buf), "65534\n");
@@ -1612,6 +1617,7 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
                 else if (strcmp(gp, "/proc/sys/kernel/overflowuid") == 0) which = 3;
                 else if (strcmp(gp, "/proc/sys/kernel/overflowgid") == 0) which = 4;
                 else if (strcmp(gp, "/proc/version") == 0) which = 5;
+                else if (strcmp(gp, "/proc/uptime") == 0) which = 6;
                 if (which) {
                     const char *hp = sp_fakeproc_classic_ensure(which);
                     if (hp) {
@@ -1668,9 +1674,49 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
 
 
 /* statx(2): bionic lacks the symbol; the supervisor itself never goes
- * through our interposer, so call the veneer directly. */
+ * through our interposer. NEVER call the raw syscall here: Android kills
+ * statx(291) with SIGSYS for untrusted uids on HyperOS-class kernels and
+ * the victim would be the SUPERVISOR itself. Emulate from newfstatat(262),
+ * which is allowed universally; stx_mask advertises exactly the fields we
+ * populated (STATX_BASIC_STATS minus the unrecoverable btime). */
+#include <sys/sysmacros.h>
+#ifndef gnu_dev_major
+#  ifdef major
+#    define gnu_dev_major(d) ((unsigned)major(d))
+#    define gnu_dev_minor(d) ((unsigned)minor(d))
+#  else
+#    define gnu_dev_major(d) ((unsigned int)((((d) >> 8) & 0xfffU) | (((unsigned int)((d) >> 32)) & ~0xfffU)))
+#    define gnu_dev_minor(d) ((unsigned int)(((d) & 0xffU) | (((unsigned int)((d) >> 12)) & ~0xffU)))
+#  endif
+#endif
 static int sp_statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *buf) {
-    return (int)syscall(291, dirfd, path, flags, mask, buf);
+    (void)mask;
+    struct stat sb;
+    memset(&sb, 0, sizeof sb);
+    if (syscall(262 /*newfstatat*/, dirfd, path, &sb,
+                (flags & AT_SYMLINK_FOLLOW) ? 0 : AT_SYMLINK_NOFOLLOW) < 0)
+        return -1;
+    memset(buf, 0, sizeof *buf);
+    buf->stx_mask = 0x000007ffU & ~0x00000800U;
+    buf->stx_blksize = (unsigned)sb.st_blksize;
+    buf->stx_nlink = (unsigned long long)sb.st_nlink;
+    buf->stx_uid = (unsigned long long)sb.st_uid;
+    buf->stx_gid = (unsigned long long)sb.st_gid;
+    buf->stx_mode = (unsigned short)sb.st_mode;
+    buf->stx_ino = (unsigned long long)sb.st_ino;
+    buf->stx_size = (unsigned long long)sb.st_size;
+    buf->stx_blocks = (unsigned long long)sb.st_blocks;
+    buf->stx_atime.tv_sec = (long long)sb.st_atime;
+    buf->stx_atime.tv_nsec = (unsigned)sb.st_atim.tv_nsec;
+    buf->stx_ctime.tv_sec = (long long)sb.st_ctime;
+    buf->stx_ctime.tv_nsec = (unsigned)sb.st_ctim.tv_nsec;
+    buf->stx_mtime.tv_sec = (long long)sb.st_mtime;
+    buf->stx_mtime.tv_nsec = (unsigned)sb.st_mtim.tv_nsec;
+    buf->stx_dev_major = (unsigned)gnu_dev_major(sb.st_dev);
+    buf->stx_dev_minor = (unsigned)gnu_dev_minor(sb.st_dev);
+    buf->stx_rdev_major = (unsigned)gnu_dev_major(sb.st_rdev);
+    buf->stx_rdev_minor = (unsigned)gnu_dev_minor(sb.st_rdev);
+    return 0;
 }
 
 /* ================= Seccomp user_notify fast path (ADR-0013) =============
@@ -2291,6 +2337,7 @@ static int sp_fake_proc_cpu_count(void) {
 static int sp_fake_proc_serve(unsigned long long id, const char *which,
                               struct seccomp_notif_resp *resp) {
     int is_version = strcmp(which, "/proc/version") == 0;
+    int is_uptime = strcmp(which, "/proc/uptime") == 0;
     int is_stat = strcmp(which, "/proc/stat") == 0;
     int is_overflow = strcmp(which, "/proc/sys/kernel/overflowuid") == 0
                    || strcmp(which, "/proc/sys/kernel/overflowgid") == 0;
@@ -2370,6 +2417,10 @@ static int sp_fake_proc_serve(unsigned long long id, const char *which,
         n = snprintf(buf, sizeof(buf),
                      "Linux version %s (sprout-build) (gcc (sprout)) #1 SMP PREEMPT %s\n",
                      un.release, un.machine);
+    } else if (is_uptime) {
+        struct timespec b; double up = 0.0;
+        if (clock_gettime(CLOCK_BOOTTIME, &b) == 0) up = (double)b.tv_sec;
+        n = snprintf(buf, sizeof(buf), "%.2f %.2f\n", up, up);
     } else { /* /proc/loadavg */
         n = snprintf(buf, sizeof(buf), "0.00 0.00 0.00 1/512 12345\n");
     }
@@ -2481,7 +2532,8 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if ((strcmp(guest, "/proc/stat") == 0 || strcmp(guest, "/proc/loadavg") == 0
              || strcmp(guest, "/proc/sys/kernel/overflowuid") == 0
              || strcmp(guest, "/proc/sys/kernel/overflowgid") == 0
-             || strcmp(guest, "/proc/version") == 0)
+             || strcmp(guest, "/proc/version") == 0
+             || strcmp(guest, "/proc/uptime") == 0)
             && sp_fake_proc_serve(id, guest, resp) == 1) return;
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
         sp_notify_reply_open(id, resp, host, flags, (mode_t)args[3]);

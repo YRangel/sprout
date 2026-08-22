@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -948,6 +949,13 @@ static int sp_fakeproc_fill(const char *guest, char *out, size_t cap) {
     if (!strcmp(guest, "/proc/sys/kernel/overflowuid") ||
         !strcmp(guest, "/proc/sys/kernel/overflowgid"))
         return snprintf(out, cap, "65534\n");
+    if (!strcmp(guest, "/proc/uptime")) {
+        /* HyperOS DENIED on host too (2026-08-22 scan); uptime(1) + glibc's
+         * sysinfo fallback both consume it. Idle time: single-cpu mirror. */
+        struct timespec b; double up = 0.0;
+        if (clock_gettime(CLOCK_BOOTTIME, &b) == 0) up = (double)b.tv_sec;
+        return snprintf(out, cap, "%.2f %.2f\n", up, up);
+    }
     if (!strcmp(guest, "/proc/version")) {
         struct utsname un; memset(&un, 0, sizeof un);
         if (uname(&un) != 0) {
@@ -977,13 +985,14 @@ static int sp_fakeproc_id(const char *guest) {
          : !strcmp(guest, "/proc/sys/kernel/overflowuid") ? 2
          : !strcmp(guest, "/proc/sys/kernel/overflowgid") ? 3
          : !strcmp(guest, "/proc/version") ? 4
+         : !strcmp(guest, "/proc/uptime") ? 5
          : -1;
 }
-static int sp_fakeproc_fds[5] = { -1, -1, -1, -1, -1 };
-static char sp_fakeproc_cache[5][SP_PATH_MAX];
-static int sp_fakeproc_cache_ready[5] = { 0, 0, 0, 0, 0 };
-static const char *sp_fakeproc_basenames[5] = {
-    "stat", "loadavg", "overflowuid", "overflowgid", "version"
+static int sp_fakeproc_fds[6] = { -1, -1, -1, -1, -1, -1 };
+static char sp_fakeproc_cache[6][SP_PATH_MAX];
+static int sp_fakeproc_cache_ready[6] = { 0, 0, 0, 0, 0, 0 };
+static const char *sp_fakeproc_basenames[6] = {
+    "stat", "loadavg", "overflowuid", "overflowgid", "version", "uptime"
 };
 /* Materialize <cache>/fakeproc/<name> with the synthetic content, once per
  * process (with a cheap already-exists skip guided by mtime-once sizing).
@@ -2314,6 +2323,48 @@ int setfsgid(gid_t fsgid) {
     errno = EPERM; return -1;
 }
 
+/* statx(2) EMULATION fallback (proot issue termux/proot#122 owns our lane
+ * too): Android untrusted-app seccomp kills raw 291 with SIGSYS on HyperOS
+ * SDK-36 (host probe dies signal 31, 2026-08-22), so glibc's statx() wrapper
+ * surfaces ENOSYS to guests. Fill the answer from newfstatat(262) = allowed
+ * everywhere. Mask policy: everything in STATX_BASIC_STATS except BTIME
+ * (birth time isn't recoverable via the legacy stat ABI; consumers honor
+ * the mask). stx_mask reflects exactly what WE populated — kernel parity. */
+#ifndef STATX_BASIC_STATS
+#define STATX_BASIC_STATS 0x000007ffU
+#define STATX_BTIME       0x00000800U
+#endif
+static int sp_statx_emulate(int dirfd, const char *path, int flags,
+                            unsigned int mask, struct statx *sx) {
+    (void)mask;
+    struct stat sb;
+    memset(&sb, 0, sizeof sb);
+    int rc = syscall(262 /*newfstatat*/, dirfd, path, &sb,
+                     (flags & AT_SYMLINK_FOLLOW) ? 0 : AT_SYMLINK_NOFOLLOW);
+    if (rc < 0) return -1;
+    memset(sx, 0, sizeof *sx);
+    sx->stx_mask = STATX_BASIC_STATS & ~(unsigned)STATX_BTIME;
+    sx->stx_blksize = (unsigned)sb.st_blksize;
+    sx->stx_nlink = (unsigned long long)sb.st_nlink;
+    sx->stx_uid = (unsigned long long)sb.st_uid;
+    sx->stx_gid = (unsigned long long)sb.st_gid;
+    sx->stx_mode = (unsigned short)sb.st_mode;
+    sx->stx_ino = (unsigned long long)sb.st_ino;
+    sx->stx_size = (unsigned long long)sb.st_size;
+    sx->stx_blocks = (unsigned long long)sb.st_blocks;
+    sx->stx_atime.tv_sec = (long long)sb.st_atime;
+    sx->stx_atime.tv_nsec = (unsigned)sb.st_atim.tv_nsec;
+    sx->stx_ctime.tv_sec = (long long)sb.st_ctime;
+    sx->stx_ctime.tv_nsec = (unsigned)sb.st_ctim.tv_nsec;
+    sx->stx_mtime.tv_sec = (long long)sb.st_mtime;
+    sx->stx_mtime.tv_nsec = (unsigned)sb.st_mtim.tv_nsec;
+    sx->stx_dev_major = (unsigned)gnu_dev_major(sb.st_dev);
+    sx->stx_dev_minor = (unsigned)gnu_dev_minor(sb.st_dev);
+    sx->stx_rdev_major = (unsigned)gnu_dev_major(sb.st_rdev);
+    sx->stx_rdev_minor = (unsigned)gnu_dev_minor(sb.st_rdev);
+    return 0;
+}
+
 int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *buf) {
     static int (*SP_REAL(statx))(int, const char *, int, unsigned int, struct statx *) = NULL;
     SP_RESOLVE(statx);
@@ -2325,6 +2376,11 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
     SP_TRACE("statx", path, p);
     int rc = SP_REAL(statx)(dirfd, p, flags, mask, buf);
     if (rc == 0) { sp_spoof_uid_gid(&buf->stx_uid, &buf->stx_gid); if (sp_hreg_hit(path) && buf->stx_nlink == 1) buf->stx_nlink = 2; }
+    if (rc < 0 && errno == ENOSYS) {
+        /* HyperOS-class kernels: real statx is host-killed; emulate. */
+        rc = sp_statx_emulate(dirfd, p, flags, mask, buf);
+        if (rc == 0) { sp_spoof_uid_gid(&buf->stx_uid, &buf->stx_gid); if (sp_hreg_hit(path) && buf->stx_nlink == 1) buf->stx_nlink = 2; }
+    }
     return rc;
 }
 
