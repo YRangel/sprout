@@ -164,8 +164,17 @@ struct Cli {
     /// unprivileged higher port 1024+port instead. Android denies
     /// CAP_NET_BIND_SERVICE to app uids; proot-distro users needed this
     /// for guest servers to start at all. Rewritten in the preload bind
-    /// wrapper for AF_INET/AF_INET6 only.
-    #[arg(short = 'p', long = "port-mapping", default_value_t = false)]
+    /// wrapper for AF_INET/AF_INET6 only. Aliases mirror proot-distro's
+    /// CLI naming for muscle-memory parity: -P / --redirect-ports /
+    /// --fix-low-ports all map onto this same knob.
+    #[arg(
+        short = 'p',
+        long = "port-mapping",
+        alias = "redirect-ports",
+        visible_alias = "fix-low-ports",
+        short_alias = 'P',
+        default_value_t = false
+    )]
     port_mapping: bool,
 
     /// proot --sysvipc compatibility acceptance flag: sprout's sysvipc
