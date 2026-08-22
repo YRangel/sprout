@@ -715,6 +715,60 @@ static void sp_xcache_put(const char *g, const char *h) {
     }
 }
 
+/* Stale-positive sweep: chase results depend on FILESYSTEM content (ld.so
+ * regenerating .so links, dpkg replacing a binary mid-lifetime) — evict
+ * everything and let the next translate re-chase. Called ONCE per process
+ * from the exec-lane ENOENT retry; cost is the miss it provokes, never the
+ * common path. */
+static void sp_xcache_clear(void) {
+    memset(sp_xcache, 0, sizeof sp_xcache);
+}
+
+/* exec-name memo: sp_guest_path_search walks PATH entries probing each
+ * (translate + access) for EVERY execvp-class call; shells hash commands
+ * for exactly this reason. Key = name + PATH-env fingerprint so a PATH
+ * flip misses safely; positive results only; same stale-positive class as
+ * the translate cache, same cure: sp_exec_caches_clear() on the ENOENT
+ * retry in execve(). */
+#define SP_ECACHE_CAP 64
+struct sp_ecentry { char name[96]; char cand[SP_PATH_MAX]; unsigned long pk; unsigned char used; };
+static struct sp_ecentry sp_ecache[SP_ECACHE_CAP];
+static unsigned long sp_pathver(const char *p) {
+    unsigned long h = 146959810393466560UL; /* FNV-ish */
+    while (*p) h = (h ^ (unsigned char)*p++) * 1099511628211UL;
+    return h;
+}
+static int sp_ecache_get(const char *name, unsigned long pk, char out[SP_PATH_MAX]) {
+    unsigned long i = sp_xhash(name) % SP_ECACHE_CAP;
+    for (int hop = 0; hop < 6; hop++) {
+        struct sp_ecentry *e = &sp_ecache[(i + hop) % SP_ECACHE_CAP];
+        if (!e->used) return 0;
+        if (e->pk == pk && !strcmp(e->name, name)) {
+            strcpy(out, e->cand);
+            return 1;
+        }
+    }
+    return 0;
+}
+static void sp_ecache_put(const char *name, unsigned long pk, const char *cand) {
+    unsigned long i = sp_xhash(name) % SP_ECACHE_CAP;
+    for (int hop = 0; hop < 6; hop++) {
+        struct sp_ecentry *e = &sp_ecache[(i + hop) % SP_ECACHE_CAP];
+        if (!e->used || (e->pk == pk && !strcmp(e->name, name))) {
+            strncpy(e->name, name, sizeof e->name - 1); e->name[sizeof e->name - 1] = 0;
+            strncpy(e->cand, cand, SP_PATH_MAX - 1); e->cand[SP_PATH_MAX - 1] = 0;
+            e->pk = pk;
+            e->used = 1;
+            return;
+        }
+    }
+}
+
+static void sp_exec_caches_clear(void) {
+    sp_xcache_clear();
+    memset(sp_ecache, 0, sizeof sp_ecache);
+}
+
 /* Translate + absolute-symlink chase. Alpine lays every applet out as an
  * absolute symlink to /bin/busybox; the host kernel would resolve those
  * targets on the HOST (missing). Only when the translation moved the path
@@ -3186,6 +3240,8 @@ static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
     const char *def = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
     char buf[4096];
     snprintf(buf, sizeof(buf), "%s", path ? path : def);
+    unsigned long pk = sp_pathver(buf);
+    if (strlen(name) < 96 && sp_ecache_get(name, pk, out)) return 0;
     for (char *dir = strtok(buf, ":"); dir; dir = strtok(NULL, ":")) {
         char cand[SP_PATH_MAX];
         int w = snprintf(cand, sizeof(cand), "%s/%s", *dir ? dir : ".", name);
@@ -3194,6 +3250,7 @@ static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
         const char *hc = sp_translate_x(cand, hostcand);
         if (access(hc, X_OK) == 0) {
             strcpy(out, cand);
+            if (strlen(name) < 96) sp_ecache_put(name, pk, cand);
             return 0;
         }
     }
@@ -4012,11 +4069,15 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
 }
 
 int execve(const char *path, char *const argv[], char *const envp[]) {
-    /* glibc binaries execve() never returns on success; the C interposer
-     * branches into the guest loader chain or hands through for host-auto
-     * cases (only for paths EXPLICITLY excluded from translation? none
-     * today: everything goes through the chain when dynamic). */
-    return sp_execve_chain(path, argv, envp, 0);
+    int rc = sp_execve_chain(path, argv, envp, 0);
+    /* Stale-positive caches: a memoized path/exec-name answer may point at
+     * a binary replaced or removed mid-process (ldconfig rewrite, dpkg
+     * upgrade); evict everything and retry ONCE cold. */
+    if (rc < 0 && errno == ENOENT) {
+        sp_exec_caches_clear();
+        rc = sp_execve_chain(path, argv, envp, 0);
+    }
+    return rc;
 }
 
 /* variadic exec family. glibc implements execl/execlp/execle via INSIDE-libc
@@ -4065,13 +4126,25 @@ int execv(const char *path, char *const argv[]) {
 int execvp(const char *path, char *const argv[]) {
     char cand[SP_PATH_MAX];
     if (sp_guest_path_search(path, cand) != 0) { errno = ENOENT; return -1; }
-    return sp_execve_chain(cand, argv, environ, 0);
+    int rc = sp_execve_chain(cand, argv, environ, 0);
+    if (rc < 0 && errno == ENOENT) {          /* stale memo: cold retry once */
+        sp_exec_caches_clear();
+        if (sp_guest_path_search(path, cand) == 0)
+            rc = sp_execve_chain(cand, argv, environ, 0);
+    }
+    return rc;
 }
 
 int execvpe(const char *path, char *const argv[], char *const envp[]) {
     char cand[SP_PATH_MAX];
     if (sp_guest_path_search(path, cand) != 0) { errno = ENOENT; return -1; }
-    return sp_execve_chain(cand, argv, envp, 0);
+    int rc = sp_execve_chain(cand, argv, envp, 0);
+    if (rc < 0 && errno == ENOENT) {
+        sp_exec_caches_clear();
+        if (sp_guest_path_search(path, cand) == 0)
+            rc = sp_execve_chain(cand, argv, envp, 0);
+    }
+    return rc;
 }
 
 int fexecve(int fd, char *const argv[], char *const envp[]) {
