@@ -53,6 +53,7 @@
 #include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 #include <linux/audit.h>
 #include <linux/stat.h>
@@ -1294,9 +1295,9 @@ static int sp_fd_target_guest(pid_t pid, int dfd, const char *rel,
 }
 
 static int sp_fake_proc_cpu_count(void);
-static char g_fakeproc_paths[4][SP_PATH_MAX]; /* 0=/proc/stat 1=loadavg 2=ofuid 3=ofgid */
+static char g_fakeproc_paths[5][SP_PATH_MAX]; /* 0=/proc/stat 1=loadavg 2=ofuid 3=ofgid 4=version */
 static const char *sp_fakeproc_classic_ensure(int which) {
-    if (which < 1 || which > 4) return NULL;
+    if (which < 1 || which > 5) return NULL;
     if (g_fakeproc_paths[which - 1][0]) return g_fakeproc_paths[which - 1];
     /* compose content */
     char buf[4096];
@@ -1342,6 +1343,23 @@ static const char *sp_fakeproc_classic_ensure(int which) {
     } else if (which == 2) {
         /* /proc/loadavg: real Android /proc/loadavg is UID-locked; synth */;
         n = snprintf(buf, sizeof(buf), "0.00 0.00 0.00 1/512 12345\n");
+    } else if (which == 5) {
+        /* /proc/version: HyperOS makes the HOST file EACCES even for root-swapping
+         * guests (observed 2026-08-22: host head -1 /proc/version EACCES for
+         * untrusted_app on SDK-36) — and LibreOffice oosplash prints
+         * '/proc not mounted - LibreOffice is unlikely to work well if at all'
+         * then falls over (any real crash is the same class). Content must be
+         * READABLE; the canonical shape (Linux version R (builder) (cc) #N
+         * PREEMPT) is all a sane guest parses. */
+        struct utsname un;
+        memset(&un, 0, sizeof un);
+        if (uname(&un) != 0) {
+            snprintf(un.release, sizeof un.release, "unknown");
+            snprintf(un.machine, sizeof un.machine, "aarch64");
+        }
+        n = snprintf(buf, sizeof(buf),
+                     "Linux version %s (sprout-build) (gcc (sprout)) #1 SMP PREEMPT %s\n",
+                     un.release, un.machine);
     } else {
         /* overflowuid / overflowgid */
         n = snprintf(buf, sizeof(buf), "65534\n");
@@ -1593,6 +1611,7 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
                 else if (strcmp(gp, "/proc/loadavg") == 0) which = 2;
                 else if (strcmp(gp, "/proc/sys/kernel/overflowuid") == 0) which = 3;
                 else if (strcmp(gp, "/proc/sys/kernel/overflowgid") == 0) which = 4;
+                else if (strcmp(gp, "/proc/version") == 0) which = 5;
                 if (which) {
                     const char *hp = sp_fakeproc_classic_ensure(which);
                     if (hp) {
@@ -2271,6 +2290,7 @@ static int sp_fake_proc_cpu_count(void) {
 
 static int sp_fake_proc_serve(unsigned long long id, const char *which,
                               struct seccomp_notif_resp *resp) {
+    int is_version = strcmp(which, "/proc/version") == 0;
     int is_stat = strcmp(which, "/proc/stat") == 0;
     int is_overflow = strcmp(which, "/proc/sys/kernel/overflowuid") == 0
                    || strcmp(which, "/proc/sys/kernel/overflowgid") == 0;
@@ -2338,6 +2358,18 @@ static int sp_fake_proc_serve(unsigned long long id, const char *which,
         /* bwrap/pressure-vessel reads these to validate uid range mapping;
          * Android SELinux hides them. 65534 = unmapped-nobody default. */
         n = snprintf(buf, sizeof(buf), "65534\n");
+    } else if (is_version) {
+        /* HyperOS locks host /proc/version even from untrusted uid reads
+         * (SDK-36 measured). Canonical one-liner, guest-parseable. */
+        struct utsname un;
+        memset(&un, 0, sizeof un);
+        if (uname(&un) != 0) {
+            snprintf(un.release, sizeof un.release, "unknown");
+            snprintf(un.machine, sizeof un.machine, "aarch64");
+        }
+        n = snprintf(buf, sizeof(buf),
+                     "Linux version %s (sprout-build) (gcc (sprout)) #1 SMP PREEMPT %s\n",
+                     un.release, un.machine);
     } else { /* /proc/loadavg */
         n = snprintf(buf, sizeof(buf), "0.00 0.00 0.00 1/512 12345\n");
     }
@@ -2448,7 +2480,8 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
         if (g_debug && guest[0] == '/' && guest[1] == 'p') SP_TRACE("[notify] openat56 guest='%s'\n", guest);
         if ((strcmp(guest, "/proc/stat") == 0 || strcmp(guest, "/proc/loadavg") == 0
              || strcmp(guest, "/proc/sys/kernel/overflowuid") == 0
-             || strcmp(guest, "/proc/sys/kernel/overflowgid") == 0)
+             || strcmp(guest, "/proc/sys/kernel/overflowgid") == 0
+             || strcmp(guest, "/proc/version") == 0)
             && sp_fake_proc_serve(id, guest, resp) == 1) return;
         if (!sp_notify_hostpath(pid, guest, host, sizeof host)) { sp_notify_continue(resp); return; }
         sp_notify_reply_open(id, resp, host, flags, (mode_t)args[3]);

@@ -33,7 +33,9 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------------ */
@@ -195,6 +197,10 @@ static void sp_resolve_links(const sp_config_t *cfg, char out[SP_PATH_MAX]) {
     }
 }
 
+#ifdef SPROUT_INTERPOSE
+static const char *sp_fakeproc_host_path(const char *guest); /* defined near open() */
+#endif
+
 /* follow_final: chase the FINAL symlink into its payload (wanted by
  * open/stat/readlink-follow semantics, NOT wanted by the NOFOLLOW family:
  * unlinkat/lstat/rename/lutimes must translate the LINK itself — chasing
@@ -215,6 +221,17 @@ int sp_translate_f(const sp_config_t *cfg, const char *path, char out[SP_PATH_MA
             cfg->rootfs[plen] == '/')
             return 0;
     }
+
+    /* Fake-/proc reroute (HyperOS blocks /proc/version,/proc/stat,/proc/loadavg
+     * and /proc/sys/kernel/overflowu{gid,id} for untrusted uids — oosplash
+     * prints 'ERROR: /proc not mounted' at stat() failure). Rerouting at the
+     * TRANSLATE level covers open/access/stat/readlink/... uniformly for every
+     * preloaded process; statics + notify-only guests keep the supervisor's
+     * ADDFD/scratch serving. */
+#ifdef SPROUT_INTERPOSE
+    {   const char *fp = sp_fakeproc_host_path(path);
+        if (fp) { snprintf(out, SP_PATH_MAX, "%s", fp); return 1; } }
+#endif
 
     /* User binds are MORE SPECIFIC than the pseudo-fs passthrough
      * (/proc,/sys,/dev): consult them FIRST so an explicit /dev/shm or
@@ -916,6 +933,126 @@ static const char *sp_self_exe_guest_path(const char *path) {
     return (e && *e) ? e : NULL;
 }
 
+/* ---- preload-side fake /proc (dynamic-lane answers) --------------------
+ * The supervisor fakes /proc/stat, /proc/loadavg, overflowuid/gid and
+ * /proc/version for STATICS + the notify lane; DYNAMIC guests answered at
+ * PLT by THIS .so used to hit the HOST's EACCES before any fake could
+ * engage (HyperOS SDK-36: /proc/version unreadable for untrusted uids,
+ * measured 2026-08-22; oosplash aborting 'ERROR: /proc not mounted' is
+ * the visible user symptom). Serve those 5 paths from a per-process
+ * memfd instead of a translate: no filesystem footprint, content lives
+ * in RAM, works for any PLT caller. */
+static int sp_fakeproc_fill(const char *guest, char *out, size_t cap) {
+    if (!strcmp(guest, "/proc/loadavg"))
+        return snprintf(out, cap, "0.00 0.00 0.00 1/512 12345\n");
+    if (!strcmp(guest, "/proc/sys/kernel/overflowuid") ||
+        !strcmp(guest, "/proc/sys/kernel/overflowgid"))
+        return snprintf(out, cap, "65534\n");
+    if (!strcmp(guest, "/proc/version")) {
+        struct utsname un; memset(&un, 0, sizeof un);
+        if (uname(&un) != 0) {
+            snprintf(un.release, sizeof un.release, "unknown");
+            snprintf(un.machine, sizeof un.machine, "aarch64");
+        }
+        return snprintf(out, cap,
+            "Linux version %s (sprout-build) (gcc (sprout)) #1 SMP PREEMPT %s\n",
+            un.release, un.machine);
+    }
+    if (!strcmp(guest, "/proc/stat")) {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        unsigned long long tick = (unsigned long long)ts.tv_sec * 100;
+        return snprintf(out, cap,
+            "cpu %llu 0 %llu %llu 0 0 0 0 0 0\n"
+            "intr %llu\nctxt %llu\nbtime %lld\nprocesses %llu\nprocs_running 1\n"
+            "procs_blocked 0\nsoftirq %llu 0 0 0 0 0 0 0 0 0 0\n",
+            tick / 50 + 37, tick / 34 + 51, tick,
+            tick * 4, tick * 12, (long long)(time(NULL) - (long long)ts.tv_sec),
+            tick / 20 + 123, tick * 8);
+    }
+    return -1;
+}
+static int sp_fakeproc_id(const char *guest) {
+    return !strcmp(guest, "/proc/stat") ? 0
+         : !strcmp(guest, "/proc/loadavg") ? 1
+         : !strcmp(guest, "/proc/sys/kernel/overflowuid") ? 2
+         : !strcmp(guest, "/proc/sys/kernel/overflowgid") ? 3
+         : !strcmp(guest, "/proc/version") ? 4
+         : -1;
+}
+static int sp_fakeproc_fds[5] = { -1, -1, -1, -1, -1 };
+static char sp_fakeproc_cache[5][SP_PATH_MAX];
+static int sp_fakeproc_cache_ready[5] = { 0, 0, 0, 0, 0 };
+static const char *sp_fakeproc_basenames[5] = {
+    "stat", "loadavg", "overflowuid", "overflowgid", "version"
+};
+/* Materialize <cache>/fakeproc/<name> with the synthetic content, once per
+ * process (with a cheap already-exists skip guided by mtime-once sizing).
+ * Sits at the translate level so stat/access/open ALL agree. */
+static const char *sp_fakeproc_host_path(const char *guest) {
+    int id = sp_fakeproc_id(guest);
+    if (id < 0) return NULL;
+    if (sp_fakeproc_cache_ready[id]) {
+        if (sp_fakeproc_cache[id][0]) return sp_fakeproc_cache[id];
+        return NULL;
+    }
+    sp_fakeproc_cache_ready[id] = 1;
+    const char *base = getenv("SPROUT_CACHE_DIR");
+    const char *loader = NULL;
+    char dir[SP_PATH_MAX];
+    if (base && base[0]) {
+        snprintf(dir, sizeof dir, "%s/fakeproc", base);
+    } else if ((loader = getenv("SPROUT_LOADER")) && loader[0]) {
+        snprintf(dir, sizeof dir, "%s", loader);
+        char *sl = strrchr(dir, '/');
+        if (!sl) return NULL;
+        *sl = 0;
+        size_t dl = strlen(dir);
+        snprintf(dir + dl, sizeof(dir) - dl, "/fakeproc");
+    } else return NULL;
+    char dst[SP_PATH_MAX];
+    snprintf(dst, sizeof dst, "%s/%s", dir, sp_fakeproc_basenames[id]);
+    if (access(dst, R_OK) == 0) {
+        snprintf(sp_fakeproc_cache[id], SP_PATH_MAX, "%s", dst);
+        return sp_fakeproc_cache[id];
+    }
+    char buf[4096];
+    int n = sp_fakeproc_fill(guest, buf, sizeof buf);
+    if (n <= 0) return NULL;
+    (void)mkdir(dir, 0755);
+    int f = syscall(56 /*openat*/, AT_FDCWD, dst,
+                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (f < 0) return NULL;
+    if (write(f, buf, (size_t)n) != n) { close(f); return NULL; }
+    close(f);
+    (void)chmod(dst, 0644);
+    snprintf(sp_fakeproc_cache[id], SP_PATH_MAX, "%s", dst);
+    return sp_fakeproc_cache[id];
+}
+static int sp_fakeproc_open(const char *guest) {
+    int id = sp_fakeproc_id(guest);
+    if (id < 0) return -1;
+    if (sp_fakeproc_fds[id] >= 0) return sp_fakeproc_fds[id];
+    char buf[4096];
+    int n = sp_fakeproc_fill(guest, buf, sizeof buf);
+    if (n <= 0) return -1;
+#ifdef SYS_memfd_create
+    int f = (int)syscall(SYS_memfd_create, "sp-fakeproc", 0);
+#else
+    int f = (int)syscall(279, "sp-fakeproc", 0); /* aarch64 */
+#endif
+    if (f < 0) return -1;
+    if (write(f, buf, (size_t)n) != n || lseek(f, 0, SEEK_SET) < 0) { close(f); return -1; }
+    return (sp_fakeproc_fds[id] = f);
+}
+/* mode contract for whats below: fake content is world-readable only */
+static int sp_fakeproc_access(const char *guest, int mode) {
+    if (sp_fakeproc_id(guest) < 0) return -1; /* not ours */
+    if (mode == 0 || (mode & ~(R_OK)) == 0) return 0;
+    errno = EACCES;
+    return 1; /* answered (denied) */
+}
+/* ---------------------------------------------------------------------- */
+
 int open(const char *path, int flags, ...) {
     static int (*SP_REAL(open))(const char *, int, ...) = NULL;
     SP_RESOLVE(open);
@@ -925,6 +1062,7 @@ int open(const char *path, int flags, ...) {
         mode = va_arg(ap, mode_t); va_end(ap);
     }
     { int af = sp_auxv_match(path); if (af >= 0) return af; }
+    { int ff = sp_fakeproc_open(path); if (ff >= 0) return ff; }
     char eb[SP_PATH_MAX];
     { const char *g = sp_self_exe_guest_path(path);
       if (g) { snprintf(eb, sizeof(eb), "%s", g); path = eb; } }
@@ -943,6 +1081,7 @@ int open64(const char *path, int flags, ...) {
         mode = va_arg(ap, mode_t); va_end(ap);
     }
     { int af = sp_auxv_match(path); if (af >= 0) return af; }
+    { int ff = sp_fakeproc_open(path); if (ff >= 0) return ff; }
     char eb[SP_PATH_MAX];
     { const char *g = sp_self_exe_guest_path(path);
       if (g) { snprintf(eb, sizeof(eb), "%s", g); path = eb; } }
@@ -967,6 +1106,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
     if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(openat)(dirfd, path, flags, mode);
     if (dirfd == -100) { int af = sp_auxv_match(path); if (af >= 0) return af; }
+    if (dirfd == -100) { int ff = sp_fakeproc_open(path); if (ff >= 0) return ff; }
     char eb[SP_PATH_MAX];
     { const char *g = sp_self_exe_guest_path(path);
       if (g && dirfd == -100) { snprintf(eb, sizeof(eb), "%s", g); path = eb; } }
@@ -988,6 +1128,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     if (dirfd != -100 /*AT_FDCWD*/ && path[0] != '/')
         return SP_REAL(openat64)(dirfd, path, flags, mode);
     if (dirfd == -100) { int af = sp_auxv_match(path); if (af >= 0) return af; }
+    if (dirfd == -100) { int ff = sp_fakeproc_open(path); if (ff >= 0) return ff; }
     char eb[SP_PATH_MAX];
     { const char *g = sp_self_exe_guest_path(path);
       if (g && dirfd == -100) { snprintf(eb, sizeof(eb), "%s", g); path = eb; } }
@@ -1051,6 +1192,8 @@ static int sp_emulate_access_impl(int dirfd, const char *path, int mode, int fla
 }
 
 int access(const char *path, int mode) {
+    int ffa = sp_fakeproc_access(path, mode);
+    if (ffa >= 0) return ffa; /* 0=ok; denied came with errno set */
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("access", path, p);
@@ -1058,6 +1201,8 @@ int access(const char *path, int mode) {
 }
 
 int eaccess(const char *path, int mode) {
+    int ffa = sp_fakeproc_access(path, mode);
+    if (ffa >= 0) return ffa;
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("eaccess", path, p);
@@ -1065,6 +1210,10 @@ int eaccess(const char *path, int mode) {
 }
 
 int faccessat(int dirfd, const char *path, int mode, int flags) {
+    if (dirfd == -100 || path[0] == '/') {
+        int ffa = sp_fakeproc_access(path, mode);
+        if (ffa >= 0) return ffa;
+    }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("faccessat", path, p);
@@ -1085,6 +1234,7 @@ int __open64_nocancel(const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags);
         mode = va_arg(ap, mode_t); va_end(ap);
     }
+    { int ff = sp_fakeproc_open(path); if (ff >= 0) return ff; }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("__open64_nocancel", path, p);
@@ -1100,6 +1250,7 @@ int __openat64_nocancel(int dirfd, const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags);
         mode = va_arg(ap, mode_t); va_end(ap);
     }
+    if (dirfd == -100) { int ff = sp_fakeproc_open(path); if (ff >= 0) return ff; }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("__openat64_nocancel", path, p);
@@ -2126,6 +2277,10 @@ int __openat64(int dirfd, const char *path, int flags, ...) {
 }
 
 int faccessat2(int dirfd, const char *path, int mode, int flags) {
+    if (dirfd == -100 || path[0] == '/') {
+        int ffa = sp_fakeproc_access(path, mode);
+        if (ffa >= 0) return ffa;
+    }
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("faccessat2", path, p);
