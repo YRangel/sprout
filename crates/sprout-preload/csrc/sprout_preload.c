@@ -117,8 +117,8 @@ void sp_config_load(sp_config_t *cfg) {
          * identity bind on a pseudo-fs root (/proc,/sys,/dev) the translated
          * host string is IDENTICAL to the guest string — but on the
          * notify lane a bind hit takes the ADDFD path: the SUPERVISOR
-         * opens the target, so /proc/self/* resolves to the SUPERVISOR's
-         * own process state and the tracee (whose preload reads its own
+         * opens the target, so /proc/self/ entries resolve to the
+         * SUPERVISOR's own process state and the tracee (whose preload reads its own
          * /proc/self/maps + auxv during init) dies of self-confusion
          * (SIGSEGV, zero diagnostic output). The passthrough+CONT lane is
          * what /proc must ride; an identity bind adds nothing anyway —
@@ -164,8 +164,8 @@ static int path_within(const char *prefix, size_t plen, const char *path) {
 #include <sys/syscall.h>
 
 /* Resolve a translated path's symlink chain INSIDE the rootfs so that
- * guest-spelled absolute targets (distro /etc/alternatives/*, proot-distro
- * "/.l2s/.l2s.*" links) do not leak to the host root when the kernel
+ * guest-spelled absolute targets (distro /etc/alternatives links, proot-
+ * distro "/.l2s/.l2s.*" stubs) do not leak to the host root when the kernel
  * follows them. Host-spelled targets (already rootfs-prefixed, e.g.
  * proot-distro's '$B/.l2s/...' spellings) are adopted verbatim.
  * Raw syscalls only — the interposed wrappers would recurse. */
