@@ -25,8 +25,10 @@ current build (`./install.sh --verify`).
 ## Emulation / x86
 
 **Can I run x86_64 apps?**
-Yes — box64 inside the guest: `apt install box64`, then
-`sprout -r R -q /usr/bin/box64 -- ./x86-app`. Host (Termux) box64/qemu-user
+Yes — box64 inside the guest: install/build box64 anywhere under the default
+lookup path (`/usr/local/bin/box64` in the rootfs) and plain
+`sprout -r R -- ./x86-app` auto-wraps, no flags. `-q PATH` (or
+`SPROUT_BINFMT_X86_64`) overrides the emulator path explicitly. Host (Termux) box64/qemu-user
 works too, sprout detects the bionic emulator and direct-spawns it —
 but Android blocks `set_robust_list` for host-bionic children and the
 guest `ld-linux` path is invisible to it, so static x86 + fresh-dynamic
