@@ -24,6 +24,8 @@ All notable changes to sprout, grouped by release version. The four-eyes rule: a
 
 ### Added
 
+- **`sprout upkg TARBALL [-C DIR]` subcommand** (CLI peeked before clap, ADR-0022): in-Rust tar.gz/xz/bz2/plain extractor with SELinux-aware write-time policy — hardlinks replicated as full-content copies (never libc `link()`), setuid/setgid stripped, device/fifo skipped with warning, `..`/absolute paths rejected. Closes the proot `--link2symlink tar -xJf rootfs.tar.xz` bootstrap gap: `sprout upkg rootfs.tar.xz -C ~/myrootfs && sprout -r ~/myrootfs -- bash` boots directly on the result. Real-world probe: 90 MiB debian rootfs → 12.5k files in ~8s. `sprout upkg --help` prints the policy card.
+
 - **`-q/--qemu` accepts HOST-installed bionic emulators** (box64/qemu-user in TERMUX, not just guest-side): the launcher detects `PT_INTERP='/system/bin/linker*'` on the resolved emulator path and DIRECT-SPAWNS it — previously the glibc loader chain force-fed the guest glibc into the bionic image and box64 died at birth with `invalid ELF header`. Child-exec lane: preload's binfmt wrap scrubbed the chain-injected `LD_PRELOAD`/`LD_LIBRARY_PATH`, passes HOST-spelled targets + libdir defaults, and skips the arm64 sysvipc shim-inject. Guest-glibc emulators keep the old contract. Verified E2E: dynamic x86_64 hello prints "hx86-ok" rc=0 via guest box64 wrap; the HOST bionic lane runs (limits documented in the commit: static x86 dies on Android's set_robust_list block, dynamic needs guest-visible ld-linux).
 
 ### Known / app-broken (verified against proot control lane, identical crash there)
