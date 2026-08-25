@@ -33,7 +33,7 @@ jobs:
       - run: mdbook build docs
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/book
+          path: docs/book/html
 
   deploy:
     needs: build
