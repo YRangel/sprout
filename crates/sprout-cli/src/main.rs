@@ -981,6 +981,9 @@ fn upkg_main(args: &[OsString]) -> anyhow::Result<()> {
             i += 1;
             let d = args.get(i).ok_or_else(|| anyhow!("-C needs a directory"))?;
             dest = PathBuf::from(d);
+        } else if a == "-h" || a == "--help" {
+            println!("sprout upkg — extract a rootfs tarball without proot\n\nUSAGE:\n    sprout upkg TARBALL [-C DIR]\n\nARGS:\n    TARBALL    .tar / .tar.gz / .tgz / .tar.xz / .txz / .tar.bz2 / .tbz2\n    -C DIR     destination directory (default: current dir)\n\nSELinux-aware policy at write time:\n  * hardlinks materialized as full-content copies (never libc link())\n  * setuid/setgid bits dropped from stored permissions\n  * device nodes / fifos skipped with a count warning\n  * absolute paths and `..` entries rejected\n\nExample (proot '--link2symlink tar -xJf …' parity):\n    sprout upkg rootfs.tar.xz -C ~/myrootfs\n    sprout -r ~/myrootfs -- bash");
+            return Ok(());
         } else if tarball.is_none() {
             tarball = Some(PathBuf::from(a));
         } else {

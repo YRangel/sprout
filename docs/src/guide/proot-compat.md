@@ -24,6 +24,7 @@ is a no-op. The table is sorted by how `proot-distro login` uses flags.
 | `--mixed-mode` | `--fallback=auto` | ✅ v0.3 (semantics satisfied) |
 | `--root-id` | `-0` | alias |
 | `--verbose <n>` | `-v` / `--verbose` | sprout is less chattery by design |
+| *(no proot equivalent)* | **`sprout upkg TARBALL [-C DIR]`** | host-mode rootfs bootstrap (aka proot `--link2symlink tar -xJf …`). In-Rust extractor with SELinux-aware policy: hardlinks replicated as full-content copies, setuid/setgid dropped, dev/fifo skipped, `..` / absolute path traversal rejected. See ADR-0022. |
 | `-v <n>` | `-v <n>` | ✅ levels accepted (reserved >1) |
 | `-V` | `-V` | ✅ banner + copyright/license/contact |
 | `-h` | `-h` | ✅ auto-clap usage |

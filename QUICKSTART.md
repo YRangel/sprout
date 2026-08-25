@@ -37,6 +37,22 @@ sprout -r $B ./static-binary; echo $?              # exit codes pass through
 Debug the launch without running: `--dry-run`. Trace: `-v`.
 Force supervisor: `--fallback ptrace` (for testing).
 
+## Unpack a downloaded rootfs (proot `--link2symlink tar` parity)
+
+Rootless, no proot required — sprout's `upkg` subcommand extracts any
+tar.gz / tar.xz / tar.bz2 / plain tar with SELinux repair (hardlinks
+materialized as full-content copies, setuid/setgid stripped, device nodes
+skipped with a count):
+
+
+curl -LO https://example.org/distro/aarch64/rootfs.tar.xz
+sprout upkg rootfs.tar.xz -C ~/myrootfs
+sprout -r ~/myrootfs --user=0:0 -- bash    # boots immediately
+
+
+Tested: fresh 90 MiB debian rootfs extracts in ~8s on Termux device and
+boots without further fixup.
+
 ## Packages work inside guests
 
 The apt / apk cycle (download, verification via sqv, unpack, post-install
@@ -48,6 +64,8 @@ sprout -r $B -0 --link2symlink /usr/bin/apt-get install -y nodejs
 sprout -r $A /sbin/apk add nodejs
 sprout -r $B /usr/bin/curl -fsSL -o /tmp/x https://example.com/file
 ```
+
+Need to build the rootfs from a tarball first? `sprout upkg` handles it.
 
 Verified: cowsay run, node--binaries execute, Go run, static / musl /
 Go-static / Go-dynamic binaries, X11 (termux-x11) handshake, cloudflared

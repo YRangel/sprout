@@ -57,6 +57,27 @@ cargo build --release --workspace   # produces sprout + supervisor + stub (glibc
                                     # GitHub release (sha256-verified) when absent locally
 ```
 
+## Bootstrapping a rootfs from a release tarball (proot `--link2symlink tar` parity)
+
+Users coming from `proot-distro` often recall `proot --link2symlink tar -xJf
+rootfs.tar.xz`. sprout ships the equivalent as the **`upkg`** subcommand — no
+guest required:
+
+```sh
+sprout upkg rootfs.tar.xz -C ~/myrootfs
+sprout -r ~/myrootfs -- bash        # boots immediately
+```
+
+Policy at write-time: hardlinks are replicated as full-content copies
+(never libc `link()` — SELinux denies them cross-mount), setuid/setgid bits
+dropped, device/fifo nodes skipped with a count warning, path traversal
+rejected. Supported compressions: `.tar` / `.tar.gz` / `.tgz` / `.tar.xz`
+/ `.txz` / `.tar.bz2` / `.tbz2` (auto-detected by magic bytes).
+
+> Low-effort alternative: `pkg install proot && proot --link2symlink
+> tar -xJf rootfs.tar.xz`, then move the rootfs in. Equivalent output;
+> `upkg` exists so you don't need proot.
+
 If you want the interposer built *from your tree* (e.g. hacking on
 `csrc/sprout_preload.c`), build it inside a glibc guest (proot-distro works):
 

@@ -111,6 +111,14 @@ that code was already wrong under proot too.
 
 ## Installation / upgrades
 
+**How do I unpack a rootfs tarball without proot?**
+Use `sprout upkg TARBALL -C DIR` — the in-Rust extractor ships with
+sprout. proot's `--link2symlink tar -xJf …` recipe becomes
+`sprout upkg rootfs.tar.xz -C ~/myrootfs && sprout -r ~/myrootfs -- bash`.
+Hardlinks materialize as content copies (SELinux denies `link()` cross-mount);
+no guest programs needed at unpack time. Details: ADR-0022 and
+guide/installation.md.
+
 **How to verify a dev `.so` build matches the deployed one?**
 Rebuild in-guest with the canonical recipe and compare md5s. ⚠ the source
 file must carry the SAME filename (`/tmp/sprout_preload.c`): gcc bakes
