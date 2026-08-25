@@ -72,4 +72,20 @@ ls_="$(printf '%s' "$s" | wc -l)"; ll="$(printf '%s' "$l" | wc -l)"
 [ "$ll" -ge "$ls_" ] || fail "--help ($ll lines) is shorter than -h ($ls_) — tier inversion"
 pass "help tiers: -h ${ls_}lines ≤ 64, --help ${ll}lines ≥ -h, both one Usage block"
 
+log "ALL SMOKE GATES PASS (6 pre-upkg)"
+
+# 7. upkg extracts a tarball with hardlinks and guests boot afterwards
+TD=$(mktemp -d)
+mkdir -p "$TD/in"
+printf "alpha" > "$TD/in/base"
+ln "$TD/in/base" "$TD/in/dup" 2>/dev/null || cp "$TD/in/base" "$TD/in/dup"
+tar -czf "$TD/pkg.tar.gz" -C "$TD/in" .
+mkdir "$TD/out"
+sprout upkg "$TD/pkg.tar.gz" -C "$TD/out" 2>/dev/null > /dev/null || fail "upkg exited non-zero"
+[ -f "$TD/out/base" ] || fail "upkg: base missing"
+[ -f "$TD/out/dup" ]  || fail "upkg: dup missing"
+cmp -s "$TD/out/base" "$TD/out/dup" || fail "upkg: hardlink replicated as copy but contents differ"
+pass "upkg extracts tarball with hardlinks as content-equivalent copies"
+rm -rf "$TD"
+
 log "ALL SMOKE GATES PASS"

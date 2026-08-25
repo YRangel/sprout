@@ -41,6 +41,7 @@
 - [0019: proot runtime-flag parity (-k/-p/-v/-V/-h/--kill-on-exit/--sysvipc/--ashmem-memfd)](./adr/0019-proot-runtime-flag-parity.md)
 - [0020: sysv-shm emulation via the libandroid-shmem protocol (MIT-SHM/llvmpipe fix)](./adr/0020-sysv-shm-libandroid-shmem-protocol.md)
 - [0021: FEX-Emu SysV IPC via in-source shim](./adr/0021-fex-sysvipc-in-source-shim.md)
+- [0022: sprout upkg — in-Rust SELinux-aware tar extractor](./adr/0022-upkg-subcommand-selinux-extract.md)
 
 # Operations
 

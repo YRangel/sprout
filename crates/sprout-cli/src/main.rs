@@ -6,6 +6,7 @@
 //! (see docs/src/adr/).
 
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -33,7 +34,7 @@ use sprout_core::{
     // per-block, not per-terminal-guess. 100 < real width still wraps big
     // phones fine and matches the long --qemu/--kill-on-exit strings below.
     max_term_width = 100,
-    after_help = "RULE #1: sprout options go BEFORE the guest command. Separate with -- when needed:\n  sprout -r ROOTFS --user=0:0 -- /bin/sh -c 'ls -la /root'\nEXAMPLES:\n  sprout -r ~/roots/debian --user=0:0 -- /bin/bash\n  sprout -r ~/roots/debian --shared-tmp --termux-x11 --user=0:0 -- startxfce4\n  sprout -r ~/roots/debian -- ./x86_64-app       (box64 auto-detected; -q /path/to/box64 overrides)\nPROOT COMPAT: -i/--change-id, -0/--root-id, -L, -k/--kernel-release, -q/--qemu,\n  -b/--bind, -w/--cwd, -p/-P/--redirect-ports/--fix-low-ports (--port-mapping),\n  --shared-tmp, --termux-x11, --sysvipc, --ashmem-memfd, --mixed-syscall (no-ops),\n  --link2symlink/--no-link2symlink.\nUnknown flags fail loudly — NEVER silently passed to the guest."
+    after_help = "RULE #1: sprout options go BEFORE the guest command. Separate with -- when needed:\n  sprout -r ROOTFS --user=0:0 -- /bin/sh -c 'ls -la /root'\nEXAMPLES:\n  sprout -r ~/roots/debian --user=0:0 -- /bin/bash\n  sprout -r ~/roots/debian --shared-tmp --termux-x11 --user=0:0 -- startxfce4\n  sprout -r ~/roots/debian -- ./x86_64-app       (box64 auto-detected; -q /path/to/box64 overrides)\n  sprout upkg rootfs.tar.xz -C ~/myrootfs      (proot --link2symlink tar-equivalent)\nPROOT COMPAT: -i/--change-id, -0/--root-id, -L, -k/--kernel-release, -q/--qemu,\n  -b/--bind, -w/--cwd, -p/-P/--redirect-ports/--fix-low-ports (--port-mapping),\n  --shared-tmp, --termux-x11, --sysvipc, --ashmem-memfd, --mixed-syscall (no-ops),\n  --link2symlink/--no-link2symlink.\nUnknown flags fail loudly — NEVER silently passed to the guest."
 )]
 struct Cli {
     /// Guest root directory (the "fake chroot"). Required.
@@ -935,6 +936,20 @@ fn parse_shebang(host_path: &std::path::Path) -> Option<(String, Option<String>)
 }
 
 fn main() -> ExitCode {
+    /* `sprout upkg TARBALL [-C DIR]` — in-Rust SELinux-aware extractor.
+     * Peeks argv[1] before clap: proot-flag surface untouched. */
+    {
+        let args: Vec<OsString> = std::env::args_os().collect();
+        if args.len() >= 2 && args[1] == "upkg" {
+            return match upkg_main(&args[2..]) {
+                Ok(()) => ExitCode::from(0),
+                Err(e) => {
+                    eprintln!("sprout upkg: {e:#}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+    }
     match run() {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
@@ -942,4 +957,162 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/* SELinux-aware tar extract. Live rules:
+ *   - HardLink entries replicated as full copies (never libc link(): FS denies
+ *     cross-mount hardlinks; this is proot `--link2symlink` semantic parity)
+ *   - CharDev/BlockDev/Fifo: skipped with a warn (unfixable rootless)
+ *   - setuid/setgid bits are dropped from stored permissions
+ *   - absolute paths and `..` are rejected
+ */
+fn upkg_main(args: &[OsString]) -> anyhow::Result<()> {
+    use anyhow::{anyhow, bail, Context};
+    use std::fs;
+    use std::io::{BufReader, Read};
+    use std::path::{Component, PathBuf};
+
+    let mut tarball: Option<PathBuf> = None;
+    let mut dest: PathBuf = PathBuf::from(".");
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "-C" {
+            i += 1;
+            let d = args.get(i).ok_or_else(|| anyhow!("-C needs a directory"))?;
+            dest = PathBuf::from(d);
+        } else if tarball.is_none() {
+            tarball = Some(PathBuf::from(a));
+        } else {
+            bail!("unexpected extra argument: {:?}", a);
+        }
+        i += 1;
+    }
+    let tarball = tarball.ok_or_else(|| anyhow!("usage: sprout upkg TARBALL [-C DIR]"))?;
+    fs::create_dir_all(&dest).with_context(|| format!("create {}", dest.display()))?;
+
+    /* Compression auto-detect from magic bytes (xz/gz/bz2/none). */
+    let f = fs::File::open(&tarball).with_context(|| format!("open {}", tarball.display()))?;
+    let mut magic_buf = [0u8; 6];
+    let n = (&f).take(6).read(&mut magic_buf)?;
+    drop(f);
+    let f = fs::File::open(&tarball)?;
+    let br = BufReader::new(f);
+    enum D {
+        Plain(BufReader<fs::File>),
+        Gz(flate2::read::GzDecoder<BufReader<fs::File>>),
+        Xz(xz2::read::XzDecoder<BufReader<fs::File>>),
+        Bz2(bzip2::read::BzDecoder<BufReader<fs::File>>),
+    }
+    impl Read for D {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            match self {
+                D::Plain(r) => r.read(b),
+                D::Gz(r) => r.read(b),
+                D::Xz(r) => r.read(b),
+                D::Bz2(r) => r.read(b),
+            }
+        }
+    }
+    let _ = n;
+    let reader: Box<dyn Read> =
+        if magic_buf.starts_with(&[0xef, 0x1f, 0x8b]) || magic_buf.starts_with(&[0x1f, 0x8b]) {
+            Box::new(D::Gz(flate2::read::GzDecoder::new(br)))
+        } else if magic_buf.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+            Box::new(D::Xz(xz2::read::XzDecoder::new(br)))
+        } else if magic_buf.starts_with(b"BZh") {
+            Box::new(D::Bz2(bzip2::read::BzDecoder::new(br)))
+        } else {
+            Box::new(D::Plain(br))
+        };
+
+    let mut ar = tar::Archive::new(reader);
+    ar.set_preserve_permissions(true);
+    ar.set_unpack_xattrs(false);
+
+    /* hardlink→copy replication: map from archive-path → extracted-path. */
+    let mut extracted: std::collections::HashMap<PathBuf, PathBuf> =
+        std::collections::HashMap::new();
+    let mut skipped_special = 0usize;
+    let mut written = 0usize;
+
+    for ent in ar.entries()? {
+        let mut ent = ent?;
+        let path = ent.path()?.into_owned();
+        /* path sanity: no absolutes, no `..` escapes */
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+        {
+            eprintln!("sprout upkg: skipping unsafe path {:?}", path);
+            continue;
+        }
+        let target = dest.join(&path);
+        use tar::EntryType;
+        match ent.header().entry_type() {
+            EntryType::Regular => {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                /* umask 077 (Termux-app) strips group/other bits on unpack;
+                 * re-apply the tar-declared mode minus setuid/setgid. */
+                let mode_from_hdr = ent.header().mode().ok().map(|m| m & !0o6000);
+                ent.unpack(&target)?;
+                if let Some(m) = mode_from_hdr {
+                    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(m));
+                }
+                extracted.insert(path.clone(), target.clone());
+                written += 1;
+            }
+            EntryType::Link => {
+                /* HARDLINK — copy content from already-written target */
+                let linkname = ent
+                    .link_name()?
+                    .ok_or_else(|| anyhow!("hardlink without target in {:?}", path))?
+                    .into_owned();
+                let source = extracted.get(&linkname).cloned().ok_or_else(|| {
+                    anyhow!("hardlink {:?} references missing {:?}", path, linkname)
+                })?;
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&source, &target)
+                    .with_context(|| format!("copy {:?} → {:?}", source, target))?;
+                extracted.insert(path.clone(), target.clone());
+                written += 1;
+            }
+            EntryType::Symlink => {
+                let ln = ent
+                    .link_name()?
+                    .ok_or_else(|| anyhow!("symlink without target in {:?}", path))?
+                    .into_owned();
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let _ = fs::remove_file(&target);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&ln, &target)?;
+            }
+            EntryType::Directory => {
+                fs::create_dir_all(&target)?;
+            }
+            EntryType::Fifo | EntryType::Char | EntryType::Block => {
+                skipped_special += 1;
+            }
+            _ => { /* pax extensions, GNU longname etc — handled by crate */ }
+        }
+    }
+    if skipped_special > 0 {
+        eprintln!(
+            "sprout upkg: skipped {} device/fifo entries (rootless constraint)",
+            skipped_special
+        );
+    }
+    eprintln!(
+        "sprout upkg: ok — {} files into {} (hardlinks replicated as copies)",
+        written,
+        dest.display()
+    );
+    Ok(())
 }
