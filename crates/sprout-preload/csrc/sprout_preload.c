@@ -2358,10 +2358,13 @@ static int sp_statx_emulate(int dirfd, const char *path, int flags,
     sx->stx_ctime.tv_nsec = (unsigned)sb.st_ctim.tv_nsec;
     sx->stx_mtime.tv_sec = (long long)sb.st_mtime;
     sx->stx_mtime.tv_nsec = (unsigned)sb.st_mtim.tv_nsec;
-    sx->stx_dev_major = (unsigned)gnu_dev_major(sb.st_dev);
-    sx->stx_dev_minor = (unsigned)gnu_dev_minor(sb.st_dev);
-    sx->stx_rdev_major = (unsigned)gnu_dev_major(sb.st_rdev);
-    sx->stx_rdev_minor = (unsigned)gnu_dev_minor(sb.st_rdev);
+    /* musl's <sys/sysmacros.h> declares major()/minor()/makedev() only;
+     * gnu_dev_major/gnu_dev_minor are glibc-only spellings. major/minor are
+     * the portable form and resolve identically on glibc. */
+    sx->stx_dev_major = (unsigned)major(sb.st_dev);
+    sx->stx_dev_minor = (unsigned)minor(sb.st_dev);
+    sx->stx_rdev_major = (unsigned)major(sb.st_rdev);
+    sx->stx_rdev_minor = (unsigned)minor(sb.st_rdev);
     return 0;
 }
 
