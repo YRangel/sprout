@@ -2819,6 +2819,36 @@ static void sv_ashmem_fstat_fixup(int fd, off_t *size_out) {
 }
 
 #include <netinet/in.h>
+/* Guest-visible port truth for -p: when bind() remaps port P (<1024) to the
+ * kernel-reachable 1024+P, record (fd -> P) so getsockname/getpeername can
+ * answer what the guest ASKED for, not what the kernel HAD to do. Only
+ * listened sockets matter to callers (sshd, avahi, lighttpd's own log);
+ * connect/sendto stay untouched, so we don't remap those answers either. */
+#define SP_PMAP_MAX 256
+static struct { int fd; uint16_t orig; } sp_pmap[SP_PMAP_MAX];
+static void sp_pmap_remember(int fd, uint16_t orig) {
+    if (fd < 0 || !orig) return;
+    /* steal the first free slot; if full, overwrite fd 0 slot (fd 0 is
+     * never a listening socket in practice, cheap victim). */
+    int slot = 0;
+    for (int i = 0; i < SP_PMAP_MAX; i++) {
+        if (sp_pmap[i].fd < 0) { slot = i; goto found; }
+        if (sp_pmap[i].fd == fd) { slot = i; goto found; }
+    }
+    slot = 0;
+found:
+    sp_pmap[slot].fd = fd;
+    sp_pmap[slot].orig = orig;
+}
+static uint16_t sp_pmap_lookup(int fd) {
+    for (int i = 0; i < SP_PMAP_MAX; i++)
+        if (sp_pmap[i].fd == fd) return sp_pmap[i].orig;
+    return 0;
+}
+static void sp_pmap_forget(int fd) {
+    for (int i = 0; i < SP_PMAP_MAX; i++)
+        if (sp_pmap[i].fd == fd) sp_pmap[i].fd = -1;
+}
 int bind(int fd, const struct sockaddr *addr, socklen_t len) {
     static int (*SP_REAL(bind))(int, const struct sockaddr *, socklen_t) = NULL;
     SP_RESOLVE(bind);
@@ -2835,23 +2865,33 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len) {
     static int pmap = -1;
     if (pmap < 0) pmap = getenv("SPROUT_PORTMAP") ? 1 : 0;
     if (pmap && addr) {
+        static int pbase = -1;
+        if (pbase < 0) {
+            const char *b = getenv("SPROUT_PORTMAP_BASE");
+            pbase = (b && *b) ? atoi(b) : 1024;
+            if (pbase <= 1024) pbase = 1024; /* sanitize */
+        }
         if (addr->sa_family == AF_INET) {
             struct sockaddr_in in4;
             memcpy(&in4, addr, sizeof(in4));
             unsigned port = ntohs(in4.sin_port);
             if (port > 0 && port < 1024) {
-                in4.sin_port = htons((uint16_t)(1024 + port));
-                return SP_REAL(bind)(fd, (const struct sockaddr *)&in4,
+                in4.sin_port = htons((uint16_t)(pbase + port));
+                int r = SP_REAL(bind)(fd, (const struct sockaddr *)&in4,
                                      sizeof(in4));
+                if (r == 0) sp_pmap_remember(fd, (uint16_t)port);
+                return r;
             }
         } else if (addr->sa_family == AF_INET6) {
             struct sockaddr_in6 in6;
             memcpy(&in6, addr, sizeof(in6));
             unsigned port = ntohs(in6.sin6_port);
             if (port > 0 && port < 1024) {
-                in6.sin6_port = htons((uint16_t)(1024 + port));
-                return SP_REAL(bind)(fd, (const struct sockaddr *)&in6,
+                in6.sin6_port = htons((uint16_t)(pbase + port));
+                int r = SP_REAL(bind)(fd, (const struct sockaddr *)&in6,
                                      sizeof(in6));
+                if (r == 0) sp_pmap_remember(fd, (uint16_t)port);
+                return r;
             }
         }
     }
@@ -3013,6 +3053,21 @@ int getsockname(int fd, struct sockaddr *addr, socklen_t *len) {
     SP_RESOLVE(getsockname);
     int r = SP_REAL(getsockname)(fd, addr, len);
     if (!r && addr && len) sp_addr_rev_unix(addr, len);
+    /* -p port mapping: the caller asked for P (<1024), the kernel bound us
+     * at 1024+P. Report P so the guest's self-model matches intent. Only
+     * consulted when SPROUT_PORTMAP=1 — the same opt-in that activated
+     * bind()'s remap (kept honest by sp_pmap_remember on success only). */
+    if (!r && addr) {
+        static int pmap = -1;
+        if (pmap < 0) pmap = getenv("SPROUT_PORTMAP") ? 1 : 0;
+        uint16_t orig;
+        if (pmap && (orig = sp_pmap_lookup(fd)) != 0) {
+            if (addr->sa_family == AF_INET)
+                ((struct sockaddr_in *)addr)->sin_port = htons(orig);
+            else if (addr->sa_family == AF_INET6)
+                ((struct sockaddr_in6 *)addr)->sin6_port = htons(orig);
+        }
+    }
     return r;
 }
 
@@ -3024,6 +3079,21 @@ int getpeername(int fd, struct sockaddr *addr, socklen_t *len) {
     return r;
 }
 
+
+/* close(): drop any port-map record for this fd so a subsequent fd
+ * (same number, reused by the kernel) doesn't inherit a stale port claim.
+ *
+ * IMPORTANT: sp_pmap_forget must not touch libc state before glibc is done
+ * with early init — a segfault here can predate main(). Use raw syscall
+ * semantics: resolve the real close lazily, only remember AFTER it ran.
+ */
+int close(int fd) {
+    static int (*SP_REAL(close))(int) = NULL;
+    SP_RESOLVE(close);
+    int r = SP_REAL(close)(fd);
+    if (r == 0) sp_pmap_forget(fd);
+    return r;
+}
 
 char *realpath(const char *path, char *resolved) {
     static char *(*SP_REAL(realpath))(const char *, char *) = NULL;

@@ -37,7 +37,15 @@ median() {
     echo "$ms"
 }
 
-proot_run() { proot-distro login "$DISTRO" -- "$@"; }
+# PROOT_LANE: pd (proot-distro login, substrate = its container, legacy) or
+# control (raw ~/proot-control.sh against $ROOTFS — SAME rootfs + Mesa +
+# tooling as the sprout leg; the apples-to-apples posture).
+PROOT_LANE=${PROOT_LANE:-pd}
+if [ "$PROOT_LANE" = control ]; then
+    proot_run() { bash "$HOME/proot-control.sh" "$@"; }
+else
+    proot_run() { proot-distro login "$DISTRO" -- "$@"; }
+fi
 sprout_run() { "$B" -r "$ROOTFS" "$@"; }
 sprout_pt() { SPROUT_USER_NOTIFY=0 "$B" -r "$ROOTFS" "$@"; }
 

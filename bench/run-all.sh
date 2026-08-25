@@ -18,6 +18,10 @@ SECTIONS=${SECTIONS:-"cpu statics vkmark"}
 VK_SIZE=${VK_SIZE:-1280x720}
 VK_PM=${VK_PM:-}
 OUT=${OUT:-bench/results/comprehensive-$(date +%Y%m%d-%H%M%S)}
+# substrate parity by default: the proot column uses the raw control lane
+# against $B — same rootfs, same Mesa, same guest tooling as sprout.
+# Set PROOT_LANE=pd for the proot-distro-container posture (older runs).
+export PROOT_LANE=${PROOT_LANE:-control}
 mkdir -p "$OUT"/{cpu,statics,vkmark,proben}
 
 has_section() { case " $SECTIONS " in *" $1 "*) return 0;; *) return 1;; esac; }

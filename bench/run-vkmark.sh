@@ -21,11 +21,21 @@ run() { # $1 label $2 launcher $3 icd
     [ -n "$PM" ] && winsys="$winsys --present-mode $PM"
     echo "== $label ($icd) ==" | tee -a "$OUT/SUMMARY"
     if [ "$launcher" = sprout ]; then
-        timeout 300 sprout -r "$B" --shared-tmp /bin/bash -lc \
+        timeout 600 sprout -r "$B" --shared-tmp /bin/bash -lc \
             "export DISPLAY=:0 VK_ICD_FILENAMES=$icd; vkmark $winsys" >"$log" 2>&1
     else
-        timeout 300 proot-distro login debian --shared-tmp -- bash -lc \
-            "export DISPLAY=:0 VK_ICD_FILENAMES=$icd; vkmark $winsys" >"$log" 2>&1
+        # PROOT_LANE=control => raw control lane against the SAME rootfs
+        # ($B) — same Mesa tree + same vkmark binary as the sprout leg.
+        if [ "${PROOT_LANE:-pd}" = control ]; then
+            # CONTROL_SHARED_TMP=1: the proot lane needs host $PREFIX/tmp for
+            # the termux-x11 socket pair (statics lanes do NOT want it).
+            timeout 600 env CONTROL_SHARED_TMP=1 \
+                bash "$HOME/proot-control.sh" bash -lc \
+                "export DISPLAY=:0 VK_ICD_FILENAMES=$icd; vkmark $winsys" >"$log" 2>&1
+        else
+            timeout 600 proot-distro login debian --shared-tmp -- bash -lc \
+                "export DISPLAY=:0 VK_ICD_FILENAMES=$icd; vkmark $winsys" >"$log" 2>&1
+        fi
     fi
     grep -E "vkmark Score" "$log" | tee -a "$OUT/SUMMARY" || echo "FAIL: no score" | tee -a "$OUT/SUMMARY"
 }

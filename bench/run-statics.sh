@@ -26,7 +26,12 @@ median() {
 
 case3() {
     name=$1; shift
-    p=$(median "proot                 $name" proot-distro login "$DISTRO" -- "$@")
+    PROOT_LANE=${PROOT_LANE:-pd}
+    if [ "$PROOT_LANE" = control ]; then
+        p=$(median "proot(control)      $name" bash "$HOME/proot-control.sh" "$@")
+    else
+        p=$(median "proot                 $name" proot-distro login "$DISTRO" -- "$@")
+    fi
     n=$(median "sprout(notif-statics) $name" "$SPROUT_BIN" -r "$ROOTFS" "$@")
     t=$(median "sprout(ptrace-lane)   $name" env SPROUT_NOTIFY_STATICS=0 "$SPROUT_BIN" -r "$ROOTFS" "$@")
     if [ -n "$p" ] && [ -n "$n" ]; then
@@ -39,9 +44,9 @@ case3() {
 }
 
 echo "### rootfs=$ROOTFS N=$N"
-case3 "spawn x50 (fork+exec static)"       /tmp/sp_spawner /tmp/sp_min
+case3 "spawn x50 (fork+exec static)"       /tmp/sp_spawner /usr/bin/busybox true
 case3 "open+read+close x20k"               /tmp/sp_ioloop
 case3 "newfstatat x20k"                    /tmp/sp_statloop
-case3 "self-exec chain depth 8"            /tmp/sp_execdepth 8
+case3 "spawn x50 static->dynamic true"     /tmp/sp_spawner /bin/true
 case3 "static->dynamic basename"           /tmp/sp_exec2 /usr/bin/basename /a/b
 case3 "static->dynamic python3 -c pass"    /tmp/sp_exec2 /usr/bin/python3 -c pass

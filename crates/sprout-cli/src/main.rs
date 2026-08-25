@@ -25,23 +25,32 @@ use sprout_core::{
     long_version = concat!(env!("CARGO_PKG_VERSION"), "\nCopyright (c) 2026 sprout contributors\nLicense: MIT OR Apache-2.0 (dual).\nGitHub: https://github.com/YRangel/sprout"),
     about,
     long_about = None,
-    after_help = "RULE #1: sprout options go BEFORE the guest command. Separate with -- when needed:\n  sprout -r ROOTFS --user=0:0 -- /bin/sh -c 'ls -la /root'\nEXAMPLES:\n  sprout -r ~/roots/debian --user=0:0 -- /bin/bash\n  sprout -r ~/roots/debian --shared-tmp --termux-x11 --user=0:0 -- startxfce4\n  sprout -r ~/roots/debian -- ./x86_64-app       (box64 auto-detected; -q /path/to/box64 overrides)\nPROOT/PROOT-DISTRO COMPAT MAP (old -> sprout):\n  -i, --change-id UID:GROUP -> -u, --user (alias)\n  -0 -> -0/--root-id (native)\n  -L -> obsolete: accepted, ignored (note printed)\n  -k, --kernel-release R -> native\n  -q, --qemu PATH -> native\n  -b, --bind H[:G] -> native\n  -w, --cwd DIR -> native\n  -p/-P/--redirect-ports/--fix-low-ports -> -p/--port-mapping (native)\n  --shared-tmp, --termux-x11, --sysvipc, --ashmem-memfd, --mixed-syscall\n    -> native or acceptance no-op (always-on semantics)\n  --link2symlink -> default ON; --no-link2symlink disables\nUnknown flags fail loudly — they are NEVER silently passed to the guest."
+    // Android terminal-width detection is flaky: on some Termux/termios
+    // configs clap falls back to unlimited width, emits ultra-long unwrapped
+    // help lines, and the tty wraps them such that continuation lines
+    // interleave with the next option's text — reading as if help printed
+    // twice side-by-side. Pin a sane working width so wrapping is computed
+    // per-block, not per-terminal-guess. 100 < real width still wraps big
+    // phones fine and matches the long --qemu/--kill-on-exit strings below.
+    max_term_width = 100,
+    after_help = "RULE #1: sprout options go BEFORE the guest command. Separate with -- when needed:\n  sprout -r ROOTFS --user=0:0 -- /bin/sh -c 'ls -la /root'\nEXAMPLES:\n  sprout -r ~/roots/debian --user=0:0 -- /bin/bash\n  sprout -r ~/roots/debian --shared-tmp --termux-x11 --user=0:0 -- startxfce4\n  sprout -r ~/roots/debian -- ./x86_64-app       (box64 auto-detected; -q /path/to/box64 overrides)\nPROOT COMPAT: -i/--change-id, -0/--root-id, -L, -k/--kernel-release, -q/--qemu,\n  -b/--bind, -w/--cwd, -p/-P/--redirect-ports/--fix-low-ports (--port-mapping),\n  --shared-tmp, --termux-x11, --sysvipc, --ashmem-memfd, --mixed-syscall (no-ops),\n  --link2symlink/--no-link2symlink.\nUnknown flags fail loudly — NEVER silently passed to the guest."
 )]
 struct Cli {
-    /// Guest root directory (the "fake chroot").
+    /// Guest root directory (the "fake chroot"). Required.
     #[arg(short = 'r', long = "rootfs", value_name = "PATH")]
     rootfs: PathBuf,
 
-    /// Working directory inside the guest.
+    /// Set guest working directory (default: target user's home).
     #[arg(short = 'w', long = "cwd", value_name = "GUEST_DIR")]
     cwd: Option<String>,
 
-    /// Bind host path into the guest: `-b host` or `-b host:guest`. Repeatable.
+    /// Bind host path into the guest; repeatable. `-b host` or `-b host:guest`.
     #[arg(short = 'b', long = "bind", value_name = "HOST[:GUEST]")]
     binds: Vec<String>,
 
-    /// Fake uid/gid 0 — DEFAULT, proot parity. Guests believe they run as
-    /// root unless --no-fakeroot is given.
+    /// Fake uid/gid 0 — this is the DEFAULT.
+    ///
+    /// proot parity: guest sees root unless --no-fakeroot.
     #[arg(
         short = '0',
         long = "root-id",
@@ -50,29 +59,34 @@ struct Cli {
     )]
     root_id: bool,
 
-    /// Run as the REAL host uid/gid: identity syscalls and get*id answers
-    /// are kernel-truthful (mostly EPERM for anything privileged).
+    /// Run as REAL host uid/gid (no fakery).
+    ///
+    /// Identity syscalls/get*id become kernel-truthful (mostly EPERM for
+    /// anything privileged).
     #[arg(long = "no-fakeroot", default_value_t = false)]
     no_fakeroot: bool,
 
-    /// proot-distro `--shared-tmp` parity: bind the host $PREFIX/tmp into the
-    /// guest at /tmp, preserving X11/Wayland/VirGL/virpipe/ssh-agent sockets
-    /// (the guest sees the live host socket dir, so X11 apps transact with the
-    /// Termux X server like proot-distro login --shared-tmp).
+    /// Bind host $PREFIX/tmp to guest /tmp (X11/audio sockets).
+    ///
+    /// proot-distro --shared-tmp parity: guest sees the live host socket dir
+    /// so X11/Wayland/VirGL/virpipe/ssh-agent transact with the Termux X
+    /// server like proot-distro login --shared-tmp.
     #[arg(long = "shared-tmp", default_value_t = false)]
     shared_tmp: bool,
 
-    /// Termux-X11/pulse preset: export DISPLAY=:0 and PULSE_SERVER=127.0.0.1
-    /// to the guest. Off by default — sprout never invents X11/audio env; it
-    /// only inherits what the caller set (host DISPLAY passes through).
-    /// Combine with --shared-tmp so the guest can reach the X socket in
-    /// $PREFIX/tmp; without it sprout warns but continues (a DISPLAY with no
-    /// reachable socket is a footgun for clients that don't need it).
+    /// Termux-X11 preset: export DISPLAY=:0 + PULSE_SERVER to the guest.
+    ///
+    /// Off by default — sprout never invents X11/audio env (only inherits what
+    /// the caller set). Pair with --shared-tmp so the guest can reach the X
+    /// socket in $PREFIX/tmp; without it sprout warns but continues (DISPLAY
+    /// with no socket is a footgun for clients that don't need it).
     #[arg(long = "termux-x11", default_value_t = false)]
     termux_x11: bool,
 
-    /// Convert hardlinks to symlinks on guest writes — DEFAULT (proot-distro
-    /// parity: SELinux denies hardlinks under /data/data/.../files).
+    /// Convert guest hardlinks to symlinks — this is the DEFAULT.
+    ///
+    /// proot-distro parity: SELinux denies hardlinks under
+    /// /data/data/.../files.
     #[arg(
         long = "link2symlink",
         default_value_t = true,
@@ -84,17 +98,19 @@ struct Cli {
     #[arg(long = "no-link2symlink", default_value_t = false)]
     no_link2symlink: bool,
 
-    /// Pass the host $HOME through to the guest instead of the proot-parity
-    /// HOME=/root default.
+    /// Keep host $HOME in the guest.
+    ///
+    /// Default (proot parity) is HOME=/root.
     #[arg(long = "host-home")]
     host_home: bool,
 
-    /// Fake-login as a guest user instead of root: `-u NAME`, `-u UID`,
-    /// `-u NAME:GROUP` or `-u UID:GID` (proot `-i` / proot-distro `--user`
-    /// parity). Resolved against the guest's /etc/passwd (+ /etc/group).
-    /// The fake-id family, ownership spoof, SO_PEERCRED, HOME/SHELL/USER/
-    /// LOGNAME and the default cwd all anchor to that user. Kernel truth
-    /// is unchanged (the app uid) — this is fake-id, not privilege change.
+    /// Fake-login as guest user instead of root.
+    ///
+    /// `-u NAME`, `-u UID`, `-u NAME:GROUP`, `-u UID:GID` (proot -i /
+    /// proot-distro --user parity). Resolved against guest /etc/passwd +
+    /// /etc/group. Fake-id family, ownership spoof, SO_PEERCRED, HOME/SHELL/
+    /// USER/LOGNAME and the default cwd all anchor to that user. Kernel truth
+    /// unchanged (the app uid) — fake-id, not privilege change.
     #[arg(
         short = 'u',
         long = "user",
@@ -103,8 +119,8 @@ struct Cli {
     )]
     user: Option<String>,
 
-    /// proot `-i/--change-id` compat alias: identical contract to `-u/--user`
-    /// (faked uid[:gid]; proot-distro muscle memory).
+    /// proot `-i/--change-id` compat alias — identical contract to
+    /// `-u/--user` (faked uid[:gid]; proot-distro muscle memory).
     #[arg(
         short = 'i',
         long = "change-id",
@@ -113,34 +129,36 @@ struct Cli {
     )]
     change_id: Option<String>,
 
-    /// proot `-L` compat ACCEPTANCE: proot's `-L` re-pinned dynamic loader
-    /// search paths (obsolete there since years too). sprout's loader chain
-    /// always resolves the guest's real ld.so, so there is nothing to fix —
-    /// the flag parses silently and a one-line note is printed at plan time.
+    /// proot `-L` obsolete-flag acceptance (parses, prints a one-line note).
+    ///
+    /// proot's `-L` re-pinned dynamic loader search paths, long obsolete there
+    /// too. sprout's loader chain always resolves the guest's real ld.so, so
+    /// there is nothing to fix.
     #[arg(short = 'L', long = "loader-fix", default_value_t = false)]
     loader_fix: bool,
 
-    /// proot `--mixed-syscall` compat acceptance: no-op (sprout's preload
-    /// interposer handles glibc wrappers natively; supervisor translation is
-    /// per-tracee anyway). Printed as a note at plan time.
+    /// proot `--mixed-syscall` acceptance no-op (always-on semantics in sprout).
+    ///
+    /// Printed as a plan-time note; sprout's preload interposer handles glibc
+    /// wrappers natively and supervisor translation is per-tracee anyway.
     #[arg(long = "mixed-syscall", default_value_t = false)]
     mixed_syscall: bool,
 
-    /// Append the host $PREFIX/bin to the guest PATH (default: the clean
-    /// guest-only PATH).
+    /// Append host $PREFIX/bin to the guest PATH (default: clean guest-only).
     #[arg(long = "host-path")]
     host_path: bool,
 
+    /// Emulator for x86/x86_64 execs (default: /usr/local/bin/box64).
+    ///
     /// proot `-q`/`--qemu` parity: x86_64 (and i386 via box32) execs are
-    /// rewritten to run through the given guest-side emulator binary
-    /// (ADR-0018 userspace binfmt adapter). Default: /usr/local/bin/box64.
-    /// Override per-arch via SPROUT_BINFMT_X86_64 / SPROUT_BINFMT_I386;
-    /// SPROUT_BINFMT_ALWAYS=1 wraps even native aarch64 ELFs (proot -q's
-    /// wrap-everything semantics for whole-rootfs usage).
+    /// rewritten to run through the given guest-side emulator (ADR-0018
+    /// userspace binfmt adapter). Per-arch overrides:
+    /// SPROUT_BINFMT_X86_64 / SPROUT_BINFMT_I386. SPROUT_BINFMT_ALWAYS=1 wraps
+    /// even native aarch64 ELFs (proot -q's wrap-everything semantics).
     #[arg(short = 'q', long = "qemu", value_name = "PATH")]
     qemu: Option<String>,
 
-    /// Force interception strategy (auto detects from guest ELF).
+    /// Interception strategy override (auto = detect from guest ELF).
     #[arg(
         long = "fallback",
         value_name = "preload|ptrace",
@@ -152,9 +170,7 @@ struct Cli {
     #[arg(long = "dry-run", default_value_t = false)]
     dry_run: bool,
 
-    /// Log every path translation to stderr.
-    /// proot parity: level-capable (-v -v or -v 3 accepted; levels beyond 1
-    /// are reserved — the interposer has a single trace depth today).
+    /// Log path translations to stderr (proot parity, level-capable).
     #[arg(short = 'v', long = "verbose", num_args = 0..=1,
           default_missing_value = "1", value_name = "LEVEL")]
     verbose: Option<u32>,
@@ -163,53 +179,50 @@ struct Cli {
     #[arg(value_name = "COMMAND [ARGS...]", trailing_var_arg = true)]
     cmd: Vec<OsString>,
 
-    /// proot --kill-on-exit parity: kill launched processes when the
-    /// command exits. Mechanism: tag the child env (SPROUT_KILL_TAG=<pid>);
-    /// at exit sweep /proc for processes whose environ contains the tag
-    /// (env survives exec through the whole guest session) and SIGKILL
-    /// them. Inherit-only: processes that launched OUTSIDE our session
-    /// (e.g. a steam daemon that forked from a DIFFERENT sprout run)
-    /// are not swept — documented as the v1 honest envelope.
+    /// Kill every process tagged to this session when the command exits.
+    ///
+    /// proot --kill-on-exit parity. Mechanism: tag the child env
+    /// (SPROUT_KILL_TAG=<pid>); at exit sweep /proc for that tag and SIGKILL.
+    /// Inherit-only: processes launched OUTSIDE our session (e.g. a steam
+    /// daemon forked from a DIFFERENT sprout run) are not swept.
     #[arg(long = "kill-on-exit", default_value_t = false)]
     kill_on_exit: bool,
 
-    /// proot -k parity: make `uname(2)` report RELEASE as the guest kernel
-    /// release. Handle via the preload interposer's uname wrapper, which
-    /// swaps uts.release post-syscall — applies across every exec because
-    /// env var SPROUT_KERNEL_RELEASE is pushed through the chain merge.
+    /// Spoof `uname -r` to RELEASE (guest-visible kernel version).
     #[arg(short = 'k', long = "kernel-release", value_name = "RELEASE")]
     kernel_release: Option<String>,
 
-    /// proot -p parity: make bind(2) on privileged ports (<1024) use the
-    /// unprivileged higher port 1024+port instead. Android denies
-    /// CAP_NET_BIND_SERVICE to app uids; proot-distro users needed this
-    /// for guest servers to start at all. Rewritten in the preload bind
-    /// wrapper for AF_INET/AF_INET6 only. Aliases mirror proot-distro's
-    /// CLI naming for muscle-memory parity: -P / --redirect-ports /
-    /// --fix-low-ports all map onto this same knob.
+    /// Remap privileged ports (<1024) to BASE+port (default BASE=1024).
+    ///
+    /// proot -p parity. Rewritten in the preload bind wrapper for
+    /// AF_INET/AF_INET6 only. Connect/sendto stay untouched. Aliases for
+    /// proot-distro muscle memory: -P / --redirect-ports / --fix-low-ports.
+    /// BASE must be >1024; leaves headroom up to BASE+1023 for the guest's
+    /// highest privileged port.
     #[arg(
         short = 'p',
         long = "port-mapping",
         alias = "redirect-ports",
         visible_alias = "fix-low-ports",
         short_alias = 'P',
-        default_value_t = false
+        num_args = 0..=1,
+        default_missing_value = "1024",
+        value_name = "BASE"
     )]
-    port_mapping: bool,
+    port_mapping: Option<u16>,
 
-    /// proot --sysvipc compatibility acceptance flag: sprout's sysvipc
-    /// emulation (ADR-0018) is ALWAYS on for x86/box64 lanes (the kernel
-    /// never carries CONFIG_SYSVIPC), toggled by SPROUT_SYSVIPC_OFF=1.
-    /// This flag exists so proot-distro-style command lines parse cleanly;
-    /// it is a documented semantic no-op.
+    /// proot --sysvipc acceptance no-op (SysV emulation is always-on; ADR-0018).
+    ///
+    /// Exists so proot-distro-style command lines parse cleanly. sprout's
+    /// sysvipc emulation is permanent on x86/box64 lanes (the kernel never
+    /// carries CONFIG_SYSVIPC); override via SPROUT_SYSVIPC_OFF=1.
     #[arg(long = "sysvipc", default_value_t = false)]
     sysvipc_compat: bool,
 
-    /// proot --ashmem-memfd parity: preload memfd_create() wrapper tries
-    /// the native syscall first, and only on ENOSYS falls back to
-    /// /dev/ashmem (ASHMEM_SET_NAME + SET_SIZE ioctls from K&R history;
-    /// proot stores the size ashmem cannot put in fstat; we replicate by
-    /// patching st_size = lseek-end for the tracked fd ring).
+    /// proot --ashmem-memfd parity: memfd_create falls back to /dev/ashmem on ENOSYS.
+    ///
+    /// (ASHMEM_SET_NAME + SET_SIZE ioctls; st_size patched from lseek-end
+    /// for the tracked fd ring since ashmem can't carry a size in fstat).
     #[arg(long = "ashmem-memfd", default_value_t = false)]
     ashmem_memfd: bool,
 }
@@ -731,11 +744,39 @@ fn run() -> Result<u8, Error> {
     /* proot-flag parity env (ADR-0019). The interposer reads these; the
      * env is inherited through the whole exec chain, so descendants see
      * them without further flag plumbing. */
-    if let Some(rel) = &cli.kernel_release {
-        plan.env.push(("SPROUT_KERNEL_RELEASE".into(), rel.clone()));
-    }
-    if cli.port_mapping {
+    // Kernel-release spoofing: explicit -k wins; otherwise brand the guest's
+    // view as sprout's own ("Sprout-Android-<host uname -r>"), so tools like
+    // fastfetch/neofetch print us instead of the raw HyperOS build string.
+    // Empty SPROUT_KERNEL_RELEASE in the env = opt-out (host string passes).
+    let rel = cli
+        .kernel_release
+        .clone()
+        .or_else(|| std::env::var("SPROUT_KERNEL_RELEASE").ok());
+    let rel = match rel {
+        Some(ref s) if !s.is_empty() => s.clone(),
+        Some(_) => String::new(), // SPROUT_KERNEL_RELEASE="" = no spoof
+        None => {
+            let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+            let host_rel = if unsafe { libc::uname(&mut u) } == 0 {
+                unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                "unknown".into()
+            };
+            format!("Sprout-Android-{host_rel}")
+        }
+    };
+    plan.env.push(("SPROUT_KERNEL_RELEASE".into(), rel));
+    if let Some(base) = cli.port_mapping {
+        if !(1024..=64512).contains(&base) {
+            return Err(Error::Cli(format!(
+                "-p BASE must be 1024..=64512 (got {base}); 65535-BASE must leave room for privileged ports"
+            )));
+        }
         plan.env.push(("SPROUT_PORTMAP".into(), "1".into()));
+        plan.env
+            .push(("SPROUT_PORTMAP_BASE".into(), base.to_string()));
     }
     if cli.ashmem_memfd {
         plan.env.push(("SPROUT_ASHMEM_MEMFD".into(), "1".into()));

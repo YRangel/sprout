@@ -19,13 +19,21 @@ honest semantics — accepted-or-implemented, documented where we diverge.
    `plan.env` once, inherited through the chain precisely so nested execs
    `bash -c uname` see the same spoof.
 
-2. **`-p, --port-mapping`** — preload `bind(2)` wrapper: for
+2. **`-p, --port-mapping [BASE]`** — preload `bind(2)` wrapper: for
    AF_INET/AF_INET6 with `sin_port ∈ [1, 1023]`, the kernel call gets
-   `1024 + port` (proot formula). Connect(2) is NOT remapped (client
-   intent is sacred in v1). This exists because Android denies
-   `CAP_NET_BIND_SERVICE` to Termux apps — yet on the Xiaomi
-   25102PCBEG kernel (6.12.23), bind(:80) surprisingly works; map stays
-   documented device-honesty for older kernels.
+   `BASE + port`. BASE defaults to 1024 (proot parity formula); explicit
+   `-p 8000` remaps `:22`→`:8022` for example — useful when the host's
+   `1000-Series` db stack or another guest is already parked on the
+   `10xx` low-ports. `SPROUT_PORTMAP_BASE` env overrides for script use.
+   Guards: BASE ∈ [1024, 64512] rejected otherwise (must leave room for
+   guest :1023 → host BASE+1023 under 65535).
+   Connect(2) is NOT remapped (client intent stays pure), but
+   `getsockname(2)` on a remapped listen-fd reports the guest-intended
+   port (not BASE+port), tracked by a per-process fd→orig-port registry
+   dropped on close. The guest's self-model (sshd logs, avahi announcements,
+   dhcpd checks) stays consistent with config. Validated 2026-08-25 on
+   HyperOS 6.12.23: guest binds :22, host opens 1046 (default) / 8022
+   (-p 8000), guest getsockname reports 22 in both cases.
 
 3. **`-v/--verbose [LEVEL]`** — clap `num_args 0..=1` + `default_missing
    = 1`: both `-v` and `-v 3` parse; level > 0 = debug on (SPROUT_DEBUG=1

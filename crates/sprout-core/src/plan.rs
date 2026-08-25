@@ -107,6 +107,16 @@ fn push_home_term(env: &mut Vec<(String, String)>, rootfs: &Rootfs) {
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
         env.push(("TERM".into(), term));
     }
+    // Terminal identifier for fastfetch/screen/tmux et al: the guest's
+    // *actual* terminal is the host one, but everything that calls $TERM_PROGRAM
+    // (fastfetch's terminal slot) or crawls /proc/$PPID/exe would otherwise
+    // name our launcher process ("ldso-sanitized-<hash>.so"). Brand it —
+    // the guest is unmistakably inside a sprout runner and naming that
+    // honestly doubles as a load-bearing debug signal when things go wrong.
+    if !env.iter().any(|(k, _)| k == "TERM_PROGRAM") {
+        let tp = std::env::var("TERM_PROGRAM").unwrap_or_else(|_| "sprout".into());
+        env.push(("TERM_PROGRAM".into(), tp));
+    }
     if let Some(name) = &rootfs.user_name {
         if !env.iter().any(|(k, _)| k == "USER") {
             env.push(("USER".into(), name.clone()));

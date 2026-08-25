@@ -42,6 +42,27 @@ flathub entry doesn't exist. Use the native Android client or FEX/Box64.
 Via box64's integrated box32 persona (`SPROUT_BINFMT_I386` if you have a
 separate box86). Debian-box64 binaries are x86_64-only today.
 
+**FEX-Emu as an alternative x86 backend?**
+FEX runs as a plain aarch64 guest process under sprout — build it inside the
+rootfs, invoke `FEX ./x86-app` and host paths resolve via FEX's own loader.
+**Experimental, not the shipped default.** The live constraints that keep
+box64 first:
+
+1. FEX dispatches guest syscalls itself; LD_PRELOAD path coating does not
+   apply to FEX-internal guest paths. Configs that assume `/proc/self/exe` -
+   relative resolution, or that rely on the guest's own `chdir` semantics,
+   behave differently under FEX than under box64.
+2. FEX's `RootFS` config knob pulls in FEXServer client-server machinery
+   whose standalone launch protocol isn't solved in-tree yet — the steam
+   probe stalled there. See STEAM-INSTALL.md §8 for the open branches.
+3. SysV-IPC under FEX works only via the in-source shim
+   (../adr/0018-userspace-sysvipc-shim.md) spliced into FEX's own
+   `Semaphore.cpp` — not upstreamable, carried as a local patch.
+
+Use box64 unless you have a specific FEX requirement; the SysV-IPC shim
+(ADR-0018) is exercised through box64's `BOX64_LD_PRELOAD` hook in
+tests/test-sysvipc-shim.sh.
+
 ## Syscalls / compatibility
 
 **`Bad system call` when I do `syscall(291)` (statx) by hand?**

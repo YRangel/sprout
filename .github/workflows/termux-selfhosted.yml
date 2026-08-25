@@ -14,3 +14,34 @@ jobs:
       - uses: actions/checkout@v4
       - run: pkg show rust >/dev/null 2>&1 || pkg install -y rust clang
       - run: cargo test --workspace --all-targets
+
+      # Runtime integration smoke — gates that motivated the harness:
+      # env -i exec-wipe chain, exec-name cache loop, loud unknown-flag
+      # errors, single-format help. Needs a guest rootfs + sprout on PATH.
+      - name: integration smoke
+        run: |
+          set -e
+          ROOTFS="${SPROUT_TEST_ROOTFS:-$HOME/roots/debian}"
+          tests/smoke.sh "$ROOTFS"
+
+      # proot / proot-distro drop-in flag contract (the v0.1 goal).
+      - name: proot-compat
+        run: |
+          set -e
+          ROOTFS="${SPROUT_TEST_ROOTFS:-$HOME/roots/debian}"
+          tests/proot-compat.sh "$ROOTFS"
+
+      # SysV-IPC shim runtime assert: builds + runs entirely INSIDE the
+      # sprout Debian guest (it has the cross gcc + box64 + the real
+      # Android-kernel ENOSYS path). Skipped (not failed) when a sprout
+      # binary + guest rootfs aren't present so base cargo test stays the
+      # always-on signal.
+      - name: sysvipc shim runtime assert (guest)
+        run: |
+          set -e
+          ROOTFS="${SPROUT_TEST_ROOTFS:-$HOME/roots/debian}"
+          if command -v sprout >/dev/null 2>&1 && [ -d "$ROOTFS" ]; then
+            scripts/test-sysvipc-shim.sh --run-in-guest "$ROOTFS"
+          else
+            echo "::warning::sysvipc runtime assert skipped (no sprout/rootfs on this runner)"
+          fi

@@ -39,6 +39,13 @@ isolation, no syscall policy. If you need confinement from a hostile
 guest, nest sprout inside a kernel-level isolation boundary (Android app's
 own UID sandbox is the natural one for Termux).
 
+That non-goal is also the security **answer**: anything a guest binary can
+do under sprout is achievable by a native Termux binary the user could
+run by hand. sprout never grants a capability the host shell didn't
+already have — it only changes which *paths* and which *uid* the guest
+believes it has. The threat "a guest did something nasty" is therefore a
+report upstream of sprout (the guest binary itself), not a sprout bug.
+
 ## Reporting
 
 See [SECURITY.md](../../SECURITY.md) for disclosure.

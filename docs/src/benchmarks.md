@@ -9,6 +9,23 @@ matrix (Turnip hardware + llvmpipe CPU lanes). Result dir:
 `bench/results/comprehensive-20260822-102619/` on the HyperOS 6.12 phone,
 Debian trixie guest vs proot-distro control.
 
+> **2026-08-23 correction — statics lane.** The `13.5–15.4×` statics figure
+> below reproduced proot-**distro** login setup cost, not proot translation
+> cost. The control harness (PROOT_LANE=control → raw proot against the
+> same rootfs, no login wrapper) ground-truths the notify-lane statics at:
+>
+> | cell (control lane) | sprout vs proot |
+> |---|---|
+> | spawn ×50 (`/usr/bin/busybox true`, static→dynamic) | **5.86×** |
+> | open+read+close tight loop | **1.45×** |
+> | newfstatat tight loop | **2.71×** |
+> | self-exec-depth chain | stubbed — not measurable (notify-statics) |
+>
+> The 13.5–15.4× row is kept below only as a historical record of the bad
+> methodology. CPU + vkmark rows above are from the earlier suite and are
+> unaffected. Any future statics claims should cite the control-lane
+> numbers, not the historical row.
+
 Highlights:
 
 | section | numbers (vs proot) |
@@ -23,6 +40,9 @@ Highlights:
 | vkmark lavapipe (CPU render) | 267 vs 143 = 1.9× |
 
 Reproduce: `DISPLAY=:0 MODE=full bench/run-all.sh [rootfs] [iterations]`.
+`PROOT_LANE=control` (default in run-all.sh) swaps the proot column to raw
+proot against the SAME rootfs (no proot-distro login) for a translation-
+overhead-only comparison — the control numbers above come from that lane.
 GPU cells require a live X display; every cell logs under the result dir
 + a guest vkmark binary on BOTH sides (proot-distro's container needs one
 apt-installed: `proot-distro login debian -- apt install vkmark`).

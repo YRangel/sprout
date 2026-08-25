@@ -25,6 +25,9 @@ pub enum Error {
     )]
     StaticNeedsPtrace { program: String },
 
+    #[error("cli error: {0}")]
+    Cli(String),
+
     #[error("--fallback=ptrace is not implemented yet (tracked for v0.3)")]
     PtraceUnimplemented,
 
