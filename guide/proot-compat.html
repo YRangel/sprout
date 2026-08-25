@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e71ed169.js";
+            window.path_to_searchindex_js = "../searchindex-fd6a00af.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1f510b02.js"></script>
+        <script src="../toc-02a38309.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -293,9 +293,51 @@ and the loader chain plus the interposer handle everything the dynamic
 fast path covers (static binaries route
 through the supervisor automatically).</p>
 <p>Known deltas vs <code>proot-distro login</code>: sprout does not (yet) -b system
-paths by default (pass <code>-b /dev -b /proc -b /sys</code> if a tool needs them)
-and does not fake <code>/proc/...</code> contents (loadavg/stat/uptime files that
-proot-distro bind-mounts from its own <code>sysdata/</code>).</p>
+paths by default (pass <code>-b /dev -b /proc -b /sys</code> if a tool needs them).</p>
+<h2 id="what-sprout-fakes-for-you-new-in-the-2026-08-cycle"><a class="header" href="#what-sprout-fakes-for-you-new-in-the-2026-08-cycle">What sprout fakes for you (new in the 2026-08 cycle)</a></h2>
+<p>/proc entries HyperOS (SDK-36-era) hides behind <code>EACCES</code> from untrusted
+uids — served through EVERY enforcement level (preload memfd answers,
+translate-level materialized-file reroute, notify ADDFD inject, classic
+scratch-file) so whichever lane carries the process, the file opens:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>path</th><th>content</th><th>consumer class</th></tr>
+</thead>
+<tbody>
+<tr><td><code>/proc/version</code></td><td><code>Linux version R (sprout-build) (gcc (sprout)) #1 SMP PREEMPT M</code> (host <code>uname(2)</code> painted)</td><td>LibreOffice oosplash probe → this was proot#175’s full fix</td></tr>
+<tr><td><code>/proc/stat</code>, <code>/proc/loadavg</code>, <code>/proc/uptime</code></td><td>synthetic but parseable/moving</td><td>htop/top/ps class, glibc sysinfo() fallback</td></tr>
+<tr><td><code>/proc/sys/kernel/overflowuid</code>, <code>/proc/sys/kernel/overflowgid</code></td><td><code>65534</code></td><td>bwrap/pressure-vessel range validation</td></tr>
+</tbody>
+</table>
+</div>
+<p>statx(2) emulation: raw <code>syscall(291)</code> is policy-killed or ENOSYS-able
+on policy-strict devices (HyperOS: <code>RET_KILL</code> outranks our notify answer —
+all rootless runners die identically), but glibc <code>statx(3)</code> callers are
+interposed at PLT and answered via newfstatat(262) emulation, stx_mask
+advertising exactly the populated fields.</p>
+<h2 id="cli-parity-additions-2026-08-22-friend-reported-class"><a class="header" href="#cli-parity-additions-2026-08-22-friend-reported-class">CLI parity additions (2026-08-22, friend-reported class)</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>proot habit</th><th>sprout</th><th>status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-i NUM</code> / <code>--change-id UID:GROUP</code></td><td><code>-i/--change-id</code></td><td><strong>ALIAS of <code>--user</code></strong> (numeric + named both; conflicts_with=user)</td></tr>
+<tr><td><code>-L</code> (obsolete ld loader-fix)</td><td><code>-L/--loader-fix</code></td><td>accepted with one-line note, no action — loader resolution is always correct</td></tr>
+<tr><td><code>--mixed-syscall</code></td><td><code>--mixed-syscall</code></td><td>accepted as no-op note; preload lane handles glibc wrappers natively</td></tr>
+<tr><td><code>--redirect-ports</code>, <code>--fix-low-ports</code>, <code>-P</code></td><td>same three spellings + <code>-p/--port-mapping</code></td><td>all four are ONE knob</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="unknown-flag-discipline-same-change"><a class="header" href="#unknown-flag-discipline-same-change">Unknown-flag discipline (same change)</a></h3>
+<p>Older builds let any unrecognized dash-token “slide through” and
+the whole rest of argv: <code>sprout -L --rootfs=R bash</code> ended with clap
+mystifyingly saying <em>rootfs was missing</em> (the token had eaten it);
+<code>sprout -r R -L bash</code> treated <code>-L</code> as the guest program name. Today: hard
+errored on contact WITH the <code>--</code> hint; only tokens after an EXPLICIT
+<code>--</code> are allowed to start with dashes. <code>sprout --help</code> prints the full
+compat map at its tail.</p>
 <h2 id="cli-parity-table"><a class="header" href="#cli-parity-table">CLI parity table</a></h2>
 <div class="table-wrapper">
 <table>

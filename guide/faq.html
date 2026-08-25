@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e71ed169.js";
+            window.path_to_searchindex_js = "../searchindex-fd6a00af.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1f510b02.js"></script>
+        <script src="../toc-02a38309.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -181,31 +181,104 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="faq"><a class="header" href="#faq">FAQ</a></h1>
-<p><strong>Why not just use proot?</strong>
-proot is a mature, well-designed tool. sprout exists because proot pays
-for generality with two context switches per syscall, and on phones that
-cost shows up in every git clone, every node cold-start, every editor
-plugin. sprout keeps proot’s coverage goals but changes the hot path.</p>
-<p><strong>Why not proroot?</strong>
-proroot has the right architecture and ships closed-source binaries with
-no docs. sprout is the open, auditable, documented version of the same
-design, plus static/Go coverage.</p>
-<p><strong>Is this a sandbox?</strong>
-No. See the <a href="../architecture/threat-model.html">threat model</a>.</p>
-<p><strong>Does it need root?</strong>
-No. Everything runs as the Termux (or embedding app’s) UID.</p>
-<p><strong>Why C for the .so, Rust for the rest?</strong>
-The <code>.so</code> must interpose libc symbols without allocations, panics, or
-runtime init. The launcher is the opposite problem (CLI UX, error
-messages, plan construction). ADR-0001 has the full rationale.</p>
-<p><strong>What about Go / static binaries?</strong>
-Detected by ELF scan and routed to an automatic ptrace fallback (v0.3).
-Nothing is silently broken; you either get the fast path or a clear error.</p>
-<p><strong>Alpine / musl?</strong>
-v0.4. The rootfs model is libc-agnostic so this is additive.</p>
-<p><strong>x86_64 on arm64?</strong>
-Outside v1.0 scope (an emulation problem, not a path problem). Watch
-Box64 integration after 1.0.</p>
+<h2 id="launcher--cli"><a class="header" href="#launcher--cli">Launcher / CLI</a></h2>
+<p><strong><code>--rootfs</code> “not provided” even though I typed it?</strong>
+You were bitten by the trailing-vararg swallow (fixed). If your sprout is
+older than this change, <em>any</em> unrecognized <code>-flag</code> before the command
+captured everything after it — including <code>--rootfs=...</code> — into cmd, and
+clap then correctly reported rootfs missing while your <code>--rootfs=...</code> sat
+invisibly inside it. Upgrade. The current build hard-fails unknown flags
+on contact with a <code>--</code> tip, and proot muscle-memory flags (<code>-i</code>,
+<code>--change-id</code>, <code>-L</code>, <code>--mixed-syscall</code>) are accepted with notes.</p>
+<p><strong>Options BEFORE or AFTER the command?</strong>
+Before. <code>sprout -r R --user=0:0 -- cmd args...</code>; separate with <code>--</code> when
+the command itself begins with a dash. <code>--help</code> prints the rule + a
+compat map at its tail.</p>
+<p><strong>“guest program ‘-L’ not found inside rootfs”?</strong>
+Same older bug class (unknown tokens after <code>--rootfs</code> became the guest
+program name, not an error). Current build: <code>-L</code> parses as a compat
+no-op printing a one-line note, then <code>cmd</code> resolves normally. Git the
+current build (<code>./install.sh --verify</code>).</p>
+<h2 id="emulation--x86"><a class="header" href="#emulation--x86">Emulation / x86</a></h2>
+<p><strong>Can I run x86_64 apps?</strong>
+Yes — box64 inside the guest: install/build box64 anywhere under the default
+lookup path (<code>/usr/local/bin/box64</code> in the rootfs) and plain
+<code>sprout -r R -- ./x86-app</code> auto-wraps, no flags. <code>-q PATH</code> (or
+<code>SPROUT_BINFMT_X86_64</code>) overrides the emulator path explicitly. Host (Termux) box64/qemu-user
+works too, sprout detects the bionic emulator and direct-spawns it —
+but Android blocks <code>set_robust_list</code> for host-bionic children and the
+guest <code>ld-linux</code> path is invisible to it, so static x86 + fresh-dynamic
+x86 guests should use the in-guest box64 lane.</p>
+<p><strong>Sober / VinegarHQ configuration?</strong>
+Upstream builds of Sober target x86_64 only. On our aarch64 lane the
+flathub entry doesn’t exist. Use the native Android client or FEX/Box64.</p>
+<p><strong>i386?</strong>
+Via box64’s integrated box32 persona (<code>SPROUT_BINFMT_I386</code> if you have a
+separate box86). Debian-box64 binaries are x86_64-only today.</p>
+<p><strong>FEX-Emu as an alternative x86 backend?</strong>
+FEX runs as a plain aarch64 guest process under sprout — build it inside the
+rootfs, invoke <code>FEX ./x86-app</code> and host paths resolve via FEX’s own loader.
+<strong>Experimental, not the shipped default.</strong> The live constraints that keep
+box64 first:</p>
+<ol>
+<li>FEX dispatches guest syscalls itself; LD_PRELOAD path coating does not
+apply to FEX-internal guest paths. Configs that assume <code>/proc/self/exe</code> -
+relative resolution, or that rely on the guest’s own <code>chdir</code> semantics,
+behave differently under FEX than under box64.</li>
+<li>FEX’s <code>RootFS</code> config knob pulls in FEXServer client-server machinery
+whose standalone launch protocol isn’t solved in-tree yet — the steam
+probe stalled there. See STEAM-INSTALL.md §8 for the open branches.</li>
+<li>SysV-IPC under FEX works only via the in-source shim
+(../adr/0018-userspace-sysvipc-shim.md) spliced into FEX’s own
+<code>Semaphore.cpp</code> — not upstreamable, carried as a local patch.</li>
+</ol>
+<p>Use box64 unless you have a specific FEX requirement; the SysV-IPC shim
+(ADR-0018) is exercised through box64’s <code>BOX64_LD_PRELOAD</code> hook in
+tests/test-sysvipc-shim.sh.</p>
+<h2 id="syscalls--compatibility"><a class="header" href="#syscalls--compatibility">Syscalls / compatibility</a></h2>
+<p><strong><code>Bad system call</code> when I do <code>syscall(291)</code> (statx) by hand?</strong>
+That’s Android policy killing RAW <code>svc(291)</code> for the untrusted UID —
+reminder: the host filter’s KILL decision outranks any user-notify answer, so the
+process dies identically under proot. glibc’s <code>statx()</code> wrapper DOES work:
+the preload lane interposes it via PLT and answers through emulation when
+necessary. Write apps through libc.</p>
+<p><strong>LibreOffice/service says “ERROR: /proc not mounted”?</strong>
+Fixed: sprout fakes <code>/proc/version</code>, <code>/proc/stat</code>, <code>/proc/loadavg</code>,
+<code>/proc/uptime</code>, <code>/proc/sys/kernel/overflow{u,g}id</code> at every level — memfd
+answers, materialized file reroute, notify ADDFD, classic scratch-file —
+AND the new statx emulation completes the story. LibreOffice 26.2 maps
+a working window under this build (‘Untitled 1 — LibreOffice Writer’).</p>
+<p><strong>Can I debug inside the guest (gdb/strace)?</strong>
+No — ptrace is owned by the supervisor. Debug from the host side or use
+SPROUT_DEBUG -v traces. This is the same class as proot.</p>
+<p><strong>mount/loop/namespaces?</strong>
+Kernel-block for every rootless runner. Out of this model.</p>
+<h2 id="desktop--x11"><a class="header" href="#desktop--x11">Desktop / X11</a></h2>
+<p><strong>Desktop opens, windows map, but everything is slow?</strong>
+Typomorph classes: (1) compositor/on for xfwm4: <code>xfconf-query -c xfwm4 -p /general/use_compositing -s false</code> fixes it on this device family; (2) you skipped <code>--shared-tmp</code> so the X socket is unreadable by root children; (3) HyperOS put the x11 display into zombie state — run <code>~/projeto/x11-rescue.sh</code>.</p>
+<p><strong>Audio crackles or stalls after a termux pkg upgrade?</strong>
+pkg resets <code>$PREFIX/etc/pulse/default.pa</code> conffile. Re-add the
+<code>module-native-protocol-tcp</code> line (<code>auth-ip-acl=127.0.0.1 auth-anonymous=1</code>).
+<code>~/pulse-guard.sh</code> heals it automatically now.</p>
+<h2 id="correctness-rules-of-thumb"><a class="header" href="#correctness-rules-of-thumb">Correctness rules of thumb</a></h2>
+<p><strong>Debug an app crash: sprout’s fault?</strong>
+Control-lane doctrine: run the same binary under <code>proot -r $D ...</code>
+(<code>~/proot-control.sh</code>). Identical crash = the app is broken in
+containerized environments; sprout can’t fix that tax. Crash ONLY under
+sprout = bug against us, file it with the repro.</p>
+<p><strong>Fake root is privilege?</strong>
+<code>id -u == 0</code> inside a guest describes ITS address space only — the host
+kernel’s view never changed. If code trusts it for a security decision,
+that code was already wrong under proot too.</p>
+<h2 id="installation--upgrades"><a class="header" href="#installation--upgrades">Installation / upgrades</a></h2>
+<p><strong>How to verify a dev <code>.so</code> build matches the deployed one?</strong>
+Rebuild in-guest with the canonical recipe and compare md5s. ⚠ the source
+file must carry the SAME filename (<code>/tmp/sprout_preload.c</code>): gcc bakes
+the name into <code>.note.gnu.build-id</code> + <code>.symtab</code> — <code>hc-preload.c</code> vs
+<code>sprout_preload.c</code> yields a different binary for identical code. The
+healthcheck (<code>~/projeto/healthcheck.sh</code>) does this L1 leg for you.</p>
+<p><strong>What batteries run before a release?</strong>
+<code>cargo test --workspace</code>, <code>test_translate</code>, <code>cargo fmt --check</code>, <code>cargo clippy -D warnings</code>, <code>bench/run.sh</code>, <code>bench/run-statics.sh</code>, <code>flagmatrix.sh</code> 11/11, <code>healthcheck.sh</code> 0 fails on BOTH lanes (6.12 notify + 4.14 ptrace), desktop spawn smoke.</p>
 
                     </main>
 

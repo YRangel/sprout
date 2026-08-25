@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e71ed169.js";
+            window.path_to_searchindex_js = "searchindex-fd6a00af.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-1f510b02.js"></script>
+        <script src="toc-02a38309.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -187,32 +187,39 @@
 <tr><th>Milestone</th><th>Scope</th><th>Status</th></tr>
 </thead>
 <tbody>
-<tr><td><strong>v0.1</strong></td><td>Core: workspace, ELF classify → preload strategy, loader-launch, CLI surface</td><td><strong>done</strong> (<code>-b/-w/-0/--link2symlink/-0</code> accepted; <code>--fallback</code> reserved for ptrace path)</td></tr>
+<tr><td><strong>v0.1</strong></td><td>Core: workspace, ELF classify → preload strategy, loader-launch, CLI surface</td><td><strong>done</strong></td></tr>
 <tr><td><strong>v0.2</strong></td><td>execve chaining + shebang scripts + <code>system()</code>/<code>posix_spawn()</code> wrappers so guests spawn guests inside sprout</td><td><strong>done</strong></td></tr>
-<tr><td><strong>v0.3</strong></td><td>ptrace fallback: static binaries (SIGSYS swallow, dirfd + cwd-relative translation, execve rewrite incl. static→dynamic/script)</td><td><strong>done</strong> (nolibc-static class verified: same syscall profile as Go)</td></tr>
-<tr><td><strong>v0.4</strong></td><td>musl/Alpine guests: supervisor-first route (kind=3 musl-dynamic), musl-specific sanitizer table, SONAME-shadow libc, absolute-symlink chasing, suid-drop swallow</td><td><strong>done</strong> (busybox/applet-chains/python3/subprocess verified)</td></tr>
-<tr><td><strong>v0.5</strong></td><td>embeddable <code>.so</code> + Android Library (AAR) for other apps</td><td>planned</td></tr>
-<tr><td><strong>v0.6</strong></td><td>reproducible benchmark suite published, regression alerts in CI</td><td>planned</td></tr>
-<tr><td><strong>v1.0</strong></td><td>proot-distro endpoints all pass on sprout as the backend</td><td>goal</td></tr>
+<tr><td><strong>v0.3</strong></td><td>ptrace fallback: static binaries (SIGSYS swallow, dirfd + cwd-relative translation, execve rewrite incl. static→dynamic/script)</td><td><strong>done</strong></td></tr>
+<tr><td><strong>v0.4</strong></td><td>musl/Alpine guests: supervisor-first route, musl sanitizer table, SONAME-shadow libc, absolute-symlink chasing, suid-drop swallow</td><td><strong>done</strong></td></tr>
+<tr><td><strong>v0.5</strong></td><td>proot-distro flag parity + X11/desktop lanes: <code>--termux-x11</code>/<code>--shared-tmp</code>, <code>-k/--kernel-release</code>, <code>-p/--port-mapping</code>, <code>--kill-on-exit</code>, <code>--sysvipc</code>/<code>--ashmem-memfd</code> acceptance, <code>MOZ_DISABLE_WASM_SIGHANDLERS</code> doc</td><td><strong>done</strong></td></tr>
+<tr><td><strong>v0.5.1</strong></td><td>hardening + perf pass: env-wipe exec-chain survival, library-stamp normalize, exec-name memo, <code>-P/--redirect-ports</code> aliases, fake-proc full table (version/uptime), statx emulation, host-bionic <code>-q</code> lane, CLI unknown-flag discipline + <code>-i/--change-id</code>/<code>-L</code> aliases, LibreOffice class</td><td><strong>done (tip)</strong></td></tr>
+<tr><td><strong>v0.6</strong></td><td>publish workflow + mdBook online, reproducible benchmark cards, hour-batteries in CI (healthcheck.sh lanes on both phone classes)</td><td>in-flight</td></tr>
+<tr><td><strong>v0.7</strong></td><td>alpine/musl lane hardening ‖ arm32 guest lane ‖ wine-class canvas on box32</td><td>scoped</td></tr>
+<tr><td><strong>v1.0</strong></td><td>sprout-distro: proot-distro-style UX shipped on sprout as the backend (install/uninstall/login/backup with byte-identical flags)</td><td>goal</td></tr>
 </tbody>
 </table>
 </div>
-<p>The numbers are set by ADRs (0002, 0004, 0005); changes to goals get their
-own ADR.</p>
-<h2 id="v01-exit-criteria"><a class="header" href="#v01-exit-criteria">v0.1 exit criteria</a></h2>
+<p>The numbers are set by ADRs; goal changes get their own ADR.</p>
+<h2 id="current-focus-queue-post-051"><a class="header" href="#current-focus-queue-post-051">Current focus queue (post-0.5.1)</a></h2>
+<ol>
+<li>Management UX polish: login shortcuts, helper scripts (<code>start-desktop.sh</code>,
+<code>x11-rescue.sh</code>, <code>stack-health.sh</code>, <code>healthcheck.sh</code>, <code>flagmatrix.sh</code>)
+→ candidate to fold into a <code>sprout-distro</code> thin frontend.</li>
+<li>Fake-proc table extension on demand (<code>/proc/net/dev</code> from <code>/sys/class/net</code>
+counters is first in line, only once an actual tool dies on it).</li>
+<li>mdBook publish pipeline (drop-in gh-pages build from this branch).</li>
+<li>perf-resident: notify-only statics benches in the matrix; HEAP footprint
+audit of the preload on long-running desktop sessions.</li>
+</ol>
+<h2 id="v01-exit-criteria-kept-from-the-era-all-satisfied-years-go"><a class="header" href="#v01-exit-criteria-kept-from-the-era-all-satisfied-years-go">v0.1 exit criteria (kept from the era, all satisfied years-go)</a></h2>
 <ul>
 <li><code>sprout -r /path/to/ubuntu /usr/bin/node --version</code> prints the node version.</li>
 <li><code>cargo test --workspace</code> green on Termux (self-hosted runner, see
 development workflow notes).</li>
 <li><code>--dry-run</code> documents the full exec plan for any guest ELF.</li>
-<li>No <code>.text</code> patching, no <code>ptrace</code>, no temp files created at run time.</li>
+<li>No <code>.text</code> patching, no <code>ptrace</code>, no temp files created at run time
+(exceptions folders: <code>~/.cache/sprout</code> derivatives, norm-stamps).</li>
 </ul>
-<h2 id="v03-design-sketch-static-binaries--exec-fallback-supervisor-ptrace-last-resort-adr-0002"><a class="header" href="#v03-design-sketch-static-binaries--exec-fallback-supervisor-ptrace-last-resort-adr-0002">v0.3 design sketch (static binaries / exec-fallback supervisor; ptrace last resort, ADR-0002/)</a></h2>
-<p>The preload core’s <code>execve</code> wrapper becomes real: it prepends the loader
-to the target argv, keeps its own <code>SPROUT_*</code> env, and injects itself into
-the child’s <code>LD_PRELOAD</code>, preserving the loop across exec. Scripts
-(<code>#!...</code>) unpack their interpreter in the wrapper instead of the kernel.
-Single-file tests in the interposer gate this.</p>
 
                     </main>
 

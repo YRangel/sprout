@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e71ed169.js";
+            window.path_to_searchindex_js = "searchindex-fd6a00af.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-1f510b02.js"></script>
+        <script src="toc-02a38309.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -179,35 +179,51 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="sprout"><a class="header" href="#sprout">sprout</a></h1>
-<p><strong>Rootless glibc/musl Linux userspace for Android. Fast, auditable, open.</strong></p>
-<p><code>sprout</code> runs full Linux userspaces (Node.js, Python, Git, Chromium, X
-applications, desktop sessions) on Android without root. It is a drop-in
-replacement for <a href="https://proot-me.github.io/">proot</a> with an <code>LD_PRELOAD</code> fast
-path that avoids ptrace syscall-stop overhead, plus automatic ptrace fallback
-for static/Go binaries and a pure-notify stub lane for AArch64 statics.</p>
-<h2 id="status"><a class="header" href="#status">Status</a></h2>
-<p><strong>Working today on-device (Termux, aarch64):</strong></p>
+<p><strong>Rootless glibc/musl Linux userspace for Android.</strong> A drop-in replacement
+for proot/proot-distro that keeps proot’s observable semantics on the
+hot paths where it matters (file-system translation, exec chains, env
+survival, proot-distro flag compatibility) while replacing its engine:</p>
 <ul>
-<li>Interactive glibc shells (bash/zsh) with X11 + audio (termux-x11 preset)</li>
-<li>XFCE4 desktop sessions + Firefox ESR under <code>--shared-tmp --termux-x11</code></li>
-<li>Package managers: <code>apt</code>/<code>dpkg</code> and <code>apk</code> (musl lane)</li>
-<li>Toolchains: meson, autotools, gcc, clang — full native-source builds inside
-the guest (e.g. Mesa built natively for Turnip GPU bring-up)</li>
-<li>Static and Go binaries (ptrace supervisor, or pure USER_NOTIFY stub lane)</li>
-<li>Two rootfs flavors: glibc (Debian) and musl (Alpine)</li>
-<li>Vulkan visible-present workloads on Turnip (real Adreno GPU) AND llvmpipe
-(software/XShm) under termux-x11 — vkmark head-to-head benchmarks favor
-sprout on both (see <a href="#benchmarks">Benchmarks</a>).</li>
-<li>x86_64/i386 guests via the userspace binfmt adapter (box64/box32, qemu,
-or any ARM64 emulator exposing <code>LD_PRELOAD</code>-composable startup) with
-userspace SysV IPC emulation (semaphores + shared memory).</li>
+<li><strong>LD_PRELOAD interposition</strong> for glibc-dynamic guests — no ptrace traps.</li>
+<li><strong>seccomp-user-notify supervisor</strong> for statics, musl guests and the
+syscalls the filter shouldn’t trust to libc.</li>
+<li><strong>Pure-notify <code>sprout-stub</code></strong> on kernels new enough (≥ 5.14 ADDFD) for
+the statics lane without ptrace at all.</li>
+</ul>
+<p>All three lanes share one translation engine (<code>sprout_core</code>), one
+config/env contract, and one cache root (<code>~/.cache/sprout</code>).</p>
+<h2 id="why-it-exists"><a class="header" href="#why-it-exists">Why it exists</a></h2>
+<p>proot generality has a price paid by <em>every</em> glibc app: ptrace-freeze on
+every syscall. On a past-generation phone that is ~2× shell cost; on the
+current Android-16/HyperOS kernel it multiplies into whole-desktop stalls
+(the proot-distro <a href="https://github.com/termux/proot-distro/issues/567">#567</a>
+slowdown class). sprout pays ctx-switches only for:
+<em>syscall numbers glibc can’t interpose (raw svc classes)</em>, <em>binaries that
+can’t carry the preload</em> (static, Go), <em>binaries whose arch differs</em>
+(x86/x86-64 through the binfmt adapter to box64/box32/qemu), and <em>glibc
+internals that ignore <code>LD_PRELOAD</code></em> (see ADR-0011).</p>
+<p>The other side of that ledger: sprout embraces <strong>interposer-side emulation</strong>
+wherever Android policy kills syscalls that glibc apps expect (set_robust_list,
+rseq, sysvipc, <code>/proc/*</code> EACCES table, statx) — documented per class in
+<a href="#environment-policy-inside-a-sprout-guest">Environment policy</a> + ADR-0006/0007/0011/0018/0020.</p>
+<h2 id="status"><a class="header" href="#status">Status</a></h2>
+<ul>
+<li>v0.5.x, 2026-08 era. Daily-use proven: Debian trixie guest with XFCE4,
+Firefox ESR, LibreOffice, flatpak-flathub, mesa/turnip hardware GL,
+box64 x86 lane, termux-x11 desktops, pulse-AAudio audio, proot-distro
+compatibility invocations of all four shapes.</li>
+<li>Tested deploy channels: HyperOS SDK-36 phone (6.12 kernel, user-notify)
+AND a POCO 4.14 phone (pure classic ptrace lane). Both run the same
+artifact set with 11/11 flag-matrix + healthcheck.</li>
+<li>Every feature/bug ADR-written; <a href="../CHANGELOG.html">CHANGELOG.md</a> records
+the exact-bus payloads.</li>
 </ul>
 <h2 id="layout-of-this-book"><a class="header" href="#layout-of-this-book">Layout of this book</a></h2>
 <ul>
-<li><strong>User guide</strong> — install, proot-compat table, environment policy, X11/GPU</li>
-<li><strong>Architecture</strong> — interceptor model, translation rules, threat model</li>
-<li><strong>ADRs</strong> — numbered decision records, template through shadow-state emulation</li>
-<li><strong>Operations</strong> — benchmarks, roadmap, development notes</li>
+<li><strong>User guide</strong> — installation, proot compat tables, env policy, X11/GPU, FAQ.</li>
+<li><strong>Architecture</strong> — overview, interception model, translation rules, threat model.</li>
+<li><strong>ADRs</strong> — 20+ decisions with rationale (the “how the sausage was made” archive).</li>
+<li><strong>Operations</strong> — benchmarks and development discipline (how we keep it all honest).</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
@@ -427,9 +443,51 @@ and the loader chain plus the interposer handle everything the dynamic
 fast path covers (static binaries route
 through the supervisor automatically).</p>
 <p>Known deltas vs <code>proot-distro login</code>: sprout does not (yet) -b system
-paths by default (pass <code>-b /dev -b /proc -b /sys</code> if a tool needs them)
-and does not fake <code>/proc/...</code> contents (loadavg/stat/uptime files that
-proot-distro bind-mounts from its own <code>sysdata/</code>).</p>
+paths by default (pass <code>-b /dev -b /proc -b /sys</code> if a tool needs them).</p>
+<h2 id="what-sprout-fakes-for-you-new-in-the-2026-08-cycle"><a class="header" href="#what-sprout-fakes-for-you-new-in-the-2026-08-cycle">What sprout fakes for you (new in the 2026-08 cycle)</a></h2>
+<p>/proc entries HyperOS (SDK-36-era) hides behind <code>EACCES</code> from untrusted
+uids — served through EVERY enforcement level (preload memfd answers,
+translate-level materialized-file reroute, notify ADDFD inject, classic
+scratch-file) so whichever lane carries the process, the file opens:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>path</th><th>content</th><th>consumer class</th></tr>
+</thead>
+<tbody>
+<tr><td><code>/proc/version</code></td><td><code>Linux version R (sprout-build) (gcc (sprout)) #1 SMP PREEMPT M</code> (host <code>uname(2)</code> painted)</td><td>LibreOffice oosplash probe → this was proot#175’s full fix</td></tr>
+<tr><td><code>/proc/stat</code>, <code>/proc/loadavg</code>, <code>/proc/uptime</code></td><td>synthetic but parseable/moving</td><td>htop/top/ps class, glibc sysinfo() fallback</td></tr>
+<tr><td><code>/proc/sys/kernel/overflowuid</code>, <code>/proc/sys/kernel/overflowgid</code></td><td><code>65534</code></td><td>bwrap/pressure-vessel range validation</td></tr>
+</tbody>
+</table>
+</div>
+<p>statx(2) emulation: raw <code>syscall(291)</code> is policy-killed or ENOSYS-able
+on policy-strict devices (HyperOS: <code>RET_KILL</code> outranks our notify answer —
+all rootless runners die identically), but glibc <code>statx(3)</code> callers are
+interposed at PLT and answered via newfstatat(262) emulation, stx_mask
+advertising exactly the populated fields.</p>
+<h2 id="cli-parity-additions-2026-08-22-friend-reported-class"><a class="header" href="#cli-parity-additions-2026-08-22-friend-reported-class">CLI parity additions (2026-08-22, friend-reported class)</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>proot habit</th><th>sprout</th><th>status</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-i NUM</code> / <code>--change-id UID:GROUP</code></td><td><code>-i/--change-id</code></td><td><strong>ALIAS of <code>--user</code></strong> (numeric + named both; conflicts_with=user)</td></tr>
+<tr><td><code>-L</code> (obsolete ld loader-fix)</td><td><code>-L/--loader-fix</code></td><td>accepted with one-line note, no action — loader resolution is always correct</td></tr>
+<tr><td><code>--mixed-syscall</code></td><td><code>--mixed-syscall</code></td><td>accepted as no-op note; preload lane handles glibc wrappers natively</td></tr>
+<tr><td><code>--redirect-ports</code>, <code>--fix-low-ports</code>, <code>-P</code></td><td>same three spellings + <code>-p/--port-mapping</code></td><td>all four are ONE knob</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="unknown-flag-discipline-same-change"><a class="header" href="#unknown-flag-discipline-same-change">Unknown-flag discipline (same change)</a></h3>
+<p>Older builds let any unrecognized dash-token “slide through” and
+the whole rest of argv: <code>sprout -L --rootfs=R bash</code> ended with clap
+mystifyingly saying <em>rootfs was missing</em> (the token had eaten it);
+<code>sprout -r R -L bash</code> treated <code>-L</code> as the guest program name. Today: hard
+errored on contact WITH the <code>--</code> hint; only tokens after an EXPLICIT
+<code>--</code> are allowed to start with dashes. <code>sprout --help</code> prints the full
+compat map at its tail.</p>
 <h2 id="cli-parity-table"><a class="header" href="#cli-parity-table">CLI parity table</a></h2>
 <div class="table-wrapper">
 <table>
@@ -669,31 +727,104 @@ capability is the kernel’s own routing.</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="faq"><a class="header" href="#faq">FAQ</a></h1>
-<p><strong>Why not just use proot?</strong>
-proot is a mature, well-designed tool. sprout exists because proot pays
-for generality with two context switches per syscall, and on phones that
-cost shows up in every git clone, every node cold-start, every editor
-plugin. sprout keeps proot’s coverage goals but changes the hot path.</p>
-<p><strong>Why not proroot?</strong>
-proroot has the right architecture and ships closed-source binaries with
-no docs. sprout is the open, auditable, documented version of the same
-design, plus static/Go coverage.</p>
-<p><strong>Is this a sandbox?</strong>
-No. See the <a href="#threat-model">threat model</a>.</p>
-<p><strong>Does it need root?</strong>
-No. Everything runs as the Termux (or embedding app’s) UID.</p>
-<p><strong>Why C for the .so, Rust for the rest?</strong>
-The <code>.so</code> must interpose libc symbols without allocations, panics, or
-runtime init. The launcher is the opposite problem (CLI UX, error
-messages, plan construction). ADR-0001 has the full rationale.</p>
-<p><strong>What about Go / static binaries?</strong>
-Detected by ELF scan and routed to an automatic ptrace fallback (v0.3).
-Nothing is silently broken; you either get the fast path or a clear error.</p>
-<p><strong>Alpine / musl?</strong>
-v0.4. The rootfs model is libc-agnostic so this is additive.</p>
-<p><strong>x86_64 on arm64?</strong>
-Outside v1.0 scope (an emulation problem, not a path problem). Watch
-Box64 integration after 1.0.</p>
+<h2 id="launcher--cli"><a class="header" href="#launcher--cli">Launcher / CLI</a></h2>
+<p><strong><code>--rootfs</code> “not provided” even though I typed it?</strong>
+You were bitten by the trailing-vararg swallow (fixed). If your sprout is
+older than this change, <em>any</em> unrecognized <code>-flag</code> before the command
+captured everything after it — including <code>--rootfs=...</code> — into cmd, and
+clap then correctly reported rootfs missing while your <code>--rootfs=...</code> sat
+invisibly inside it. Upgrade. The current build hard-fails unknown flags
+on contact with a <code>--</code> tip, and proot muscle-memory flags (<code>-i</code>,
+<code>--change-id</code>, <code>-L</code>, <code>--mixed-syscall</code>) are accepted with notes.</p>
+<p><strong>Options BEFORE or AFTER the command?</strong>
+Before. <code>sprout -r R --user=0:0 -- cmd args...</code>; separate with <code>--</code> when
+the command itself begins with a dash. <code>--help</code> prints the rule + a
+compat map at its tail.</p>
+<p><strong>“guest program ‘-L’ not found inside rootfs”?</strong>
+Same older bug class (unknown tokens after <code>--rootfs</code> became the guest
+program name, not an error). Current build: <code>-L</code> parses as a compat
+no-op printing a one-line note, then <code>cmd</code> resolves normally. Git the
+current build (<code>./install.sh --verify</code>).</p>
+<h2 id="emulation--x86"><a class="header" href="#emulation--x86">Emulation / x86</a></h2>
+<p><strong>Can I run x86_64 apps?</strong>
+Yes — box64 inside the guest: install/build box64 anywhere under the default
+lookup path (<code>/usr/local/bin/box64</code> in the rootfs) and plain
+<code>sprout -r R -- ./x86-app</code> auto-wraps, no flags. <code>-q PATH</code> (or
+<code>SPROUT_BINFMT_X86_64</code>) overrides the emulator path explicitly. Host (Termux) box64/qemu-user
+works too, sprout detects the bionic emulator and direct-spawns it —
+but Android blocks <code>set_robust_list</code> for host-bionic children and the
+guest <code>ld-linux</code> path is invisible to it, so static x86 + fresh-dynamic
+x86 guests should use the in-guest box64 lane.</p>
+<p><strong>Sober / VinegarHQ configuration?</strong>
+Upstream builds of Sober target x86_64 only. On our aarch64 lane the
+flathub entry doesn’t exist. Use the native Android client or FEX/Box64.</p>
+<p><strong>i386?</strong>
+Via box64’s integrated box32 persona (<code>SPROUT_BINFMT_I386</code> if you have a
+separate box86). Debian-box64 binaries are x86_64-only today.</p>
+<p><strong>FEX-Emu as an alternative x86 backend?</strong>
+FEX runs as a plain aarch64 guest process under sprout — build it inside the
+rootfs, invoke <code>FEX ./x86-app</code> and host paths resolve via FEX’s own loader.
+<strong>Experimental, not the shipped default.</strong> The live constraints that keep
+box64 first:</p>
+<ol>
+<li>FEX dispatches guest syscalls itself; LD_PRELOAD path coating does not
+apply to FEX-internal guest paths. Configs that assume <code>/proc/self/exe</code> -
+relative resolution, or that rely on the guest’s own <code>chdir</code> semantics,
+behave differently under FEX than under box64.</li>
+<li>FEX’s <code>RootFS</code> config knob pulls in FEXServer client-server machinery
+whose standalone launch protocol isn’t solved in-tree yet — the steam
+probe stalled there. See STEAM-INSTALL.md §8 for the open branches.</li>
+<li>SysV-IPC under FEX works only via the in-source shim
+(../adr/0018-userspace-sysvipc-shim.md) spliced into FEX’s own
+<code>Semaphore.cpp</code> — not upstreamable, carried as a local patch.</li>
+</ol>
+<p>Use box64 unless you have a specific FEX requirement; the SysV-IPC shim
+(ADR-0018) is exercised through box64’s <code>BOX64_LD_PRELOAD</code> hook in
+tests/test-sysvipc-shim.sh.</p>
+<h2 id="syscalls--compatibility"><a class="header" href="#syscalls--compatibility">Syscalls / compatibility</a></h2>
+<p><strong><code>Bad system call</code> when I do <code>syscall(291)</code> (statx) by hand?</strong>
+That’s Android policy killing RAW <code>svc(291)</code> for the untrusted UID —
+reminder: the host filter’s KILL decision outranks any user-notify answer, so the
+process dies identically under proot. glibc’s <code>statx()</code> wrapper DOES work:
+the preload lane interposes it via PLT and answers through emulation when
+necessary. Write apps through libc.</p>
+<p><strong>LibreOffice/service says “ERROR: /proc not mounted”?</strong>
+Fixed: sprout fakes <code>/proc/version</code>, <code>/proc/stat</code>, <code>/proc/loadavg</code>,
+<code>/proc/uptime</code>, <code>/proc/sys/kernel/overflow{u,g}id</code> at every level — memfd
+answers, materialized file reroute, notify ADDFD, classic scratch-file —
+AND the new statx emulation completes the story. LibreOffice 26.2 maps
+a working window under this build (‘Untitled 1 — LibreOffice Writer’).</p>
+<p><strong>Can I debug inside the guest (gdb/strace)?</strong>
+No — ptrace is owned by the supervisor. Debug from the host side or use
+SPROUT_DEBUG -v traces. This is the same class as proot.</p>
+<p><strong>mount/loop/namespaces?</strong>
+Kernel-block for every rootless runner. Out of this model.</p>
+<h2 id="desktop--x11"><a class="header" href="#desktop--x11">Desktop / X11</a></h2>
+<p><strong>Desktop opens, windows map, but everything is slow?</strong>
+Typomorph classes: (1) compositor/on for xfwm4: <code>xfconf-query -c xfwm4 -p /general/use_compositing -s false</code> fixes it on this device family; (2) you skipped <code>--shared-tmp</code> so the X socket is unreadable by root children; (3) HyperOS put the x11 display into zombie state — run <code>~/projeto/x11-rescue.sh</code>.</p>
+<p><strong>Audio crackles or stalls after a termux pkg upgrade?</strong>
+pkg resets <code>$PREFIX/etc/pulse/default.pa</code> conffile. Re-add the
+<code>module-native-protocol-tcp</code> line (<code>auth-ip-acl=127.0.0.1 auth-anonymous=1</code>).
+<code>~/pulse-guard.sh</code> heals it automatically now.</p>
+<h2 id="correctness-rules-of-thumb"><a class="header" href="#correctness-rules-of-thumb">Correctness rules of thumb</a></h2>
+<p><strong>Debug an app crash: sprout’s fault?</strong>
+Control-lane doctrine: run the same binary under <code>proot -r $D ...</code>
+(<code>~/proot-control.sh</code>). Identical crash = the app is broken in
+containerized environments; sprout can’t fix that tax. Crash ONLY under
+sprout = bug against us, file it with the repro.</p>
+<p><strong>Fake root is privilege?</strong>
+<code>id -u == 0</code> inside a guest describes ITS address space only — the host
+kernel’s view never changed. If code trusts it for a security decision,
+that code was already wrong under proot too.</p>
+<h2 id="installation--upgrades"><a class="header" href="#installation--upgrades">Installation / upgrades</a></h2>
+<p><strong>How to verify a dev <code>.so</code> build matches the deployed one?</strong>
+Rebuild in-guest with the canonical recipe and compare md5s. ⚠ the source
+file must carry the SAME filename (<code>/tmp/sprout_preload.c</code>): gcc bakes
+the name into <code>.note.gnu.build-id</code> + <code>.symtab</code> — <code>hc-preload.c</code> vs
+<code>sprout_preload.c</code> yields a different binary for identical code. The
+healthcheck (<code>~/projeto/healthcheck.sh</code>) does this L1 leg for you.</p>
+<p><strong>What batteries run before a release?</strong>
+<code>cargo test --workspace</code>, <code>test_translate</code>, <code>cargo fmt --check</code>, <code>cargo clippy -D warnings</code>, <code>bench/run.sh</code>, <code>bench/run-statics.sh</code>, <code>flagmatrix.sh</code> 11/11, <code>healthcheck.sh</code> 0 fails on BOTH lanes (6.12 notify + 4.14 ptrace), desktop spawn smoke.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="architecture-overview"><a class="header" href="#architecture-overview">Architecture overview</a></h1>
 <p>sprout is four small layers, each independently testable:</p>
@@ -1080,6 +1211,12 @@ on-disk ELF files; both are untrusted-content and parsed defensively
 isolation, no syscall policy. If you need confinement from a hostile
 guest, nest sprout inside a kernel-level isolation boundary (Android app’s
 own UID sandbox is the natural one for Termux).</p>
+<p>That non-goal is also the security <strong>answer</strong>: anything a guest binary can
+do under sprout is achievable by a native Termux binary the user could
+run by hand. sprout never grants a capability the host shell didn’t
+already have — it only changes which <em>paths</em> and which <em>uid</em> the guest
+believes it has. The threat “a guest did something nasty” is therefore a
+report upstream of sprout (the guest binary itself), not a sprout bug.</p>
 <h2 id="reporting"><a class="header" href="#reporting">Reporting</a></h2>
 <p>See <a href="../SECURITY.html">SECURITY.md</a> for disclosure.</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -2422,13 +2559,21 @@ parity: proot also only patches release). Env is <code>pushed</code> onto
 <code>bash -c uname</code> see the same spoof.</p>
 </li>
 <li>
-<p><strong><code>-p, --port-mapping</code></strong> — preload <code>bind(2)</code> wrapper: for
+<p><strong><code>-p, --port-mapping [BASE]</code></strong> — preload <code>bind(2)</code> wrapper: for
 AF_INET/AF_INET6 with <code>sin_port ∈ [1, 1023]</code>, the kernel call gets
-<code>1024 + port</code> (proot formula). Connect(2) is NOT remapped (client
-intent is sacred in v1). This exists because Android denies
-<code>CAP_NET_BIND_SERVICE</code> to Termux apps — yet on the Xiaomi
-25102PCBEG kernel (6.12.23), bind(:80) surprisingly works; map stays
-documented device-honesty for older kernels.</p>
+<code>BASE + port</code>. BASE defaults to 1024 (proot parity formula); explicit
+<code>-p 8000</code> remaps <code>:22</code>→<code>:8022</code> for example — useful when the host’s
+<code>1000-Series</code> db stack or another guest is already parked on the
+<code>10xx</code> low-ports. <code>SPROUT_PORTMAP_BASE</code> env overrides for script use.
+Guards: BASE ∈ [1024, 64512] rejected otherwise (must leave room for
+guest :1023 → host BASE+1023 under 65535).
+Connect(2) is NOT remapped (client intent stays pure), but
+<code>getsockname(2)</code> on a remapped listen-fd reports the guest-intended
+port (not BASE+port), tracked by a per-process fd→orig-port registry
+dropped on close. The guest’s self-model (sshd logs, avahi announcements,
+dhcpd checks) stays consistent with config. Validated 2026-08-25 on
+HyperOS 6.12.23: guest binds :22, host opens 1046 (default) / 8022
+(-p 8000), guest getsockname reports 22 in both cases.</p>
 </li>
 <li>
 <p><strong><code>-v/--verbose [LEVEL]</code></strong> — clap <code>num_args 0..=1</code> + <code>default_missing = 1</code>: both <code>-v</code> and <code>-v 3</code> parse; level &gt; 0 = debug on (SPROUT_DEBUG=1
@@ -2551,7 +2696,144 @@ musl .so until the musl build flow lands).</li>
 the binfmt (box64/steam) lane; ADR-0020 covers shm for MIT-SHM.</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="0021-fex-emu-sysv-ipc-via-in-source-shim"><a class="header" href="#0021-fex-emu-sysv-ipc-via-in-source-shim">0021: FEX-Emu SysV IPC via in-source shim</a></h1>
+<p>Date: 2026-08-24
+Status: accepted (experimental — local patch, not upstreamed)</p>
+<h2 id="context-20"><a class="header" href="#context-20">Context</a></h2>
+<p>Steam’s <code>tier0</code> startup requires SysV semaphores on the <strong>i386</strong> ABI.
+Under sprout + box64/box32 that is covered by the LD_PRELOAD shim in
+ADR-0018 (guest loader pulls <code>libsprout-sysvipc.so</code> in via
+<code>BOX64_LD_PRELOAD</code>, <code>semget</code>/<code>semctl</code>/<code>semop</code> interpose at the libc
+wrappers, object state lives in <code>$SPROUT_SYSVIPC_DIR</code> fd-backed files).</p>
+<p>When we tried to lift the same steam install onto <strong>FEX-Emu</strong> (to escape
+box32’s GLX / dladdr walls), the preload approach broke down:</p>
+<ul>
+<li>FEX implements the guest syscall surface in <code>Source/Tools/LinuxEmulation/LinuxSyscalls</code>.
+For SysV it routes through <code>::syscall(SYSCALL_DEF(semget))</code> — a raw
+passthrough to the host kernel. An LD_PRELOAD DSO preloaded into the
+FEX <strong>loader</strong> process does not reach FEX’s own internal <code>::syscall</code>
+call sites, so the shim never fires and <code>semget</code> returns ENOSYS.</li>
+<li>FEX exposes no runtime toggle for SysV emulation and upstream’s answer
+to emulated IPC is “use a real VM”.</li>
+</ul>
+<h2 id="decision-19"><a class="header" href="#decision-19">Decision</a></h2>
+<p>Patch FEX’s own <code>x32/Semaphore.cpp</code> in place:</p>
+<ol>
+<li>Add a userspace <code>SysVSemSpace</code>: process-internal <code>std::unordered_map</code>s
+keyed by <code>key_t</code> AND by synthetic semid, with per-object
+<code>std::mutex + std::condition_variable</code> and a monotonically-increasing
+version counter so <code>semop</code> waiters wake reliably under contention.</li>
+<li>Implement <code>sysv_semget</code>, <code>sysv_semop</code>, <code>sysv_semtimedop</code>,
+<code>sysv_semctl_32</code> (IPC_SET/IPC_STAT/GETALL/SETALL/SETVAL/GETVAL/IPC_INFO/
+IPC_RMID/GETPID/GETNCNT/GETZCNT) on top of that table, honoring
+IPC_PRIVATE + IPC_EXCL. SEM_UNDO is documented as a no-op.</li>
+<li>Rewire <code>REGISTER_SYSCALL_IMPL_X32(semget/semctl/semop/semtimedop)</code> and the
+<code>semctl</code> i386-mux lambda to route into the emulation instead of
+<code>::syscall</code> passthrough. MSG_/SHM_ remain passthrough — steam does not
+touch them via SysV, and keeping them raw preserves any future host
+where CONFIG_SYSVIPC=y.</li>
+</ol>
+<p>The emulation is <strong>per-FEX-process</strong>, not cross-process persistent — steam
+runs a single supervisor + client pair under one FEX instance, which this
+covers. Anything needing cross-process SysV identity stays on the box64
+shim path (ADR-0018) which is fd-backed and survives process boundaries.</p>
+<h2 id="consequences-19"><a class="header" href="#consequences-19">Consequences</a></h2>
+<ul>
+<li>steam’s <code>tier0</code> semaphore phase clears under FEX; the client proceeds
+past <code>CProcessEnvironmentManager is ready</code> where every prior lane
+(box32, arm64-native) had died.</li>
+<li>The patch is a guest-side fork-local change, not upstreamable as-is
+(FEX upstream deliberately does not emulate IPC). Carried as
+<code>~/projeto/FEX-sprout-final.bundle</code>.</li>
+<li>FEX’s <code>RootFS</code> config knob is out of scope for this shim and its
+FEXServer launch protocol is currently unsolved — host-path ↔ guest-path
+drift through FEX (e.g. steam’s “Couldn’t chdir into the install path”)
+is a separate open problem documented in STEAM-INSTALL.md §8.</li>
+<li>sprout itself is untouched: this is a consumer-side patch on the
+emulator FEX, in the layered model (sprout = path translation, FEX =
+ISA translation, shim = syscall emulation) each concern stays in its own
+layer.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="benchmarks"><a class="header" href="#benchmarks">Benchmarks</a></h1>
+<h3 id="2026-08-22--comprehensive-suite-benchrun-allsh"><a class="header" href="#2026-08-22--comprehensive-suite-benchrun-allsh">2026-08-22 — comprehensive suite (<code>bench/run-all.sh</code>)</a></h3>
+<p>Full-suite workspace: one command, one <code>summary.md</code> + <code>machine-info.md</code>
+provenance block (host SKU/kernel/git SHA/artifact md5s). Cells: smoke
+gates → CPU/workload (MODE=full medians) → statics lane → vkmark GPU
+matrix (Turnip hardware + llvmpipe CPU lanes). Result dir:
+<code>bench/results/comprehensive-20260822-102619/</code> on the HyperOS 6.12 phone,
+Debian trixie guest vs proot-distro control.</p>
+<blockquote>
+<p><strong>2026-08-23 correction — statics lane.</strong> The <code>13.5–15.4×</code> statics figure
+below reproduced proot-<strong>distro</strong> login setup cost, not proot translation
+cost. The control harness (PROOT_LANE=control → raw proot against the
+same rootfs, no login wrapper) ground-truths the notify-lane statics at:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>cell (control lane)</th><th>sprout vs proot</th></tr>
+</thead>
+<tbody>
+<tr><td>spawn ×50 (<code>/usr/bin/busybox true</code>, static→dynamic)</td><td><strong>5.86×</strong></td></tr>
+<tr><td>open+read+close tight loop</td><td><strong>1.45×</strong></td></tr>
+<tr><td>newfstatat tight loop</td><td><strong>2.71×</strong></td></tr>
+<tr><td>self-exec-depth chain</td><td>stubbed — not measurable (notify-statics)</td></tr>
+</tbody>
+</table>
+</div>
+<p>The 13.5–15.4× row is kept below only as a historical record of the bad
+methodology. CPU + vkmark rows above are from the earlier suite and are
+unaffected. Any future statics claims should cite the control-lane
+numbers, not the historical row.</p>
+</blockquote>
+<p>Highlights:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>section</th><th>numbers (vs proot)</th></tr>
+</thead>
+<tbody>
+<tr><td>CPU <code>find /usr -type f</code></td><td><strong>33.2×</strong></td></tr>
+<tr><td>CPU <code>git status</code> / <code>git log</code> (50-file repo)</td><td>7.4× / 3.6×</td></tr>
+<tr><td>CPU <code>tar czf /etc</code></td><td>7.8×</td></tr>
+<tr><td>CPU <code>bash -c true</code>, <code>sh-loop true 500x</code></td><td>5.3× / 5.9×</td></tr>
+<tr><td>statics notify lane (spawn/open/fstatat/self-exec/dyn)</td><td><strong>13.5–15.4×</strong></td></tr>
+<tr><td>statics ptrace-vs-notify overhead</td><td>1.3–1.7× (the ptrace tax we dodge)</td></tr>
+<tr><td>vkmark Turnip (GPU, 1280x720, default PM)</td><td><strong>sprout 5555 vs proot 559 = 9.9×</strong></td></tr>
+<tr><td>vkmark lavapipe (CPU render)</td><td>267 vs 143 = 1.9×</td></tr>
+</tbody>
+</table>
+</div>
+<p>Reproduce: <code>DISPLAY=:0 MODE=full bench/run-all.sh [rootfs] [iterations]</code>.
+<code>PROOT_LANE=control</code> (default in run-all.sh) swaps the proot column to raw
+proot against the SAME rootfs (no proot-distro login) for a translation-
+overhead-only comparison — the control numbers above come from that lane.
+GPU cells require a live X display; every cell logs under the result dir</p>
+<ul>
+<li>a guest vkmark binary on BOTH sides (proot-distro’s container needs one
+apt-installed: <code>proot-distro login debian -- apt install vkmark</code>).</li>
+</ul>
+<h3 id="2026-08-22--exec-era-improvements-post-20233659e1592a"><a class="header" href="#2026-08-22--exec-era-improvements-post-20233659e1592a">2026-08-22 — exec-era improvements (post-#2023365/#9e1592a)</a></h3>
+<p>Lane gains applied across the board on the HyperOS host, Debian trixie
+guest — initial exec-name memo + library-stamp normalize + the ptrace
+canonical tdso fix — the table below is kept as the reference era:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>workload</th><th>sprout vs proot</th></tr>
+</thead>
+<tbody>
+<tr><td><code>git status</code> / <code>git log</code> (50-file repo in-guest, MODE=full)</td><td>4.1–4.6×</td></tr>
+<tr><td><code>find /usr -type f</code></td><td>27.5×</td></tr>
+<tr><td>start-to-spawn jitter (20 subprocess spawns)</td><td>69 ms total</td></tr>
+<tr><td>apt/dpkg transaction lane (install+purge)</td><td>PASS (class-closing, ADR-0012)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Also: statx answers now come from emulation on policy-strict lanes (no
+app-visible delta on this HyperOS class; documented for the 4.14 POCO
+device where answers were already native-only).</p>
+<hr>
 <p>Method: wall-clock medians, on-device (Android 16, aarch64, kernel
 6.12.23). Same guest rootfs and same command lines on both sides;
 <code>proot-distro v5 ... login</code> is the incumbent baseline. Reproduce with
@@ -3055,32 +3337,39 @@ Thermal drift: numbers are point-in-time at 22:40; compare only same-file runs.<
 <tr><th>Milestone</th><th>Scope</th><th>Status</th></tr>
 </thead>
 <tbody>
-<tr><td><strong>v0.1</strong></td><td>Core: workspace, ELF classify → preload strategy, loader-launch, CLI surface</td><td><strong>done</strong> (<code>-b/-w/-0/--link2symlink/-0</code> accepted; <code>--fallback</code> reserved for ptrace path)</td></tr>
+<tr><td><strong>v0.1</strong></td><td>Core: workspace, ELF classify → preload strategy, loader-launch, CLI surface</td><td><strong>done</strong></td></tr>
 <tr><td><strong>v0.2</strong></td><td>execve chaining + shebang scripts + <code>system()</code>/<code>posix_spawn()</code> wrappers so guests spawn guests inside sprout</td><td><strong>done</strong></td></tr>
-<tr><td><strong>v0.3</strong></td><td>ptrace fallback: static binaries (SIGSYS swallow, dirfd + cwd-relative translation, execve rewrite incl. static→dynamic/script)</td><td><strong>done</strong> (nolibc-static class verified: same syscall profile as Go)</td></tr>
-<tr><td><strong>v0.4</strong></td><td>musl/Alpine guests: supervisor-first route (kind=3 musl-dynamic), musl-specific sanitizer table, SONAME-shadow libc, absolute-symlink chasing, suid-drop swallow</td><td><strong>done</strong> (busybox/applet-chains/python3/subprocess verified)</td></tr>
-<tr><td><strong>v0.5</strong></td><td>embeddable <code>.so</code> + Android Library (AAR) for other apps</td><td>planned</td></tr>
-<tr><td><strong>v0.6</strong></td><td>reproducible benchmark suite published, regression alerts in CI</td><td>planned</td></tr>
-<tr><td><strong>v1.0</strong></td><td>proot-distro endpoints all pass on sprout as the backend</td><td>goal</td></tr>
+<tr><td><strong>v0.3</strong></td><td>ptrace fallback: static binaries (SIGSYS swallow, dirfd + cwd-relative translation, execve rewrite incl. static→dynamic/script)</td><td><strong>done</strong></td></tr>
+<tr><td><strong>v0.4</strong></td><td>musl/Alpine guests: supervisor-first route, musl sanitizer table, SONAME-shadow libc, absolute-symlink chasing, suid-drop swallow</td><td><strong>done</strong></td></tr>
+<tr><td><strong>v0.5</strong></td><td>proot-distro flag parity + X11/desktop lanes: <code>--termux-x11</code>/<code>--shared-tmp</code>, <code>-k/--kernel-release</code>, <code>-p/--port-mapping</code>, <code>--kill-on-exit</code>, <code>--sysvipc</code>/<code>--ashmem-memfd</code> acceptance, <code>MOZ_DISABLE_WASM_SIGHANDLERS</code> doc</td><td><strong>done</strong></td></tr>
+<tr><td><strong>v0.5.1</strong></td><td>hardening + perf pass: env-wipe exec-chain survival, library-stamp normalize, exec-name memo, <code>-P/--redirect-ports</code> aliases, fake-proc full table (version/uptime), statx emulation, host-bionic <code>-q</code> lane, CLI unknown-flag discipline + <code>-i/--change-id</code>/<code>-L</code> aliases, LibreOffice class</td><td><strong>done (tip)</strong></td></tr>
+<tr><td><strong>v0.6</strong></td><td>publish workflow + mdBook online, reproducible benchmark cards, hour-batteries in CI (healthcheck.sh lanes on both phone classes)</td><td>in-flight</td></tr>
+<tr><td><strong>v0.7</strong></td><td>alpine/musl lane hardening ‖ arm32 guest lane ‖ wine-class canvas on box32</td><td>scoped</td></tr>
+<tr><td><strong>v1.0</strong></td><td>sprout-distro: proot-distro-style UX shipped on sprout as the backend (install/uninstall/login/backup with byte-identical flags)</td><td>goal</td></tr>
 </tbody>
 </table>
 </div>
-<p>The numbers are set by ADRs (0002, 0004, 0005); changes to goals get their
-own ADR.</p>
-<h2 id="v01-exit-criteria"><a class="header" href="#v01-exit-criteria">v0.1 exit criteria</a></h2>
+<p>The numbers are set by ADRs; goal changes get their own ADR.</p>
+<h2 id="current-focus-queue-post-051"><a class="header" href="#current-focus-queue-post-051">Current focus queue (post-0.5.1)</a></h2>
+<ol>
+<li>Management UX polish: login shortcuts, helper scripts (<code>start-desktop.sh</code>,
+<code>x11-rescue.sh</code>, <code>stack-health.sh</code>, <code>healthcheck.sh</code>, <code>flagmatrix.sh</code>)
+→ candidate to fold into a <code>sprout-distro</code> thin frontend.</li>
+<li>Fake-proc table extension on demand (<code>/proc/net/dev</code> from <code>/sys/class/net</code>
+counters is first in line, only once an actual tool dies on it).</li>
+<li>mdBook publish pipeline (drop-in gh-pages build from this branch).</li>
+<li>perf-resident: notify-only statics benches in the matrix; HEAP footprint
+audit of the preload on long-running desktop sessions.</li>
+</ol>
+<h2 id="v01-exit-criteria-kept-from-the-era-all-satisfied-years-go"><a class="header" href="#v01-exit-criteria-kept-from-the-era-all-satisfied-years-go">v0.1 exit criteria (kept from the era, all satisfied years-go)</a></h2>
 <ul>
 <li><code>sprout -r /path/to/ubuntu /usr/bin/node --version</code> prints the node version.</li>
 <li><code>cargo test --workspace</code> green on Termux (self-hosted runner, see
 development workflow notes).</li>
 <li><code>--dry-run</code> documents the full exec plan for any guest ELF.</li>
-<li>No <code>.text</code> patching, no <code>ptrace</code>, no temp files created at run time.</li>
+<li>No <code>.text</code> patching, no <code>ptrace</code>, no temp files created at run time
+(exceptions folders: <code>~/.cache/sprout</code> derivatives, norm-stamps).</li>
 </ul>
-<h2 id="v03-design-sketch-static-binaries--exec-fallback-supervisor-ptrace-last-resort-adr-0002"><a class="header" href="#v03-design-sketch-static-binaries--exec-fallback-supervisor-ptrace-last-resort-adr-0002">v0.3 design sketch (static binaries / exec-fallback supervisor; ptrace last resort, ADR-0002/)</a></h2>
-<p>The preload core’s <code>execve</code> wrapper becomes real: it prepends the loader
-to the target argv, keeps its own <code>SPROUT_*</code> env, and injects itself into
-the child’s <code>LD_PRELOAD</code>, preserving the loop across exec. Scripts
-(<code>#!...</code>) unpack their interpreter in the wrapper instead of the kernel.
-Single-file tests in the interposer gate this.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="building"><a class="header" href="#building">Building</a></h1>
 <h2 id="native-on-the-android-device-termux"><a class="header" href="#native-on-the-android-device-termux">Native, on the Android device (Termux)</a></h2>
@@ -3185,6 +3474,33 @@ Do not renumber or respell without updating plan.rs tests.</li>
 <li><code>--shared-tmp</code> is sugar for a single <code>Binding</code>; do not add side
 effects to it.</li>
 </ol>
+<h2 id="batteries-run-before-any-claim-done"><a class="header" href="#batteries-run-before-any-claim-done">Batteries (run before ANY claim “done”)</a></h2>
+<p>Every contributor-visible “ship” fan-out = this exact cycle (the
+<code>~/projeto/</code> scripts are maintainer-side helpers pinned in-memory; the
+canon is replicated here for CI and docs):</p>
+<pre><code>cargo test --workspace
+cd crates/sprout-preload/csrc/tests &amp;&amp; gcc -std=c11 -O2 -Wall -Wextra -Wpedantic \
+    -D_GNU_SOURCE -o /tmp/ttr test_translate.c ../sprout_preload.c -ldl &amp;&amp; /tmp/ttr
+cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+bench/run.sh $ROOTFS    bench/run-statics.sh $ROOTFS
+~/projeto/flagmatrix.sh           # 11/11 expected
+~/projeto/healthcheck.sh          # 3-layer gate, 0 fails expected; both lanes
+</code></pre>
+<p><code>healthcheck.sh</code> covers: git clean, fmt, clippy, cargo test, canonical
+test_translate, deployment md5 identity (sprout/super vs the freshest
+target build + an in-guest canonical <code>.so</code> rebuild), the full runtime
+probe set, the six-path fake-proc readback, glibc statx probe, flagmatrix,
+AND a cross-phone mode comparing against expected md5 goldens.</p>
+<p><strong>Canonical <code>.so</code> recipe (hard requirement; deviations = half-inert
+artifacts)</strong>: in a glibc guest (debian rootfs on the dev phone),
+<code>gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -fPIC -shared \ -DSPROUT_INTERPOSE -o libsprout-core.so sprout_preload.c -ldl</code> — with the
+source staged as EXACTLY <code>/tmp/sprout_preload.c</code>. The filename is part of
+the contractual identity (<code>symtab+build-id bake-in</code> — another name yields
+different bytes for identical code, proven 2026-08-22).</p>
+<p><strong>Control-lane doctrine</strong> alongside: every app-crash hypothesis must first
+run <code>~/proot-control.sh</code> — the same binary under raw <code>proot</code>. Identical
+crash = app broken (sprout can’t fix that); differing = bug against us.</p>
 
                     </main>
 

@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e71ed169.js";
+            window.path_to_searchindex_js = "searchindex-fd6a00af.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-1f510b02.js"></script>
+        <script src="toc-02a38309.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -181,35 +181,51 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="sprout"><a class="header" href="#sprout">sprout</a></h1>
-<p><strong>Rootless glibc/musl Linux userspace for Android. Fast, auditable, open.</strong></p>
-<p><code>sprout</code> runs full Linux userspaces (Node.js, Python, Git, Chromium, X
-applications, desktop sessions) on Android without root. It is a drop-in
-replacement for <a href="https://proot-me.github.io/">proot</a> with an <code>LD_PRELOAD</code> fast
-path that avoids ptrace syscall-stop overhead, plus automatic ptrace fallback
-for static/Go binaries and a pure-notify stub lane for AArch64 statics.</p>
-<h2 id="status"><a class="header" href="#status">Status</a></h2>
-<p><strong>Working today on-device (Termux, aarch64):</strong></p>
+<p><strong>Rootless glibc/musl Linux userspace for Android.</strong> A drop-in replacement
+for proot/proot-distro that keeps proot’s observable semantics on the
+hot paths where it matters (file-system translation, exec chains, env
+survival, proot-distro flag compatibility) while replacing its engine:</p>
 <ul>
-<li>Interactive glibc shells (bash/zsh) with X11 + audio (termux-x11 preset)</li>
-<li>XFCE4 desktop sessions + Firefox ESR under <code>--shared-tmp --termux-x11</code></li>
-<li>Package managers: <code>apt</code>/<code>dpkg</code> and <code>apk</code> (musl lane)</li>
-<li>Toolchains: meson, autotools, gcc, clang — full native-source builds inside
-the guest (e.g. Mesa built natively for Turnip GPU bring-up)</li>
-<li>Static and Go binaries (ptrace supervisor, or pure USER_NOTIFY stub lane)</li>
-<li>Two rootfs flavors: glibc (Debian) and musl (Alpine)</li>
-<li>Vulkan visible-present workloads on Turnip (real Adreno GPU) AND llvmpipe
-(software/XShm) under termux-x11 — vkmark head-to-head benchmarks favor
-sprout on both (see <a href="./benchmarks.html">Benchmarks</a>).</li>
-<li>x86_64/i386 guests via the userspace binfmt adapter (box64/box32, qemu,
-or any ARM64 emulator exposing <code>LD_PRELOAD</code>-composable startup) with
-userspace SysV IPC emulation (semaphores + shared memory).</li>
+<li><strong>LD_PRELOAD interposition</strong> for glibc-dynamic guests — no ptrace traps.</li>
+<li><strong>seccomp-user-notify supervisor</strong> for statics, musl guests and the
+syscalls the filter shouldn’t trust to libc.</li>
+<li><strong>Pure-notify <code>sprout-stub</code></strong> on kernels new enough (≥ 5.14 ADDFD) for
+the statics lane without ptrace at all.</li>
+</ul>
+<p>All three lanes share one translation engine (<code>sprout_core</code>), one
+config/env contract, and one cache root (<code>~/.cache/sprout</code>).</p>
+<h2 id="why-it-exists"><a class="header" href="#why-it-exists">Why it exists</a></h2>
+<p>proot generality has a price paid by <em>every</em> glibc app: ptrace-freeze on
+every syscall. On a past-generation phone that is ~2× shell cost; on the
+current Android-16/HyperOS kernel it multiplies into whole-desktop stalls
+(the proot-distro <a href="https://github.com/termux/proot-distro/issues/567">#567</a>
+slowdown class). sprout pays ctx-switches only for:
+<em>syscall numbers glibc can’t interpose (raw svc classes)</em>, <em>binaries that
+can’t carry the preload</em> (static, Go), <em>binaries whose arch differs</em>
+(x86/x86-64 through the binfmt adapter to box64/box32/qemu), and <em>glibc
+internals that ignore <code>LD_PRELOAD</code></em> (see ADR-0011).</p>
+<p>The other side of that ledger: sprout embraces <strong>interposer-side emulation</strong>
+wherever Android policy kills syscalls that glibc apps expect (set_robust_list,
+rseq, sysvipc, <code>/proc/*</code> EACCES table, statx) — documented per class in
+<a href="guide/environment.html">Environment policy</a> + ADR-0006/0007/0011/0018/0020.</p>
+<h2 id="status"><a class="header" href="#status">Status</a></h2>
+<ul>
+<li>v0.5.x, 2026-08 era. Daily-use proven: Debian trixie guest with XFCE4,
+Firefox ESR, LibreOffice, flatpak-flathub, mesa/turnip hardware GL,
+box64 x86 lane, termux-x11 desktops, pulse-AAudio audio, proot-distro
+compatibility invocations of all four shapes.</li>
+<li>Tested deploy channels: HyperOS SDK-36 phone (6.12 kernel, user-notify)
+AND a POCO 4.14 phone (pure classic ptrace lane). Both run the same
+artifact set with 11/11 flag-matrix + healthcheck.</li>
+<li>Every feature/bug ADR-written; <a href="../CHANGELOG.html">CHANGELOG.md</a> records
+the exact-bus payloads.</li>
 </ul>
 <h2 id="layout-of-this-book"><a class="header" href="#layout-of-this-book">Layout of this book</a></h2>
 <ul>
-<li><strong>User guide</strong> — install, proot-compat table, environment policy, X11/GPU</li>
-<li><strong>Architecture</strong> — interceptor model, translation rules, threat model</li>
-<li><strong>ADRs</strong> — numbered decision records, template through shadow-state emulation</li>
-<li><strong>Operations</strong> — benchmarks, roadmap, development notes</li>
+<li><strong>User guide</strong> — installation, proot compat tables, env policy, X11/GPU, FAQ.</li>
+<li><strong>Architecture</strong> — overview, interception model, translation rules, threat model.</li>
+<li><strong>ADRs</strong> — 20+ decisions with rationale (the “how the sausage was made” archive).</li>
+<li><strong>Operations</strong> — benchmarks and development discipline (how we keep it all honest).</li>
 </ul>
 
                     </main>

@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e71ed169.js";
+            window.path_to_searchindex_js = "searchindex-fd6a00af.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-1f510b02.js"></script>
+        <script src="toc-02a38309.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -283,6 +283,33 @@ Do not renumber or respell without updating plan.rs tests.</li>
 <li><code>--shared-tmp</code> is sugar for a single <code>Binding</code>; do not add side
 effects to it.</li>
 </ol>
+<h2 id="batteries-run-before-any-claim-done"><a class="header" href="#batteries-run-before-any-claim-done">Batteries (run before ANY claim “done”)</a></h2>
+<p>Every contributor-visible “ship” fan-out = this exact cycle (the
+<code>~/projeto/</code> scripts are maintainer-side helpers pinned in-memory; the
+canon is replicated here for CI and docs):</p>
+<pre><code>cargo test --workspace
+cd crates/sprout-preload/csrc/tests &amp;&amp; gcc -std=c11 -O2 -Wall -Wextra -Wpedantic \
+    -D_GNU_SOURCE -o /tmp/ttr test_translate.c ../sprout_preload.c -ldl &amp;&amp; /tmp/ttr
+cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+bench/run.sh $ROOTFS    bench/run-statics.sh $ROOTFS
+~/projeto/flagmatrix.sh           # 11/11 expected
+~/projeto/healthcheck.sh          # 3-layer gate, 0 fails expected; both lanes
+</code></pre>
+<p><code>healthcheck.sh</code> covers: git clean, fmt, clippy, cargo test, canonical
+test_translate, deployment md5 identity (sprout/super vs the freshest
+target build + an in-guest canonical <code>.so</code> rebuild), the full runtime
+probe set, the six-path fake-proc readback, glibc statx probe, flagmatrix,
+AND a cross-phone mode comparing against expected md5 goldens.</p>
+<p><strong>Canonical <code>.so</code> recipe (hard requirement; deviations = half-inert
+artifacts)</strong>: in a glibc guest (debian rootfs on the dev phone),
+<code>gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -fPIC -shared \ -DSPROUT_INTERPOSE -o libsprout-core.so sprout_preload.c -ldl</code> — with the
+source staged as EXACTLY <code>/tmp/sprout_preload.c</code>. The filename is part of
+the contractual identity (<code>symtab+build-id bake-in</code> — another name yields
+different bytes for identical code, proven 2026-08-22).</p>
+<p><strong>Control-lane doctrine</strong> alongside: every app-crash hypothesis must first
+run <code>~/proot-control.sh</code> — the same binary under raw <code>proot</code>. Identical
+crash = app broken (sprout can’t fix that); differing = bug against us.</p>
 
                     </main>
 

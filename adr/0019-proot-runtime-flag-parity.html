@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e71ed169.js";
+            window.path_to_searchindex_js = "../searchindex-fd6a00af.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1f510b02.js"></script>
+        <script src="../toc-02a38309.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -199,13 +199,21 @@ parity: proot also only patches release). Env is <code>pushed</code> onto
 <code>bash -c uname</code> see the same spoof.</p>
 </li>
 <li>
-<p><strong><code>-p, --port-mapping</code></strong> — preload <code>bind(2)</code> wrapper: for
+<p><strong><code>-p, --port-mapping [BASE]</code></strong> — preload <code>bind(2)</code> wrapper: for
 AF_INET/AF_INET6 with <code>sin_port ∈ [1, 1023]</code>, the kernel call gets
-<code>1024 + port</code> (proot formula). Connect(2) is NOT remapped (client
-intent is sacred in v1). This exists because Android denies
-<code>CAP_NET_BIND_SERVICE</code> to Termux apps — yet on the Xiaomi
-25102PCBEG kernel (6.12.23), bind(:80) surprisingly works; map stays
-documented device-honesty for older kernels.</p>
+<code>BASE + port</code>. BASE defaults to 1024 (proot parity formula); explicit
+<code>-p 8000</code> remaps <code>:22</code>→<code>:8022</code> for example — useful when the host’s
+<code>1000-Series</code> db stack or another guest is already parked on the
+<code>10xx</code> low-ports. <code>SPROUT_PORTMAP_BASE</code> env overrides for script use.
+Guards: BASE ∈ [1024, 64512] rejected otherwise (must leave room for
+guest :1023 → host BASE+1023 under 65535).
+Connect(2) is NOT remapped (client intent stays pure), but
+<code>getsockname(2)</code> on a remapped listen-fd reports the guest-intended
+port (not BASE+port), tracked by a per-process fd→orig-port registry
+dropped on close. The guest’s self-model (sshd logs, avahi announcements,
+dhcpd checks) stays consistent with config. Validated 2026-08-25 on
+HyperOS 6.12.23: guest binds :22, host opens 1046 (default) / 8022
+(-p 8000), guest getsockname reports 22 in both cases.</p>
 </li>
 <li>
 <p><strong><code>-v/--verbose [LEVEL]</code></strong> — clap <code>num_args 0..=1</code> + <code>default_missing = 1</code>: both <code>-v</code> and <code>-v 3</code> parse; level &gt; 0 = debug on (SPROUT_DEBUG=1

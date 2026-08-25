@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e71ed169.js";
+            window.path_to_searchindex_js = "../searchindex-fd6a00af.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1f510b02.js"></script>
+        <script src="../toc-02a38309.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -222,6 +222,12 @@ on-disk ELF files; both are untrusted-content and parsed defensively
 isolation, no syscall policy. If you need confinement from a hostile
 guest, nest sprout inside a kernel-level isolation boundary (Android app’s
 own UID sandbox is the natural one for Termux).</p>
+<p>That non-goal is also the security <strong>answer</strong>: anything a guest binary can
+do under sprout is achievable by a native Termux binary the user could
+run by hand. sprout never grants a capability the host shell didn’t
+already have — it only changes which <em>paths</em> and which <em>uid</em> the guest
+believes it has. The threat “a guest did something nasty” is therefore a
+report upstream of sprout (the guest binary itself), not a sprout bug.</p>
 <h2 id="reporting"><a class="header" href="#reporting">Reporting</a></h2>
 <p>See <a href="../../SECURITY.html">SECURITY.md</a> for disclosure.</p>
 
