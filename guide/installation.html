@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-fd6a00af.js";
+            window.path_to_searchindex_js = "../searchindex-d9c01035.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-02a38309.js"></script>
+        <script src="../toc-7efb765d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -225,6 +225,21 @@ cargo build --release --workspace   # produces sprout + supervisor + stub (glibc
 ./install.sh --verify               # auto-fetches the two interposer DSOs from the latest
                                     # GitHub release (sha256-verified) when absent locally
 </code></pre>
+<h2 id="bootstrapping-a-rootfs-from-a-release-tarball-proot---link2symlink-tar-parity"><a class="header" href="#bootstrapping-a-rootfs-from-a-release-tarball-proot---link2symlink-tar-parity">Bootstrapping a rootfs from a release tarball (proot <code>--link2symlink tar</code> parity)</a></h2>
+<p>Users coming from <code>proot-distro</code> often recall <code>proot --link2symlink tar -xJf rootfs.tar.xz</code>. sprout ships the equivalent as the <strong><code>upkg</code></strong> subcommand — no
+guest required:</p>
+<pre><code class="language-sh">sprout upkg rootfs.tar.xz -C ~/myrootfs
+sprout -r ~/myrootfs -- bash        # boots immediately
+</code></pre>
+<p>Policy at write-time: hardlinks are replicated as full-content copies
+(never libc <code>link()</code> — SELinux denies them cross-mount), setuid/setgid bits
+dropped, device/fifo nodes skipped with a count warning, path traversal
+rejected. Supported compressions: <code>.tar</code> / <code>.tar.gz</code> / <code>.tgz</code> / <code>.tar.xz</code>
+/ <code>.txz</code> / <code>.tar.bz2</code> / <code>.tbz2</code> (auto-detected by magic bytes).</p>
+<blockquote>
+<p>Low-effort alternative: <code>pkg install proot &amp;&amp; proot --link2symlink tar -xJf rootfs.tar.xz</code>, then move the rootfs in. Equivalent output;
+<code>upkg</code> exists so you don’t need proot.</p>
+</blockquote>
 <p>If you want the interposer built <em>from your tree</em> (e.g. hacking on
 <code>csrc/sprout_preload.c</code>), build it inside a glibc guest (proot-distro works):</p>
 <pre><code class="language-sh">proot-distro login debian --work-dir $PWD -- /usr/bin/sh -c \

@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-fd6a00af.js";
+            window.path_to_searchindex_js = "../searchindex-d9c01035.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-02a38309.js"></script>
+        <script src="../toc-7efb765d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -209,6 +209,7 @@ is a no-op. The table is sorted by how <code>proot-distro login</code> uses flag
 <tr><td><code>--mixed-mode</code></td><td><code>--fallback=auto</code></td><td>✅ v0.3 (semantics satisfied)</td></tr>
 <tr><td><code>--root-id</code></td><td><code>-0</code></td><td>alias</td></tr>
 <tr><td><code>--verbose &lt;n&gt;</code></td><td><code>-v</code> / <code>--verbose</code></td><td>sprout is less chattery by design</td></tr>
+<tr><td><em>(no proot equivalent)</em></td><td><strong><code>sprout upkg TARBALL [-C DIR]</code></strong></td><td>host-mode rootfs bootstrap (aka proot <code>--link2symlink tar -xJf …</code>). In-Rust extractor with SELinux-aware policy: hardlinks replicated as full-content copies, setuid/setgid dropped, dev/fifo skipped, <code>..</code> / absolute path traversal rejected. See ADR-0022.</td></tr>
 <tr><td><code>-v &lt;n&gt;</code></td><td><code>-v &lt;n&gt;</code></td><td>✅ levels accepted (reserved &gt;1)</td></tr>
 <tr><td><code>-V</code></td><td><code>-V</code></td><td>✅ banner + copyright/license/contact</td></tr>
 <tr><td><code>-h</code></td><td><code>-h</code></td><td>✅ auto-clap usage</td></tr>

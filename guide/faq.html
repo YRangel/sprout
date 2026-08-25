@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-fd6a00af.js";
+            window.path_to_searchindex_js = "../searchindex-d9c01035.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-02a38309.js"></script>
+        <script src="../toc-7efb765d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -271,6 +271,13 @@ sprout = bug against us, file it with the repro.</p>
 kernel’s view never changed. If code trusts it for a security decision,
 that code was already wrong under proot too.</p>
 <h2 id="installation--upgrades"><a class="header" href="#installation--upgrades">Installation / upgrades</a></h2>
+<p><strong>How do I unpack a rootfs tarball without proot?</strong>
+Use <code>sprout upkg TARBALL -C DIR</code> — the in-Rust extractor ships with
+sprout. proot’s <code>--link2symlink tar -xJf …</code> recipe becomes
+<code>sprout upkg rootfs.tar.xz -C ~/myrootfs &amp;&amp; sprout -r ~/myrootfs -- bash</code>.
+Hardlinks materialize as content copies (SELinux denies <code>link()</code> cross-mount);
+no guest programs needed at unpack time. Details: ADR-0022 and
+guide/installation.md.</p>
 <p><strong>How to verify a dev <code>.so</code> build matches the deployed one?</strong>
 Rebuild in-guest with the canonical recipe and compare md5s. ⚠ the source
 file must carry the SAME filename (<code>/tmp/sprout_preload.c</code>): gcc bakes
