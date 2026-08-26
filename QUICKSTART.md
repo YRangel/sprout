@@ -53,6 +53,17 @@ sprout -r ~/myrootfs --user=0:0 -- bash    # boots immediately
 Tested: fresh 90 MiB debian rootfs extracts in ~8s on Termux device and
 boots without further fixup.
 
+## Graphical desktop the easy way
+
+The full onboarding path (Termux:X11 pkg + APK, rootfs, DNS, xfce install,
+runtime dir, launcher) lives in [docs/src/guide/getting-started.md](docs/src/guide/getting-started.md).
+Shortest pointer: do Steps 0–7 in order. Each step has ONE check before
+you move on.
+
+If you hit one of the classic failure modes (`FAIL handshake`,
+`Cannot open display`, `dpkg` postinst path-leak), that page has a table
+mapping every error to its fix.
+
 ## Packages work inside guests
 
 The apt / apk cycle (download, verification via sqv, unpack, post-install

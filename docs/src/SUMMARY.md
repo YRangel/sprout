@@ -4,6 +4,7 @@
 
 # User guide
 
+- [From zero to desktop](./guide/getting-started.md)
 - [Installation](./guide/installation.md)
 - [proot compatibility](./guide/proot-compat.md)
 - [Environment policy](./guide/environment.md)

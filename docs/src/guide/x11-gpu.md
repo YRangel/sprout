@@ -7,7 +7,11 @@ exactly the same semantics — through the same mechanism, not virtualization.
 ## X11 (verified)
 
 ```
-pkg install termux-x11-xfce4     # any X server on the host side
+pkg install x11-repo -y
+pkg install termux-x11-nightly -y
+# AND install the matching Android app (APK) from F-Droid or
+# https://github.com/termux/termux-x11/releases — the pkg is a launcher,
+# the APK is the actual X server. Both halves, same store family.
 termux-x11 :0                    # display :0 lives at $PREFIX/tmp/.X11-unix/X0
 ```
 
