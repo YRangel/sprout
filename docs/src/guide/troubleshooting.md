@@ -58,13 +58,13 @@ sprout (<0.5.1). Rebuild or reinstall; upgrade-path doc lives in
 inside the guest the same address is the guest's own loopback with nothing
 listening.
 
-**Fix** (from Termux, replace `~/deltahalo` with your rootfs dir):
+**Fix** (from Termux, replace `~/linux` with your rootfs dir):
 ```sh
-rm -f ~/deltahalo/etc/resolv.conf
-printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > ~/deltahalo/etc/resolv.conf
+rm -f ~/linux/etc/resolv.conf
+printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > ~/linux/etc/resolv.conf
 ```
 
-Check: `sprout -r ~/deltahalo --user=0:0 -- ping -c 1 deb.debian.org`
+Check: `sprout -r ~/linux --user=0:0 -- ping -c 1 deb.debian.org`
 shows an IPv4/IPv6 address.
 
 ### `apt update` fails even after resolv.conf
@@ -173,8 +173,8 @@ it.
 
 **Fix once**, from host-side Termux:
 ```sh
-sprout -r ~/deltahalo --user=0:0 -- mkdir -p /tmp/runtime-root
-chmod 700 ~/deltahalo/tmp/runtime-root
+sprout -r ~/linux --user=0:0 -- mkdir -p /tmp/runtime-root
+chmod 700 ~/linux/tmp/runtime-root
 ```
 
 ### `pulseaudio --start failed` at desktop launch

@@ -1,45 +1,38 @@
 # From zero to a desktop: step by step
 
-Literally every step, why it exists, what to check before moving on. Copy each
-block one at a time, check the line under it, **then** continue. If a check
-fails, STOP — read the "if this went wrong" subsection for that step before
-typing anything else.
+Every step below says what it does, why it exists, and the one thing to
+check before moving on. Copy one block at a time. If the check fails, stop
+— the fix is right there under **If this went wrong**.
 
-Reader assumed: fresh Termux, never ran sprout, wants an XFCE desktop.
+Goal at the end of this page: a full XFCE desktop running inside sprout,
+in the Termux:X11 Android app, with sound.
 
 ---
 
-## Step 0 — prerequisites on the Android side (no guests yet)
+## Step 0 — install the Termux:X11 half (no guests yet)
 
-sprout runs rootless inside your Termux session, but it cannot conjure
-an X server out of nothing. You need:
+A desktop needs an X server. On Android that means **two** components
+that must come from the *same store family* (both F-Droid, or both
+GitHub releases — signatures must match):
 
-1. **Termux itself** updated:
-   ```sh
-   pkg update && pkg upgrade -y
-   ```
-   ✅ You should see `All packages are up to date.`
+```sh
+pkg update && pkg upgrade -y
+pkg install x11-repo -y
+pkg install termux-x11-nightly -y
+```
 
-2. **Termux:X11 packages** — the Termux half:
-   ```sh
-   pkg install x11-repo -y
-   pkg install termux-x11-nightly -y
-   ```
-   ✅ Check: `which termux-x11` prints a path.
+Then install the **Termux:X11 Android app** (the `.apk` from
+https://github.com/termux/termux-x11/releases — file ends in
+`termux-x11-nightly-*-universal.apk`, or from F-Droid). Open the app once
+so Android registers it.
 
-3. **Termux:X11 Android app** — the other half (`termux-x11` in Termux is
-   just the launcher; the actual X server is an app):
-   - Install it from F-Droid **or** from the GitHub release
-     [termux/termux-x11 releases](https://github.com/termux/termux-x11/releases)
-     (file name ends in `.apk`, e.g. `termux-x11-nightly-…-universal.apk`),
-     then open the app once so Android registers it.
-   - **⚠ Install from the SAME source family as Termux itself.** Mixed
-     F-Droid-Termux + Play-Store-termux-x11 (or vice versa) gives silent
-     `socket: No such file` errors — the two apps signed by different keys
-     can't see each other's data.
+✅ `which termux-x11` prints a path; the Termux:X11 app icon is on your
+launcher.
 
-   ✅ Check: you should have an app called "Termux:X11" on your launcher
-   with a green X icon.
+> **⚠ Mixing F-Droid Termux + GitHub APK (or the reverse) never works.**
+> Different signing keys → the app and the shell can't see each other's
+> sockets. If Termux came from F-Droid, get the APK from F-Droid; if it
+> came from GitHub, get the APK from the same releases page.
 
 ---
 
@@ -51,293 +44,325 @@ git clone https://github.com/YRangel/sprout.git && cd sprout
 cargo build --release --workspace
 bash install.sh --verify
 ```
-✅ Check: `sprout --version` prints something like `sprout 0.5.1`.
 
-**If this went wrong:** `install.sh` downloads the two prebuilt interposer
-`.so` files from GitHub (your phone cannot build them, ARM guest ABI).
-If download fails, the script says so and exits non-zero — check your
-connection and re-run. Do NOT continue past this error.
+✅ `sprout --version` prints `sprout 0.5.1` (or newer).
+
+**If this went wrong:** `install.sh` downloads two prebuilt `.so` files
+from the GitHub release — your phone can't compile them (they're glibc
+ABI). A network hiccup fails here loudly. Rerun until `--verify` passes.
 
 ---
 
-## Step 2 — get a Linux rootfs onto disk
+## Step 2 — get a Linux rootfs
 
-A rootfs is just a directory full of Debian/Alpine/Ubuntu files. sprout
-ships a proot-compatible downloader equivalent called `upkg`.
-
-Two minutes, glibc Debian example:
+A rootfs is a directory full of distro files. Make one and fill it:
 
 ```sh
-mkdir -p ~/deltahalo
+mkdir -p ~/linux
 cd ~
 curl -LO https://github.com/termux/proot-distro/releases/download/v4.37.0/debian-trixie-aarch64-pd-v4.37.0.tar.xz
-sprout upkg debian-trixie-aarch64-pd-v4.37.0.tar.xz -C ~/deltahalo
+sprout upkg debian-trixie-aarch64-pd-v4.37.0.tar.xz -C ~/linux
 ```
 
-(The URL is one example; any `rootfs-<distro>-<arch>.tar.{xz,gz,bz2}` works.
-`upkg` picks the decompressor automatically from magic bytes.)
+`sprout upkg` extracts the tarball with SELinux-aware rules (hardlinks
+become content-copies, device nodes skipped). Other distros work too —
+any `rootfs-<distro>-aarch64.tar.xz|gz|bz2` URL from a reputable source.
 
-✅ Checks:
+✅ Check both exist:
 
 ```sh
-ls ~/deltahalo/bin/ls       # exists
-ls ~/deltahalo/etc/os-release   # exists
+ls ~/linux/bin/ls
+ls ~/linux/etc/os-release
 ```
 
 **If this went wrong:**
-- `sprout upkg: open ...: No such file` → the tarball path is wrong. `cd` and retry.
-- `mkdir: cannot create directory … : Permission denied` → you wrote `sudo` or
-  ran with `su` somewhere. sprout does NOT want root. Run as plain Termux user.
+- `sprout: command not found` → go back to Step 1.
+- `guest loader not found` → your tarball is for the wrong CPU arch
+  (x86_64 instead of arm64). Get the `aarch64` build.
+- `No such file or directory` on the tarball path → you `cd`'d away.
+  `cd ~` and re-run.
 
 ---
 
-## Step 3 — smoke the rootfs (no graphics yet)
+## Step 3 — boot a shell and make DNS work inside
 
 ```sh
-sprout -r ~/deltahalo --user=0:0 -- /bin/bash -c 'cat /etc/os-release | head -1'
+sprout -r ~/linux --user=0:0 -- /bin/bash
 ```
-✅ Should print something like `PRETTY_NAME="Debian GNU/Linux 13 (trixie)"`.
 
-**If this went wrong:**
-- `sprout: guest loader not found: tried […]` → the tarball didn't contain
-  the loader (`ld-linux-aarch64.so.1`), usually because you unpacked an x86_64
-  rootfs on a phone. `upkg` does not convert architectures. Get an aarch64
-  tarball.
-- `sprout: command not found` → Step 1 didn't finish. Go back.
+✅ The prompt changes (you're *inside* the guest now). Try:
+
+```sh
+cat /etc/os-release | head -1
+ping -c 1 8.8.8.8             # raw IP — works without DNS
+ping -c 1 deb.debian.org      # needs DNS — fails right now, expected
+```
+
+The last one fails because Android's resolver lives on the *host*
+loopback. Inside the guest, `127.0.0.1` is the guest's own empty
+loopback.
+
+**Fix DNS, from plain Termux** (exit the guest shell first with `exit`):
+
+```sh
+rm -f ~/linux/etc/resolv.conf
+printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > ~/linux/etc/resolv.conf
+```
+
+✅ Re-enter and `ping -c 1 deb.debian.org` resolves.
 
 ---
 
-## Step 4 — DNS inside the guest (before any apt)
-
-Android's resolver lives at `127.0.0.1:53` **on the host**. Your guest's
-`127.0.0.1` is its own loopback — nothing there. Machine can't resolve names
-until you write real IPs into guest resolv.conf.
-
-From **Termux, one line**:
+## Step 4 — install XFCE + dbus inside the guest
 
 ```sh
-printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > ~/deltahalo/etc/resolv.conf
-```
-
-If `~/deltahalo/etc/resolv.conf` was a dangling symlink (points at
-`/run/systemd/resolve/...` that doesn't exist in a container), remove it first:
-
-```sh
-rm -f ~/deltahalo/etc/resolv.conf
-printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > ~/deltahalo/etc/resolv.conf
-```
-
-✅ Check: `sprout -r ~/deltahalo --user=0:0 -- ping -c 1 deb.debian.org`
-prints a line with an IP in it.
-
-**If this went wrong:** double-check you used a `>` (not `>>` typo, not a
-newline-in-echo-escape). `cat ~/deltahalo/etc/resolv.conf` should show exactly
-two lines beginning `nameserver`.
-
----
-
-## Step 5 — install XFCE inside the guest
-
-```sh
-sprout -r ~/deltahalo --user=0:0 -- bash
-# (prompt changes — you are now INSIDE the guest — note the localhost name)
+sprout -r ~/linux --user=0:0 -- bash
 apt update
-apt install -y xfce4 xfce4-goodies dbus-x11
+apt install -y xfce4 xfce4-goodies dbus-x11 x11-utils
+exit
 ```
 
-This takes 5–15 min depending on network. apt may ask for a keyboard layout
-— pick whatever you like.
+This takes 5–15 min. `dbus-x11` and `x11-utils` are not optional —
+dbus-x11 provides the session bus launcher xfce depends on, and
+`x11-utils` gives you `xset q` / `xwininfo` for handshake probes later.
 
-✅ When apt exits without red "E:" lines you're done.
+✅ apt ends without red `E:` lines.
 
 **If this went wrong:**
-
-- dpkg errors about `/data/data/com.termux/...` paths inside the guest
-  (the *host* path leaking in): some postinst scripts use realpath() which
-  sees through sprout's translation. Known-shim-gap; workaround that always
-  works once the rest of the package set is fine:
+- `dpkg: ... returned an error exit status 2` mentioning a
+  `/data/data/com.termux/...` path → a postinstall script used
+  `realpath()` which returns the host path. Workaround inside the guest:
 
   ```sh
-  # inside the guest, run these one by one:
   dpkg --configure -a
   apt --fix-broken install
-  # if a specific package still refuses, e.g. dictionaries-common:
+  # if one specific package keeps failing (example: dictionaries-common):
   rm -f /var/lib/dpkg/info/dictionaries-common.postinst
   printf '#!/bin/sh\nexit 0\n' > /var/lib/dpkg/info/dictionaries-common.postinst
   chmod 755 /var/lib/dpkg/info/dictionaries-common.postinst
   dpkg --configure -a && apt-get -f install
-  # optional cleanup once everything is green:
-  apt install --reinstall dictionaries-common
   ```
 
-- `Can't open display` errors during install are HARMLESS at this stage:
-  there is no X server yet. apt is just autodetecting and warning. Will
-  be fixed by Step 6. IGNORE them for now.
+---
 
-Exit the guest shell with `exit` to drop back to Termux when apt is done.
+## Step 5 — the four background jobs a desktop needs
+
+No systemd runs inside sprout (rootless = no PID 1 duties). Android apps
+can't start daemons either. So a working desktop needs **four separate
+processes alive**, in this dependency order:
+
+```
+┌─────────────────────┐
+│  pulseaudio         │  host daemon — sounds via Android audio HAL
+│  (Termux side)      │  listens on TCP 127.0.0.1 + a unix socket
+└─────────┬───────────┘
+          │ (independent)
+┌─────────▼───────────┐
+│  Termux:X11 :0      │  host daemon — the actual X server (the APK)
+│  (Termux:API side)  │  opens /data/data/com.termux/files/usr/tmp/.X11-unix/X0
+└─────────┬───────────┘
+          │ (xfce's session bus must find a live X display)
+┌─────────▼───────────┐
+│  dbus session bus   │  guest process — apps discover each other here
+│  (inside sprout)    │  launched by startxfce4's chain via dbus-x11
+└─────────┬───────────┘
+          │
+┌─────────▼───────────┐
+│  xfce4-session      │  guest process — the actual desktop
+│  (inside sprout)    │  exits when you log out or close the X app
+└─────────────────────┘
+```
+
+If any layer is missing, the layers above it crash with cryptic errors
+(the exact failure cascade is in the troubleshooting section below).
+That's why the launcher script exists at all — to bring each layer up in
+the correct order, every time.
+
+In this step you'll bring each one up **by hand**, understand what it
+does, and only at the end use the one-line script.
 
 ---
 
-## Step 6 — give the guest an X server + audio (one-shot harness)
+## Step 6 — launch the desktop MANUALLY (no harness)
 
-Sprout cannot guess which of your Termux:X11 instances, on which display,
-with which audio daemon, you want. We ship the reference launcher that
-does ALL of this in the right order:
+Do this once so you understand every piece. All of these run in your
+Termux session (not inside sprout).
+
+### 6a — PulseAudio (host side)
 
 ```sh
-# these three files come with the repo, no install needed beyond cp
-cp ~/sprout/examples/desktop/start-desktop.sh  ~/
-cp ~/sprout/examples/desktop/pulse-guard.sh    ~/
-cp ~/sprout/examples/desktop/x11-rescue.sh     ~/
-chmod +x ~/start-desktop.sh ~/pulse-guard.sh ~/x11-rescue.sh
-
-# make it point at YOUR rootfs (any path works; no edits needed inside)
-export SPROUT_DESKTOP_ROOTFS=~/deltahalo
-
-# one-time prep INSIDE the guest: xfce expects this runtime dir
-sprout -r ~/deltahalo --user=0:0 -- sh -c 'mkdir -p /tmp/runtime-root && chmod 700 /tmp/runtime-root'
+pulseaudio --kill 2>/dev/null; sleep 1
+pulseaudio --start --exit-idle-time=-1
 ```
 
-✅ Both blocks ran without errors.
+What this does: starts the sound daemon. `--exit-idle-time=-1` tells it
+**never to quit on silence** — otherwise it exits after a minute of no
+audio and your desktop goes mute.
 
-**If this went wrong**:
-- `mkdir: cannot create directory '/tmp/runtime-root': Permission denied` —
-  your guest's `/tmp` isn't writable by fake-root. Fix once:
-  `rm -rf $PREFIX/tmp/runtime-root` (clean host side too) and re-run.
+✅ `pactl info | grep 'Default Sink'` prints a line.
 
----
+**If this went wrong:** `pulseaudio --start` says failed. Likely a stale
+pid file: `rm -f $PREFIX/var/run/pulse/pid` and retry. Still failing →
+your audio will be absent but the desktop still runs (skip ahead).
 
-## Step 7 — start the desktop (one command from now on)
+### 6b — Termux:X11 server (host side)
 
 ```sh
-~/start-desktop.sh start
+# clean prior attempts: file and process leavings fool the next run
+pkill -f 'termux-x11 :0' 2>/dev/null
+rm -f $PREFIX/tmp/.X0-lock $PREFIX/tmp/.X11-unix/X0
+sleep 2
+
+# launch it for real
+nohup termux-x11 :0 > $PREFIX/tmp/x11.log 2>&1 &
 ```
 
-## What `start` actually does, and WHY each piece exists
+What this does: starts the X server with display `:0`. The server creates
+the unix socket `$PREFIX/tmp/.X11-unix/X0` — that's the rendezvous point
+the guest will connect to.
 
-There's no systemd inside sprout (or any proot-class launcher), and Android
-won't let an app own system services. A desktop session needs **four daemons**
-up and talking to each other — and their startup ordering has to be right.
-The script is a tiny orchestrator for exactly that:
+✅ After ~5 s, `ls -la $PREFIX/tmp/.X11-unix/X0` shows an `s` (socket)
+type file.
 
-```
-pulseaudio (sound)      ── host Termux daemon, speaks OpenSL ES to the
-                          Android audio HAL. Listens on a unix socket.
+**If this went wrong:** `FAIL: no socket after 5s` (look in
+`$PREFIX/tmp/x11.log`). The Termux:X11 Android app isn't installed,
+isn't running, or is signature-mismatched (Step 0 ⚠).
 
-Termux:X11 (display)    ── the Android app. Host X server, real
-                          framebuffer. Listens at /tmp/.X11-unix/X0
-                          in Termux's shared /tmp.
+### 6c — Bring the app window forward
 
-session dbus            ── the "apps talk to each other" bus XFCE
-                          requires. Lives inside the guest.
-
-xfce4-session           ── the actual desktop. Lives inside the guest.
+```sh
+am start -n com.termux.x11/.MainActivity
 ```
 
-The dependency chain: xfce needs dbus; dbus needs X (its auth envelope
-keys off the display); X needs to exist with a good handshake before any
-client can reach it; audio is a leaf but must exist before xfce probes it
-or the session starts muted.
+This asks Android to bring the Termux:X11 app's window to the front.
+You should now see a black screen or a waiting-for-client canvas in the
+app.
 
-### In exact order, here's what `start` runs:
+### 6d — Give the guest its runtime dir + environment
 
-1. **pulse-guard** — spawns a background watchdog that pings pulseaudio
-   every 20 s and cold-restarts it if the process dies. (HyperOS-class
-   kernels occasionally SIGSTOP it under background pressure; the watchdog
-   is cheap insurance.) If you see `WARN: pulseaudio --start failed`
-   that's audio-only — X + desktop still work.
+Still in Termux:
 
-2. **x11-rescue** — the part that fixes the most classic footguns:
-   - kills any zombie `termux-x11` process
-   - **deletes the stale `/tmp/.X11-unix/X0` socket file** (the thing that
-     makes raw `startxfce4` say "X server already running" then fail
-     five lines later — the file exists but nothing listens)
-   - launches a fresh `termux-x11 :0`
-   - polls the socket and connects with a handshake probe, so it only
-     returns success when the X server is really answering queries. If
-     this prints `FAIL handshake` the Termux:X11 APK isn't running or
-     doesn't match your Termux install (Step 0 #3).
+```sh
+sprout -r ~/linux --user=0:0 -- mkdir -p /tmp/runtime-root
+chmod 700 ~/linux/tmp/runtime-root
+```
 
-3. **sprout session launch** — finally, the linux guest wakes up with
-   the right side environment already set:
+`XDG_RUNTIME_DIR` default for uid 0 is `/tmp/runtime-root` and xfce's
+session bus refuses to start without it (mode must be exactly 0700).
 
-   ```sh
-   sprout -r $SPROUT_DESKTOP_ROOTFS \
-          --shared-tmp \
-          --termux-x11 \
-          --user=0:0 \
-          -- /usr/bin/startxfce4
-   ```
+### 6e — Launch startxfce4 inside sprout
 
-   The flags:
-   - `--shared-tmp` — guest `/tmp` gets bound to Termux's `$PREFIX/tmp`.
-     This is how the guest process sees `/tmp/.X11-unix/X0` (the socket
-     from step 2) at the exact path the X protocol expects.
-   - `--termux-x11` — exports `DISPLAY=:0` + `PULSE_SERVER=127.0.0.1`
-     into the guest session, so apps don't have to guess.
-   - `--user=0:0` — fake-root inside the guest, so dpkg-ish login/startup
-     bits work without complaint.
-   - `--` — tells sprout "options stop here, rest is the guest command".  
-   - `/usr/bin/startxfce4` — the xfce session. Runs as long as the desktop
-     stays open; when you close the Termux:X11 app Android-side, this
-     process tears down cleanly and the harness marks itself stopped.
+```sh
+sprout -r ~/linux --shared-tmp --termux-x11 --user=0:0 -- startxfce4
+```
 
-✅ At the end of the 3 steps you should see the Termux:X11 app pop up
-with the XFCE desktop inside.
+What every flag does:
 
-## Why you can't just type the sprout command yourself
+| Flag | Why the desktop needs it |
+|---|---|
+| `-r ~/linux` | which rootfs to enter |
+| `--shared-tmp` | binds host `$PREFIX/tmp` into guest `/tmp` — the X socket file (created in 6b) appears inside the guest at the exact same path |
+| `--termux-x11` | exports `DISPLAY=:0` and `PULSE_SERVER=127.0.0.1` into the guest so XFCE knows where to find display + sound |
+| `--user=0:0` | fake-root identity inside the guest (dpkg-ish session scripts expect it) |
+| `--` | **sprout options stop here** — `startxfce4` is the guest command |
+| `startxfce4` | the actual xfce session; in turn launches dbus-launch, then xfce4-session, then the panel/desktop/WM |
 
-You can. The failure mode: if you typed step 3 directly without steps
-1+2, the guest starts but has no X socket to bind to (`DISPLAY=:0`
-points at nothing), no D-Bus session bus exists yet, and
-`/tmp/runtime-root` probably doesn't exist either. The output is the
-exact segment that confused your friend — cascading of
-`Cannot open display` → `dbus-launch ... failed` →
-`xfce4-session: Cannot open display`. The harness exists because it sets
-all three up in the right order, every time.
+✅ Termux:X11's window shows the XFCE desktop, mouse + keyboard work.
+
+### Closing the session manually
+
+- Log out from XFCE's menu, or close the Termux:X11 app.
+- Back in Termux: `pkill -f startxfce4; pkill -f 'termux-x11 :0'` (and
+  pulseaudio keeps running — that's fine, or `pulseaudio --kill`).
+
+**If this step failed**, read the raw log the launch produced:
+
+```sh
+sprout -r ~/linux --shared-tmp --termux-x11 --user=0:0 -- startxfce4 2>&1 | head -20
+```
+
+Match the first failure line against the table at the bottom of this page.
 
 ---
 
+## Step 7 — the shortcut: one script that does 6a→6e for you
+
+You've now run each piece by hand and know what they do. For daily use,
+the same five steps are bundled in one script that also adds health
+checks and a stale-state sweeper (it auto-deletes that dead
+`/tmp/.X11-unix/X0` file before launching, which is the most common
+"desktop won't start" cause):
+
+```sh
+mkdir -p ~/bin
+cp ~/sprout/examples/desktop/start-desktop.sh \
+   ~/sprout/examples/desktop/pulse-guard.sh \
+   ~/sprout/examples/desktop/x11-rescue.sh ~/bin/
+chmod +x ~/bin/start-desktop.sh ~/bin/pulse-guard.sh ~/bin/x11-rescue.sh
+```
+
+Tell it which rootfs is yours:
+
+```sh
+export SPROUT_DESKTOP_ROOTFS=~/linux
+```
+
+To make that permanent across Termux restarts:
+
+```sh
+echo 'export SPROUT_DESKTOP_ROOTFS=~/linux' >> ~/.bashrc
+```
+
+### Daily commands
+
+```sh
+~/bin/start-desktop.sh start     # full sequence (pulse-guard + x11-rescue + session)
+~/bin/start-desktop.sh stop      # clean stop
+~/bin/start-desktop.sh restart   # bounce everything (use after resume from deep sleep)
+~/bin/start-desktop.sh status    # what's alive right now
+~/bin/start-desktop.sh shell     # extra shell INTO the running guest
+```
+
+### What `start` does, exactly
+
+1. **Audio gate** — is `pactl info` healthy? If not, `pulseaudio
+   --kill`, then start. If it still fails: warns and continues (no
+   audio, but desktop still works). Then it spawns a tiny watchdog
+   (`pulse-guard.sh`) that pings pulse every 20 s and cold-restarts it
+   on silence — HyperOS-class kernels occasionally kill idle daemons.
+2. **X gate** (`x11-rescue.sh`) — finds every leftover `termux-x11`
+   process and numeric-kills it, removes the stale socket file,
+   launches a fresh server, waits until an actual handshake probe
+   (`xwininfo -root` via sprout) returns, and only then proceeds.
+3. **Session launch** — `setsid sprout -r $SPROUT_DESKTOP_ROOTFS
+   --shared-tmp --termux-x11 --user=0:0 -- /usr/bin/startxfce4` in the
+   background. Then it polls `ps` every 5 s for `xfce4-session` and
+   reports success/failure after up to 24 tries.
+
+So `start` is **Step 6 with code around it**. You could do everything it
+does manually (you just did, in Step 6); the script exists so you don't
+have to.
+
 ---
 
-## Step 8 — actually using the thing
+## Common failure map (from real sessions)
 
-While the desktop is running:
-
-- `~/start-desktop.sh stop` — cleanly stop everything.
-- `~/start-desktop.sh status` — print what's running.
-- `~/start-desktop.sh restart` — bounce X+audio+session (use when lockscreen
-  confuses the X server).
-- `~/start-desktop.sh shell` — give you a shell INTO the desktop's guest
-  (apt install more packages, poke around).
-- `~/start-desktop.sh` — alone shows this list again.
-
-You do **not** type `sprout -r ~/deltahalo --shared-tmp --termux-x11
-startxfce4` directly. Without the preflight steps the launch dies with a
-confusing `Cannot open display` error message — the harness exists because
-everyone hits it and nobody enjoys debugging dbus error sprawl.
-
----
-
-## Common failure map
-
-| Error | Real problem | Fix |
+| Error you saw | What it really means | Fix → step |
 |---|---|---|
-| `FAIL: no socket after 5s — nohup: failed to run command '.../termux-x11'` | `termux-x11-nightly` pkg not installed | Step 0 #2 |
-| `FAIL handshake` | APK not running, or APK+Termux from different stores | Step 0 #3 |
-| `X server already running on display :0` then immediate `Can't open display :0` etc | Stale `/tmp/.X11-unix/X0` from a killed run | `rm -f $PREFIX/tmp/.X11-unix/X0` and rerun `~/start-desktop.sh start` |
-| `xfce4-session: Cannot open display` | You bypassed the harness; no DISPLAY set, or `:0` never came up | Use `~/start-desktop.sh start`, not raw `sprout ... startxfce4` |
-| `dbus-launch ... failed to connect to X11 display` | X socket dead → session bus couldn't set up | same as above; harness handles ordering |
-| `XDG_RUNTIME_DIR "/tmp/runtime-root" not available` | Step 6 last command never ran (or guest /tmp wiped) | re-mkdir it: `sprout -r … -- mkdir -p /tmp/runtime-root` then `chmod 700` outside |
-| `Unable to locate package neofetch` | DNS still broken | Step 4 (resolv.conf) |
-| `dpkg: … dictionaries-common` postinst exit 2 | realpath() leaked host path inside guest | dpkg-postinst fence in Step 5 |
-| `unable to connect to D-Bus` inside session | `dbus-x11` pkg missing in the guest | inside guest: `apt install dbus-x11`, restart via the harness |
+| `nohup: failed to run command '…/termux-x11': No such file or directory` | the pkg isn't installed | Step 0 |
+| `== socket up: X0` then `FAIL handshake` | APK not running / signature mismatch | Step 0 ⚠ |
+| `X server already running on display :0` then a wall of `Can't open display` | stale `/tmp/.X11-unix/X0` file | `rm -f $PREFIX/tmp/.X11-unix/X0` and relaunch (script does this) |
+| `XDG_RUNTIME_DIR "/tmp/runtime-root" not available` | Step 6d never ran | redo Step 6d |
+| `dbus-launch: ... failed to connect to X11 display` | startxfce4 ran but no live X server | 6b's handshake must pass first |
+| `Unable to locate package neofetch` | DNS still broken | Step 3 |
+| dpkg postinst errors with `/data/data/com.termux/...` paths | postinst saw the host path via `realpath` | Step 4's workaround |
+| `pulseaudio --start failed` | stale pulse pid | Step 6a's workaround |
 
 ---
 
-## Where to read more (once it works)
+## Where next
 
-- `../guide/proot-compat.md` — every proot flag and sprout's exact status
-- `../guide/environment.md` — env vars that shape behavior
-- `../adr/` — design decisions, why things are the way they are
-- `../guide/faq.md` — the long-form maintenance questions
+- [sprout, by hand](./commands.md) — what every flag actually does
+- [Troubleshooting](./troubleshooting.md) — the long-form symptom index
+- [X11 / GPU guide](./x11-gpu.md) — Turnip-accelerated workloads, how
+  `--shared-tmp` + ICD plumbing are wired
