@@ -207,27 +207,96 @@ sprout -r ~/deltahalo --user=0:0 -- sh -c 'mkdir -p /tmp/runtime-root && chmod 7
 
 ---
 
-## Step 7 — start the desktop (the only command you need from now on)
+## Step 7 — start the desktop (one command from now on)
 
 ```sh
 ~/start-desktop.sh start
 ```
 
-What this does for you, in order, and what each check means:
+## What `start` actually does, and WHY each piece exists
 
-1. `pulse-guard`: keeps pulseaudio alive in the background. If it prints
-   `WARN: pulseaudio --start failed`, audio is dead but display still works.
-   Not fatal.
-2. `x11-rescue`: kills any leftover termux-x11 process, **removes the stale
-   `/tmp/.X11-unix/X0` socket file**, launches a fresh server, and waits
-   until a real handshake answers on the socket. **If this says "FAIL
-   handshake"**, the Termux:X11 Android app is either not installed (Step 0 #3),
-   not running, or was signed from a different repo than Termux itself
-   (Step 0 #3 ⚠). Fix that FIRST before anything else.
-3. Sprout session: spawns `xfce4-session` inside the guest with
-   `--shared-tmp --termux-x11 --user=0:0`.
+There's no systemd inside sprout (or any proot-class launcher), and Android
+won't let an app own system services. A desktop session needs **four daemons**
+up and talking to each other — and their startup ordering has to be right.
+The script is a tiny orchestrator for exactly that:
 
-✅ Your Termux:X11 app should pop up on screen with the XFCE desktop inside.
+```
+pulseaudio (sound)      ── host Termux daemon, speaks OpenSL ES to the
+                          Android audio HAL. Listens on a unix socket.
+
+Termux:X11 (display)    ── the Android app. Host X server, real
+                          framebuffer. Listens at /tmp/.X11-unix/X0
+                          in Termux's shared /tmp.
+
+session dbus            ── the "apps talk to each other" bus XFCE
+                          requires. Lives inside the guest.
+
+xfce4-session           ── the actual desktop. Lives inside the guest.
+```
+
+The dependency chain: xfce needs dbus; dbus needs X (its auth envelope
+keys off the display); X needs to exist with a good handshake before any
+client can reach it; audio is a leaf but must exist before xfce probes it
+or the session starts muted.
+
+### In exact order, here's what `start` runs:
+
+1. **pulse-guard** — spawns a background watchdog that pings pulseaudio
+   every 20 s and cold-restarts it if the process dies. (HyperOS-class
+   kernels occasionally SIGSTOP it under background pressure; the watchdog
+   is cheap insurance.) If you see `WARN: pulseaudio --start failed`
+   that's audio-only — X + desktop still work.
+
+2. **x11-rescue** — the part that fixes the most classic footguns:
+   - kills any zombie `termux-x11` process
+   - **deletes the stale `/tmp/.X11-unix/X0` socket file** (the thing that
+     makes raw `startxfce4` say "X server already running" then fail
+     five lines later — the file exists but nothing listens)
+   - launches a fresh `termux-x11 :0`
+   - polls the socket and connects with a handshake probe, so it only
+     returns success when the X server is really answering queries. If
+     this prints `FAIL handshake` the Termux:X11 APK isn't running or
+     doesn't match your Termux install (Step 0 #3).
+
+3. **sprout session launch** — finally, the linux guest wakes up with
+   the right side environment already set:
+
+   ```sh
+   sprout -r $SPROUT_DESKTOP_ROOTFS \
+          --shared-tmp \
+          --termux-x11 \
+          --user=0:0 \
+          -- /usr/bin/startxfce4
+   ```
+
+   The flags:
+   - `--shared-tmp` — guest `/tmp` gets bound to Termux's `$PREFIX/tmp`.
+     This is how the guest process sees `/tmp/.X11-unix/X0` (the socket
+     from step 2) at the exact path the X protocol expects.
+   - `--termux-x11` — exports `DISPLAY=:0` + `PULSE_SERVER=127.0.0.1`
+     into the guest session, so apps don't have to guess.
+   - `--user=0:0` — fake-root inside the guest, so dpkg-ish login/startup
+     bits work without complaint.
+   - `--` — tells sprout "options stop here, rest is the guest command".  
+   - `/usr/bin/startxfce4` — the xfce session. Runs as long as the desktop
+     stays open; when you close the Termux:X11 app Android-side, this
+     process tears down cleanly and the harness marks itself stopped.
+
+✅ At the end of the 3 steps you should see the Termux:X11 app pop up
+with the XFCE desktop inside.
+
+## Why you can't just type the sprout command yourself
+
+You can. The failure mode: if you typed step 3 directly without steps
+1+2, the guest starts but has no X socket to bind to (`DISPLAY=:0`
+points at nothing), no D-Bus session bus exists yet, and
+`/tmp/runtime-root` probably doesn't exist either. The output is the
+exact segment that confused your friend — cascading of
+`Cannot open display` → `dbus-launch ... failed` →
+`xfce4-session: Cannot open display`. The harness exists because it sets
+all three up in the right order, every time.
+
+---
 
 ---
 
