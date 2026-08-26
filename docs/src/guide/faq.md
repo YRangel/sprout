@@ -128,3 +128,9 @@ healthcheck (`~/projeto/healthcheck.sh`) does this L1 leg for you.
 
 **What batteries run before a release?**
 `cargo test --workspace`, `test_translate`, `cargo fmt --check`, `cargo clippy -D warnings`, `bench/run.sh`, `bench/run-statics.sh`, `flagmatrix.sh` 11/11, `healthcheck.sh` 0 fails on BOTH lanes (6.12 notify + 4.14 ptrace), desktop spawn smoke.
+
+**Nothing here matches my error?**
+See the [troubleshooting by symptom](./troubleshooting.md) page — every
+failure mode we've ever seen in the wild each got its own section there.
+If yours isn't covered, open an issue with the exact error string and
+`sprout --dry-run -v 3` output attached.

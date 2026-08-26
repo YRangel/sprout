@@ -1,0 +1,78 @@
+/* sprout mdbook — small targeted polish on the ayu theme. */
+
+:root {
+  --sidebar-width: 300px;
+}
+
+/* code blocks get a tighter, darker look across themes */
+pre {
+  border-radius: 6px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+  padding: 14px 16px;
+  font-size: 0.92em;
+}
+code {
+  border-radius: 4px;
+  padding: 0.12em 0.35em;
+}
+
+/* table density + zebra; flag charts are heavy on tables */
+table {
+  border-collapse: collapse;
+  font-size: 0.94em;
+  margin: 1em 0;
+}
+table td, table th {
+  padding: 6px 12px;
+}
+table tr:nth-child(even) {
+  background: rgba(128, 128, 128, 0.08);
+}
+
+/* make headings breathe + add a subtle anchor color */
+h1, h2, h3 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+h2 {
+  margin-top: 1.6em;
+  padding-bottom: 0.2em;
+  border-bottom: 1px solid var(--quote-border);
+}
+
+/* inline `code` inside a body cell pops slightly */
+td code, p code, li code {
+  background: var(--quote-bg);
+  border: 1px solid var(--quote-border);
+}
+
+/* big blockquote callouts render as a bordered box */
+blockquote {
+  border-left: 4px solid var(--quote-border);
+  background: var(--quote-bg);
+  padding: 0.6em 1em;
+  margin: 1em 0;
+  border-radius: 0 4px 4px 0;
+}
+
+/* warning-style marker — start a blockquote line with ⚠ */
+blockquote > p > strong:first-child {
+  color: #e67e22;
+}
+
+/* top-bar action buttons get slightly bolder */
+.menu-bar .right-buttons a {
+  font-weight: 500;
+}
+
+/* search results list gets slightly larger hit-area */
+#searchresults li {
+  margin: 0.4em 0;
+  padding: 0.4em;
+  border-radius: 6px;
+}
+
+/* narrow screens: keep code from blowing out sideways */
+@media (max-width: 800px) {
+  pre { font-size: 0.86em; }
+}

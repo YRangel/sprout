@@ -3,16 +3,37 @@ authors = ["sprout contributors"]
 language = "en"
 src = "src"
 title = "sprout — Rootless glibc Linux on Android"
+description = "proot-compatible launcher; LD_PRELOAD fast path, ptrace fallback, box64/x86 lane, Termux:X11 desktop harness"
 
 [output.html]
-default-theme = "light"
-preferred-dark-theme = "navy"
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/YRangel/sprout"
 edit-url-template = "https://github.com/YRangel/sprout/edit/main/docs/{path}"
+site-url = "/sprout/"
+additional-css = ["theme/custom.css"]
+
+# searchindex tuning: broad boost on CLI/flag text so hitting a flag name
+# lands on the command reference instead of a mid-page paragraph.
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+
+[output.html.print]
+enable = true
+
+[output.html.fold]
+enable = false
+level = 1
 
 [output.linkcheck]
 follow-web-links = false
-# CI (peaceiris/actions-mdbook) installs mdbook only — without the linkcheck
-# binary `mdbook build` hard-fails (rc=101). optional=true keeps CI green and
-# still runs linkcheck locally when the plugin exists.
 optional = true
+
+[output.html.playground]
+runnable = false

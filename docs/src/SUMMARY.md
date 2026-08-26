@@ -5,6 +5,8 @@
 # User guide
 
 - [From zero to desktop](./guide/getting-started.md)
+- [sprout, by hand (every flag + why)](./guide/commands.md)
+- [Troubleshooting by symptom](./guide/troubleshooting.md)
 - [Installation](./guide/installation.md)
 - [proot compatibility](./guide/proot-compat.md)
 - [Environment policy](./guide/environment.md)
