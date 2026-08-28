@@ -2,6 +2,12 @@
 
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 
+## [0.5.3]
+
+### Fixed
+
+- **ptrace siginfo replay**: SpiderMonkey firefox wasm SIGSEGV handlers now work un-broken under classic-ptrace supervision (kernel-4.14 hosts incl. POCOs). Before: the tracer swallowed every wasm guard-page trap then re-injected with bare `PTRACE_CONT(signo)` — full tracer round-trip per trap *and* `si_code`/`si_addr` fidelity lost on 4.14 → Firefox cascaded into crashreporter-on-relaunch (the misleading "safe-mode" dialog). Now the supervisor fetches and replays siginfo identically before resuming, both on the shadow-tracee fast path and the traced-tracee deliver path. POCO 3-cycle launch→TERM→relaunch produces zero new crashes; the user-land `MOZ_DISABLE_WASM_SIGHANDLERS=1` wrapper is no longer required.
+
 ## [0.5.2]
 
 ### Added
