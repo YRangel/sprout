@@ -347,7 +347,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "sprout-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "bzip2",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "sprout-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "nix",
  "sprout-preload",
@@ -373,14 +373,14 @@ dependencies = [
 
 [[package]]
 name = "sprout-preload"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "sprout-ptrace"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "cc",
 ]

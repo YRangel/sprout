@@ -2,6 +2,21 @@
 
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 
+## [0.5.2]
+
+### Added
+
+- **Getting-started guide reworked manual-first** (`docs/src/guide/getting-started.md`): each of the six Steps 0-5 opens with what the layer does and why, then the exact command, then a one-line check before moving on. Step 5 = "the four daemons a desktop needs" diagram (pulseaudio / Termux:X11 / dbus session / xfce4-session) with the dependency chain spelled out. Step 6 = **launch the desktop by hand** (6a pulseaudio with `--exit-idle-time=-1`, 6b termux-x11 with stale-socket sweep, 6c am start to foreground, 6d runtime-root mkdir 0700, 6e full sprout launch with a per-flag table). Step 7 = the start-desktop.sh shortcut as a cumulative wrapper for Step 6, every script statement mapped back to its manual counterpart.
+- **New user-guide pages**: `docs/src/guide/commands.md` (every sprout flag with what / why / when-to-use, 26-row summary table), `docs/src/guide/troubleshooting.md` (symptom-indexed — startup, DNS, dpkg, X11, permissions, emulation, performance).
+- **mdbook theme polish** (`docs/theme/custom.css` + `book.toml` adjustments): ayu dark default, zebra-striped tables, blockquote callouts, mobile code-wrap fix, boosted search indexing on flag names.
+- **`sprout upkg --help`** now prints a policy card (hardlinks → content copies, suid/sgid stripped, dev nodes skipped, traversal rejected) plus supported-extension list (.tar/.tar.gz/.tgz/.tar.xz/.txz/.tar.bz2/.tbz2).
+
+### Fixed
+
+- **`-b <relative-host>`**: resolves against the launcher's cwd via `realpath` exactly proot-style (was hard-error `invalid binding 'etc'`). Nonexistent / malformed binds now warn-once + skip + continue the launch; was: hard-error that killed the guest before boot. Two new proot-compat gates pin both behaviors (relative cwd-bind content probe + nonexistent-host warn+launch green).
+- **docs: proot-compat `-b` row** now states the relative-resolution rule and `cwd-relative guest-dir` semantics for `-w`; matches implementation post-fix.
+- **docs: `-h` / `--help` after_help** gains `sprout upkg rootfs.tar.xz -C ~/myrootfs` example block.
+
 ## [0.5.1]
 
 ### Fixed
