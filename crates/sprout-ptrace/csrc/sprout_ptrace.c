@@ -3333,6 +3333,32 @@ int main(int argc, char **argv) {
         tracee_t *t = find_or_add(w);
         if (!t) goto cont;
 
+        /* Shadow tracees with preload coverage don't need us to supervise
+         * hardware-trap signals (SIGSEGV/SIGBUS/SIGILL/SIGFPE). Letting
+         * them ride PTRACE_CONT(sig) directly preserves the tracee's
+         * siginfo/ucontext chain without a GETREGSET detour. On 4.14 this
+         * avoids the re-arm bug that drove Firefox's SpiderMonkey wasm
+         * signal-handler stack into an unrecoverable state under
+         * classic-ptrace (task #13 "B: replay siginfo"; A: this shadow
+         * automatic opt-in). */
+        if (t->shadow) {
+            if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE) {
+                /* Re-arm semantically: fetch siginfo + reinject the same
+                 * pending signal. PTRACE_CONT(sig) alone can orphan
+                 * si_code/si_addr for SM's wasm on 4.14. */
+                siginfo_t si;
+                memset(&si, 0, sizeof si);
+                if (ptrace(PTRACE_GETSIGINFO, w, 0, &si) == 0)
+                    ptrace(PTRACE_SETSIGINFO, w, 0, &si);
+                ptrace(PTRACE_CONT, w, 0, (void *)(long)sig);
+                continue;
+            }
+            /* still CONT for everything else — shadow contract is
+             * free-run; supervisor only watches exec events. */
+            ptrace(PTRACE_CONT, w, 0, (void *)(long)sig);
+            continue;
+        }
+
         /* Safety net: SECCOMP_RET_TRAP delivers SIGSYS as a signal-stop
          * *before* the syscall executes (registers untouched). If the
          * trapped syscall is on our emulate-OK whitelist, swallow the
@@ -3546,7 +3572,17 @@ int main(int argc, char **argv) {
                                 w, r.regs[8], emul_ret, getenv("SPROUT_FAKEROOT") ? getenv("SPROUT_FAKEROOT") : "-");
                 }
             }
-            /* swallow or deliver */
+            /* swallow or deliver — when re-delivering an intercepted signal
+             * on a traced tracee, replay its siginfo too so si_code/si_addr
+             * survive the tracer handoff (Firefox wasm trap-handler needs
+             * this on 4.14-classic; CONT-with-signo alone loses si_code
+             * fidelity). */
+            if (!emulated && (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE)) {
+                siginfo_t si;
+                memset(&si, 0, sizeof si);
+                if (ptrace(PTRACE_GETSIGINFO, w, 0, &si) == 0)
+                    ptrace(PTRACE_SETSIGINFO, w, 0, &si);
+            }
             ptrace(t->shadow ? PTRACE_CONT : PTRACE_SYSCALL, w, 0, emulated ? (void *)0 : (void *)(long)sig);
             continue;
         }
