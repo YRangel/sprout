@@ -1,5 +1,5 @@
 <!DOCTYPE HTML>
-<html lang="en" class="light sidebar-visible" dir="ltr">
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="">
+        <meta name="description" content="proot-compatible launcher; LD_PRELOAD fast path, ptrace fallback, box64/x86 lane, Termux:X11 desktop harness">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -28,17 +28,18 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-78628439.css">
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
             const path_to_root = "../";
-            const default_light_theme = "light";
-            const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d9c01035.js";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-b6e5ab2a.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-7efb765d.js"></script>
+        <script src="../toc-a64ca261.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -76,7 +77,7 @@
             try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
             if (theme === null || theme === undefined) { theme = default_theme; }
             const html = document.documentElement;
-            html.classList.remove('light')
+            html.classList.remove('ayu')
             html.classList.add(theme);
             html.classList.add("js");
         </script>
@@ -286,6 +287,11 @@ the name into <code>.note.gnu.build-id</code> + <code>.symtab</code> — <code>h
 healthcheck (<code>~/projeto/healthcheck.sh</code>) does this L1 leg for you.</p>
 <p><strong>What batteries run before a release?</strong>
 <code>cargo test --workspace</code>, <code>test_translate</code>, <code>cargo fmt --check</code>, <code>cargo clippy -D warnings</code>, <code>bench/run.sh</code>, <code>bench/run-statics.sh</code>, <code>flagmatrix.sh</code> 11/11, <code>healthcheck.sh</code> 0 fails on BOTH lanes (6.12 notify + 4.14 ptrace), desktop spawn smoke.</p>
+<p><strong>Nothing here matches my error?</strong>
+See the <a href="./troubleshooting.html">troubleshooting by symptom</a> page — every
+failure mode we’ve ever seen in the wild each got its own section there.
+If yours isn’t covered, open an issue with the exact error string and
+<code>sprout --dry-run -v 3</code> output attached.</p>
 
                     </main>
 

@@ -1,5 +1,5 @@
 <!DOCTYPE HTML>
-<html lang="en" class="light sidebar-visible" dir="ltr">
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
@@ -8,7 +8,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="">
+        <meta name="description" content="proot-compatible launcher; LD_PRELOAD fast path, ptrace fallback, box64/x86 lane, Termux:X11 desktop harness">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -28,17 +28,18 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/custom-78628439.css">
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
             const path_to_root = "../";
-            const default_light_theme = "light";
-            const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d9c01035.js";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-b6e5ab2a.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-7efb765d.js"></script>
+        <script src="../toc-a64ca261.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -76,7 +77,7 @@
             try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
             if (theme === null || theme === undefined) { theme = default_theme; }
             const html = document.documentElement;
-            html.classList.remove('light')
+            html.classList.remove('ayu')
             html.classList.add(theme);
             html.classList.add("js");
         </script>
@@ -185,7 +186,11 @@
 host and guest and the X server lives in that shared dir. sprout reaches
 exactly the same semantics — through the same mechanism, not virtualization.</p>
 <h2 id="x11-verified"><a class="header" href="#x11-verified">X11 (verified)</a></h2>
-<pre><code>pkg install termux-x11-xfce4     # any X server on the host side
+<pre><code>pkg install x11-repo -y
+pkg install termux-x11-nightly -y
+# AND install the matching Android app (APK) from F-Droid or
+# https://github.com/termux/termux-x11/releases — the pkg is a launcher,
+# the APK is the actual X server. Both halves, same store family.
 termux-x11 :0                    # display :0 lives at $PREFIX/tmp/.X11-unix/X0
 </code></pre>
 <p>In the guest:</p>

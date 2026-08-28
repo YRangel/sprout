@@ -1,5 +1,5 @@
 <!DOCTYPE HTML>
-<html lang="en" class="light sidebar-visible" dir="ltr">
+<html lang="en" class="ayu sidebar-visible" dir="ltr">
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
@@ -9,7 +9,7 @@
 
         <!-- Custom HTML head -->
 
-        <meta name="description" content="">
+        <meta name="description" content="proot-compatible launcher; LD_PRELOAD fast path, ptrace fallback, box64/x86 lane, Termux:X11 desktop harness">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
@@ -29,17 +29,18 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="theme/custom-78628439.css">
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
             const path_to_root = "";
-            const default_light_theme = "light";
-            const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d9c01035.js";
+            const default_light_theme = "ayu";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "searchindex-b6e5ab2a.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-7efb765d.js"></script>
+        <script src="toc-a64ca261.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -77,7 +78,7 @@
             try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
             if (theme === null || theme === undefined) { theme = default_theme; }
             const html = document.documentElement;
-            html.classList.remove('light')
+            html.classList.remove('ayu')
             html.classList.add(theme);
             html.classList.add("js");
         </script>
@@ -226,6 +227,746 @@ the exact-bus payloads.</li>
 <li><strong>Operations</strong> — benchmarks and development discipline (how we keep it all honest).</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="from-zero-to-a-desktop-step-by-step"><a class="header" href="#from-zero-to-a-desktop-step-by-step">From zero to a desktop: step by step</a></h1>
+<p>Every step below says what it does, why it exists, and the one thing to
+check before moving on. Copy one block at a time. If the check fails, stop
+— the fix is right there under <strong>If this went wrong</strong>.</p>
+<p>Goal at the end of this page: a full XFCE desktop running inside sprout,
+in the Termux:X11 Android app, with sound.</p>
+<hr>
+<h2 id="step-0--install-the-termuxx11-half-no-guests-yet"><a class="header" href="#step-0--install-the-termuxx11-half-no-guests-yet">Step 0 — install the Termux:X11 half (no guests yet)</a></h2>
+<p>A desktop needs an X server. On Android that means <strong>two</strong> components
+that must come from the <em>same store family</em> (both F-Droid, or both
+GitHub releases — signatures must match):</p>
+<pre><code class="language-sh">pkg update &amp;&amp; pkg upgrade -y
+pkg install x11-repo -y
+pkg install termux-x11-nightly -y
+</code></pre>
+<p>Then install the <strong>Termux:X11 Android app</strong> (the <code>.apk</code> from
+https://github.com/termux/termux-x11/releases — file ends in
+<code>termux-x11-nightly-*-universal.apk</code>, or from F-Droid). Open the app once
+so Android registers it.</p>
+<p>✅ <code>which termux-x11</code> prints a path; the Termux:X11 app icon is on your
+launcher.</p>
+<blockquote>
+<p><strong>⚠ Mixing F-Droid Termux + GitHub APK (or the reverse) never works.</strong>
+Different signing keys → the app and the shell can’t see each other’s
+sockets. If Termux came from F-Droid, get the APK from F-Droid; if it
+came from GitHub, get the APK from the same releases page.</p>
+</blockquote>
+<hr>
+<h2 id="step-1--install-sprout"><a class="header" href="#step-1--install-sprout">Step 1 — install sprout</a></h2>
+<pre><code class="language-sh">pkg install rust git -y
+git clone https://github.com/YRangel/sprout.git &amp;&amp; cd sprout
+cargo build --release --workspace
+bash install.sh --verify
+</code></pre>
+<p>✅ <code>sprout --version</code> prints <code>sprout 0.5.1</code> (or newer).</p>
+<p><strong>If this went wrong:</strong> <code>install.sh</code> downloads two prebuilt <code>.so</code> files
+from the GitHub release — your phone can’t compile them (they’re glibc
+ABI). A network hiccup fails here loudly. Rerun until <code>--verify</code> passes.</p>
+<hr>
+<h2 id="step-2--get-a-linux-rootfs"><a class="header" href="#step-2--get-a-linux-rootfs">Step 2 — get a Linux rootfs</a></h2>
+<p>A rootfs is a directory full of distro files. Make one and fill it:</p>
+<pre><code class="language-sh">mkdir -p ~/linux
+cd ~
+curl -LO https://github.com/termux/proot-distro/releases/download/v4.37.0/debian-trixie-aarch64-pd-v4.37.0.tar.xz
+sprout upkg debian-trixie-aarch64-pd-v4.37.0.tar.xz -C ~/linux
+</code></pre>
+<p><code>sprout upkg</code> extracts the tarball with SELinux-aware rules (hardlinks
+become content-copies, device nodes skipped). Other distros work too —
+any <code>rootfs-&lt;distro&gt;-aarch64.tar.xz|gz|bz2</code> URL from a reputable source.</p>
+<p>✅ Check both exist:</p>
+<pre><code class="language-sh">ls ~/linux/bin/ls
+ls ~/linux/etc/os-release
+</code></pre>
+<p><strong>If this went wrong:</strong></p>
+<ul>
+<li><code>sprout: command not found</code> → go back to Step 1.</li>
+<li><code>guest loader not found</code> → your tarball is for the wrong CPU arch
+(x86_64 instead of arm64). Get the <code>aarch64</code> build.</li>
+<li><code>No such file or directory</code> on the tarball path → you <code>cd</code>’d away.
+<code>cd ~</code> and re-run.</li>
+</ul>
+<hr>
+<h2 id="step-3--boot-a-shell-and-make-dns-work-inside"><a class="header" href="#step-3--boot-a-shell-and-make-dns-work-inside">Step 3 — boot a shell and make DNS work inside</a></h2>
+<pre><code class="language-sh">sprout -r ~/linux --user=0:0 -- /bin/bash
+</code></pre>
+<p>✅ The prompt changes (you’re <em>inside</em> the guest now). Try:</p>
+<pre><code class="language-sh">cat /etc/os-release | head -1
+ping -c 1 8.8.8.8             # raw IP — works without DNS
+ping -c 1 deb.debian.org      # needs DNS — fails right now, expected
+</code></pre>
+<p>The last one fails because Android’s resolver lives on the <em>host</em>
+loopback. Inside the guest, <code>127.0.0.1</code> is the guest’s own empty
+loopback.</p>
+<p><strong>Fix DNS, from plain Termux</strong> (exit the guest shell first with <code>exit</code>):</p>
+<pre><code class="language-sh">rm -f ~/linux/etc/resolv.conf
+printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' &gt; ~/linux/etc/resolv.conf
+</code></pre>
+<p>✅ Re-enter and <code>ping -c 1 deb.debian.org</code> resolves.</p>
+<hr>
+<h2 id="step-4--install-xfce--dbus-inside-the-guest"><a class="header" href="#step-4--install-xfce--dbus-inside-the-guest">Step 4 — install XFCE + dbus inside the guest</a></h2>
+<pre><code class="language-sh">sprout -r ~/linux --user=0:0 -- bash
+apt update
+apt install -y xfce4 xfce4-goodies dbus-x11 x11-utils
+exit
+</code></pre>
+<p>This takes 5–15 min. <code>dbus-x11</code> and <code>x11-utils</code> are not optional —
+dbus-x11 provides the session bus launcher xfce depends on, and
+<code>x11-utils</code> gives you <code>xset q</code> / <code>xwininfo</code> for handshake probes later.</p>
+<p>✅ apt ends without red <code>E:</code> lines.</p>
+<p><strong>If this went wrong:</strong></p>
+<ul>
+<li>
+<p><code>dpkg: ... returned an error exit status 2</code> mentioning a
+<code>/data/data/com.termux/...</code> path → a postinstall script used
+<code>realpath()</code> which returns the host path. Workaround inside the guest:</p>
+<pre><code class="language-sh">dpkg --configure -a
+apt --fix-broken install
+# if one specific package keeps failing (example: dictionaries-common):
+rm -f /var/lib/dpkg/info/dictionaries-common.postinst
+printf '#!/bin/sh\nexit 0\n' &gt; /var/lib/dpkg/info/dictionaries-common.postinst
+chmod 755 /var/lib/dpkg/info/dictionaries-common.postinst
+dpkg --configure -a &amp;&amp; apt-get -f install
+</code></pre>
+</li>
+</ul>
+<hr>
+<h2 id="step-5--the-four-background-jobs-a-desktop-needs"><a class="header" href="#step-5--the-four-background-jobs-a-desktop-needs">Step 5 — the four background jobs a desktop needs</a></h2>
+<p>No systemd runs inside sprout (rootless = no PID 1 duties). Android apps
+can’t start daemons either. So a working desktop needs <strong>four separate
+processes alive</strong>, in this dependency order:</p>
+<pre><code>┌─────────────────────┐
+│  pulseaudio         │  host daemon — sounds via Android audio HAL
+│  (Termux side)      │  listens on TCP 127.0.0.1 + a unix socket
+└─────────┬───────────┘
+          │ (independent)
+┌─────────▼───────────┐
+│  Termux:X11 :0      │  host daemon — the actual X server (the APK)
+│  (Termux:API side)  │  opens /data/data/com.termux/files/usr/tmp/.X11-unix/X0
+└─────────┬───────────┘
+          │ (xfce's session bus must find a live X display)
+┌─────────▼───────────┐
+│  dbus session bus   │  guest process — apps discover each other here
+│  (inside sprout)    │  launched by startxfce4's chain via dbus-x11
+└─────────┬───────────┘
+          │
+┌─────────▼───────────┐
+│  xfce4-session      │  guest process — the actual desktop
+│  (inside sprout)    │  exits when you log out or close the X app
+└─────────────────────┘
+</code></pre>
+<p>If any layer is missing, the layers above it crash with cryptic errors
+(the exact failure cascade is in the troubleshooting section below).
+That’s why the launcher script exists at all — to bring each layer up in
+the correct order, every time.</p>
+<p>In this step you’ll bring each one up <strong>by hand</strong>, understand what it
+does, and only at the end use the one-line script.</p>
+<hr>
+<h2 id="step-6--launch-the-desktop-manually-no-harness"><a class="header" href="#step-6--launch-the-desktop-manually-no-harness">Step 6 — launch the desktop MANUALLY (no harness)</a></h2>
+<p>Do this once so you understand every piece. All of these run in your
+Termux session (not inside sprout).</p>
+<h3 id="6a--pulseaudio-host-side"><a class="header" href="#6a--pulseaudio-host-side">6a — PulseAudio (host side)</a></h3>
+<pre><code class="language-sh">pulseaudio --kill 2&gt;/dev/null; sleep 1
+pulseaudio --start --exit-idle-time=-1
+</code></pre>
+<p>What this does: starts the sound daemon. <code>--exit-idle-time=-1</code> tells it
+<strong>never to quit on silence</strong> — otherwise it exits after a minute of no
+audio and your desktop goes mute.</p>
+<p>✅ <code>pactl info | grep 'Default Sink'</code> prints a line.</p>
+<p><strong>If this went wrong:</strong> <code>pulseaudio --start</code> says failed. Likely a stale
+pid file: <code>rm -f $PREFIX/var/run/pulse/pid</code> and retry. Still failing →
+your audio will be absent but the desktop still runs (skip ahead).</p>
+<h3 id="6b--termuxx11-server-host-side"><a class="header" href="#6b--termuxx11-server-host-side">6b — Termux:X11 server (host side)</a></h3>
+<pre><code class="language-sh"># clean prior attempts: file and process leavings fool the next run
+pkill -f 'termux-x11 :0' 2&gt;/dev/null
+rm -f $PREFIX/tmp/.X0-lock $PREFIX/tmp/.X11-unix/X0
+sleep 2
+
+# launch it for real
+nohup termux-x11 :0 &gt; $PREFIX/tmp/x11.log 2&gt;&amp;1 &amp;
+</code></pre>
+<p>What this does: starts the X server with display <code>:0</code>. The server creates
+the unix socket <code>$PREFIX/tmp/.X11-unix/X0</code> — that’s the rendezvous point
+the guest will connect to.</p>
+<p>✅ After ~5 s, <code>ls -la $PREFIX/tmp/.X11-unix/X0</code> shows an <code>s</code> (socket)
+type file.</p>
+<p><strong>If this went wrong:</strong> <code>FAIL: no socket after 5s</code> (look in
+<code>$PREFIX/tmp/x11.log</code>). The Termux:X11 Android app isn’t installed,
+isn’t running, or is signature-mismatched (Step 0 ⚠).</p>
+<h3 id="6c--bring-the-app-window-forward"><a class="header" href="#6c--bring-the-app-window-forward">6c — Bring the app window forward</a></h3>
+<pre><code class="language-sh">am start -n com.termux.x11/.MainActivity
+</code></pre>
+<p>This asks Android to bring the Termux:X11 app’s window to the front.
+You should now see a black screen or a waiting-for-client canvas in the
+app.</p>
+<h3 id="6d--give-the-guest-its-runtime-dir--environment"><a class="header" href="#6d--give-the-guest-its-runtime-dir--environment">6d — Give the guest its runtime dir + environment</a></h3>
+<p>Still in Termux:</p>
+<pre><code class="language-sh">sprout -r ~/linux --user=0:0 -- mkdir -p /tmp/runtime-root
+chmod 700 ~/linux/tmp/runtime-root
+</code></pre>
+<p><code>XDG_RUNTIME_DIR</code> default for uid 0 is <code>/tmp/runtime-root</code> and xfce’s
+session bus refuses to start without it (mode must be exactly 0700).</p>
+<h3 id="6e--launch-startxfce4-inside-sprout"><a class="header" href="#6e--launch-startxfce4-inside-sprout">6e — Launch startxfce4 inside sprout</a></h3>
+<pre><code class="language-sh">sprout -r ~/linux --shared-tmp --termux-x11 --user=0:0 -- startxfce4
+</code></pre>
+<p>What every flag does:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Why the desktop needs it</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-r ~/linux</code></td><td>which rootfs to enter</td></tr>
+<tr><td><code>--shared-tmp</code></td><td>binds host <code>$PREFIX/tmp</code> into guest <code>/tmp</code> — the X socket file (created in 6b) appears inside the guest at the exact same path</td></tr>
+<tr><td><code>--termux-x11</code></td><td>exports <code>DISPLAY=:0</code> and <code>PULSE_SERVER=127.0.0.1</code> into the guest so XFCE knows where to find display + sound</td></tr>
+<tr><td><code>--user=0:0</code></td><td>fake-root identity inside the guest (dpkg-ish session scripts expect it)</td></tr>
+<tr><td><code>--</code></td><td><strong>sprout options stop here</strong> — <code>startxfce4</code> is the guest command</td></tr>
+<tr><td><code>startxfce4</code></td><td>the actual xfce session; in turn launches dbus-launch, then xfce4-session, then the panel/desktop/WM</td></tr>
+</tbody>
+</table>
+</div>
+<p>✅ Termux:X11’s window shows the XFCE desktop, mouse + keyboard work.</p>
+<h3 id="closing-the-session-manually"><a class="header" href="#closing-the-session-manually">Closing the session manually</a></h3>
+<ul>
+<li>Log out from XFCE’s menu, or close the Termux:X11 app.</li>
+<li>Back in Termux: <code>pkill -f startxfce4; pkill -f 'termux-x11 :0'</code> (and
+pulseaudio keeps running — that’s fine, or <code>pulseaudio --kill</code>).</li>
+</ul>
+<p><strong>If this step failed</strong>, read the raw log the launch produced:</p>
+<pre><code class="language-sh">sprout -r ~/linux --shared-tmp --termux-x11 --user=0:0 -- startxfce4 2&gt;&amp;1 | head -20
+</code></pre>
+<p>Match the first failure line against the table at the bottom of this page.</p>
+<hr>
+<h2 id="step-7--the-shortcut-one-script-that-does-6a6e-for-you"><a class="header" href="#step-7--the-shortcut-one-script-that-does-6a6e-for-you">Step 7 — the shortcut: one script that does 6a→6e for you</a></h2>
+<p>You’ve now run each piece by hand and know what they do. For daily use,
+the same five steps are bundled in one script that also adds health
+checks and a stale-state sweeper (it auto-deletes that dead
+<code>/tmp/.X11-unix/X0</code> file before launching, which is the most common
+“desktop won’t start” cause):</p>
+<pre><code class="language-sh">mkdir -p ~/bin
+cp ~/sprout/examples/desktop/start-desktop.sh \
+   ~/sprout/examples/desktop/pulse-guard.sh \
+   ~/sprout/examples/desktop/x11-rescue.sh ~/bin/
+chmod +x ~/bin/start-desktop.sh ~/bin/pulse-guard.sh ~/bin/x11-rescue.sh
+</code></pre>
+<p>Tell it which rootfs is yours:</p>
+<pre><code class="language-sh">export SPROUT_DESKTOP_ROOTFS=~/linux
+</code></pre>
+<p>To make that permanent across Termux restarts:</p>
+<pre><code class="language-sh">echo 'export SPROUT_DESKTOP_ROOTFS=~/linux' &gt;&gt; ~/.bashrc
+</code></pre>
+<h3 id="daily-commands"><a class="header" href="#daily-commands">Daily commands</a></h3>
+<pre><code class="language-sh">~/bin/start-desktop.sh start     # full sequence (pulse-guard + x11-rescue + session)
+~/bin/start-desktop.sh stop      # clean stop
+~/bin/start-desktop.sh restart   # bounce everything (use after resume from deep sleep)
+~/bin/start-desktop.sh status    # what's alive right now
+~/bin/start-desktop.sh shell     # extra shell INTO the running guest
+</code></pre>
+<h3 id="what-start-does-exactly"><a class="header" href="#what-start-does-exactly">What <code>start</code> does, exactly</a></h3>
+<ol>
+<li><strong>Audio gate</strong> — is <code>pactl info</code> healthy? If not, <code>pulseaudio --kill</code>, then start. If it still fails: warns and continues (no
+audio, but desktop still works). Then it spawns a tiny watchdog
+(<code>pulse-guard.sh</code>) that pings pulse every 20 s and cold-restarts it
+on silence — HyperOS-class kernels occasionally kill idle daemons.</li>
+<li><strong>X gate</strong> (<code>x11-rescue.sh</code>) — finds every leftover <code>termux-x11</code>
+process and numeric-kills it, removes the stale socket file,
+launches a fresh server, waits until an actual handshake probe
+(<code>xwininfo -root</code> via sprout) returns, and only then proceeds.</li>
+<li><strong>Session launch</strong> — <code>setsid sprout -r $SPROUT_DESKTOP_ROOTFS --shared-tmp --termux-x11 --user=0:0 -- /usr/bin/startxfce4</code> in the
+background. Then it polls <code>ps</code> every 5 s for <code>xfce4-session</code> and
+reports success/failure after up to 24 tries.</li>
+</ol>
+<p>So <code>start</code> is <strong>Step 6 with code around it</strong>. You could do everything it
+does manually (you just did, in Step 6); the script exists so you don’t
+have to.</p>
+<hr>
+<h2 id="common-failure-map-from-real-sessions"><a class="header" href="#common-failure-map-from-real-sessions">Common failure map (from real sessions)</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Error you saw</th><th>What it really means</th><th>Fix → step</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nohup: failed to run command '…/termux-x11': No such file or directory</code></td><td>the pkg isn’t installed</td><td>Step 0</td></tr>
+<tr><td><code>== socket up: X0</code> then <code>FAIL handshake</code></td><td>APK not running / signature mismatch</td><td>Step 0 ⚠</td></tr>
+<tr><td><code>X server already running on display :0</code> then a wall of <code>Can't open display</code></td><td>stale <code>/tmp/.X11-unix/X0</code> file</td><td><code>rm -f $PREFIX/tmp/.X11-unix/X0</code> and relaunch (script does this)</td></tr>
+<tr><td><code>XDG_RUNTIME_DIR "/tmp/runtime-root" not available</code></td><td>Step 6d never ran</td><td>redo Step 6d</td></tr>
+<tr><td><code>dbus-launch: ... failed to connect to X11 display</code></td><td>startxfce4 ran but no live X server</td><td>6b’s handshake must pass first</td></tr>
+<tr><td><code>Unable to locate package neofetch</code></td><td>DNS still broken</td><td>Step 3</td></tr>
+<tr><td>dpkg postinst errors with <code>/data/data/com.termux/...</code> paths</td><td>postinst saw the host path via <code>realpath</code></td><td>Step 4’s workaround</td></tr>
+<tr><td><code>pulseaudio --start failed</code></td><td>stale pulse pid</td><td>Step 6a’s workaround</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="where-next"><a class="header" href="#where-next">Where next</a></h2>
+<ul>
+<li><a href="#sprout-by-hand">sprout, by hand</a> — what every flag actually does</li>
+<li><a href="#troubleshooting-by-symptom">Troubleshooting</a> — the long-form symptom index</li>
+<li><a href="#x11-wayland-and-gpu-guests">X11 / GPU guide</a> — Turnip-accelerated workloads, how
+<code>--shared-tmp</code> + ICD plumbing are wired</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sprout-by-hand"><a class="header" href="#sprout-by-hand">sprout, by hand</a></h1>
+<p>This page is the flag-by-flag reference. For each option: what it does,
+WHY that exists, and when to reach for it.</p>
+<p>General calling convention:</p>
+<pre><code>sprout [OPTIONS] -r ROOTFS -- COMMAND [ARGS...]
+</code></pre>
+<p>RULE #1: <strong>options come before the guest command. Separate with <code>--</code>.</strong></p>
+<p>The <code>--</code> is what tells sprout’s parser where its world ends and the guest
+begins. Without it, e.g. <code>-w /var</code> in a guest command line gets eaten by
+sprout instead.</p>
+<hr>
+<h2 id="the-one-flag-you-need-on-every-call"><a class="header" href="#the-one-flag-you-need-on-every-call">The one flag you need on every call</a></h2>
+<h3 id="-r-path----rootfs-path--where-the-guest-lives"><a class="header" href="#-r-path----rootfs-path--where-the-guest-lives"><code>-r PATH</code> / <code>--rootfs PATH</code> — where the guest lives</a></h3>
+<p>The “fake chroot”. sprout maps every guest-visible path under this dir on
+the host. Anything a guest reads or writes under <code>/</code> lands inside this
+directory.</p>
+<ul>
+<li>Why it exists: proot’s <code>-r</code> parity. There is no <code>--</code> magic here — every
+single run needs it, no exceptions. This is how sprout knows which
+guests’ libraries to pull up and which process gets clean knowledge of
+the host’s filesystem.</li>
+<li>Path must exist and be at least shallowly populated (there must be
+something under <code>&lt;rootfs&gt;/lib/</code> for a guest to actually launch).</li>
+<li>Absolute paths only on the host side. <code>~/roots/debian</code> is fine; <code>debian/</code>
+relative isn’t (historical constraint from the proot translation ABI,
+see ADR-0003).</li>
+</ul>
+<pre><code class="language-sh">sprout -r ~/myrootfs -- /bin/echo hello
+sprout -r ~/myrootfs --user=0:0 -- /bin/bash        # interactive
+</code></pre>
+<hr>
+<h2 id="the-interposer-family--steering-how-syscalls-are-trapped"><a class="header" href="#the-interposer-family--steering-how-syscalls-are-trapped">The interposer family — steering how syscalls are trapped</a></h2>
+<p>These five flags control how sprout traps syscalls. Most users never
+touch them; the defaults are auto-detected from the binary.</p>
+<h3 id="--fallback-preload----fallback-ptrace--override-the-auto-router"><a class="header" href="#--fallback-preload----fallback-ptrace--override-the-auto-router"><code>--fallback preload</code> / <code>--fallback ptrace</code> — override the auto router</a></h3>
+<p>sprout inspects every invoked binary’s ELF header:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ELF what</th><th>Route</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ET_DYN + PT_INTERP</code> (glibc dynamic, most binaries)</td><td><strong>preload</strong></td><td>LD_PRELOAD into guest ld.so, no syscall stops. Fast</td></tr>
+<tr><td><code>ET_EXEC</code> / static / Go</td><td><strong>ptrace</strong></td><td>PLT can’t be interposed in a binary that has no ld.so runtime; ptrace supervisor with a static-memory trampoline</td></tr>
+</tbody>
+</table>
+</div>
+<p>Auto-detection is correct for ~99% of cases. Override exist for testing
+and for edges (e.g. hand-assembled ELFs that lie about their ABI).</p>
+<h3 id="-l----loader-fix--accepted-prints-a-note-does-nothing"><a class="header" href="#-l----loader-fix--accepted-prints-a-note-does-nothing"><code>-L</code> / <code>--loader-fix</code> — accepted, prints a note, does nothing</a></h3>
+<p>proot used this to repin dynamic loader paths. proot’s authors retired the
+flag; sprout’s loader chain always picks the guest’s real <code>ld.so</code>, so there
+is nothing left to “fix”. Accepted for muscle-memory compatibility with
+proot-distro.</p>
+<h3 id="--mixed-syscall--accepted-no-op"><a class="header" href="#--mixed-syscall--accepted-no-op"><code>--mixed-syscall</code> — accepted, no-op</a></h3>
+<p>Same story. proot had a “split” syscall handoff; sprout’s preload + ptrace
+lanes overlap by design so there is no seam to mix anything across.</p>
+<h3 id="--link2symlink----no-link2symlink--selinux-hardlink-fallback"><a class="header" href="#--link2symlink----no-link2symlink--selinux-hardlink-fallback"><code>--link2symlink</code> / <code>--no-link2symlink</code> — SELinux hardlink fallback</a></h3>
+<p><strong>DEFAULT since v0.5.</strong> On Android, SELinux denies <code>link()</code> syscalls that
+cross filesystem boundaries (rootfs mount vs APK data; guest vs host fuse,
+etc). Instead of letting the caller fail with EPERM, sprout:</p>
+<ol>
+<li>Moves the source to a private <code>$ROOT/.l2s/.l2s.&lt;name&gt;.&lt;nonce&gt;</code> stash</li>
+<li>Replaces both source and destination with symlinks → via the hardlink
+registry (sp_hreg[256]) the guest’s <code>stat()</code> still reports <code>nlink=2</code>
+(this is what keeps the <code>useradd</code> lock-file protocol working)</li>
+<li>As a LAST resort, falls back to plain content copy</li>
+</ol>
+<p><code>--no-link2symlink</code> opts out: link() gets the raw kernel EPERM.</p>
+<h3 id="-q-path----qemu-path--userspace-binfmt-adapter"><a class="header" href="#-q-path----qemu-path--userspace-binfmt-adapter"><code>-q PATH</code> / <code>--qemu PATH</code> — userspace binfmt adapter</a></h3>
+<p>Hooks <code>execve</code> of x86/x86_64 binaries to run them through a guest-side
+emulator (default: <code>/usr/local/bin/box64</code>; i386 covered by box32).
+ADR-0018 spells the full mechanism.</p>
+<ul>
+<li>Env overrides per-arch: <code>SPROUT_BINFMT_X86_64</code>, <code>SPROUT_BINFMT_I386</code></li>
+<li>Wrap everything (even native aarch64): <code>SPROUT_BINFMT_ALWAYS=1</code></li>
+<li>This is how the x86_64 guest lane boots (box64 0.4.5 injected
+end-to-end): <code>sprout -r $X86ROOTFS -- ./program.elf</code></li>
+</ul>
+<hr>
+<h2 id="identity--who-the-guest-thinks-you-are"><a class="header" href="#identity--who-the-guest-thinks-you-are">Identity — who the guest thinks you are</a></h2>
+<p>sprout implements “fake root” the same way proot does: uid/gid syscalls
+return what you told them to return; kernel-side the process still runs
+as your app uid.</p>
+<h3 id="-0----root-id--pretend-to-be-root-default"><a class="header" href="#-0----root-id--pretend-to-be-root-default"><code>-0</code> / <code>--root-id</code> — pretend to be root (DEFAULT)</a></h3>
+<p>Guest sees <code>uid=0(root) gid=0(root)</code>. Files created appear 0-owned,
+<code>chown()</code> “succeeds”, <code>getuid()</code> returns 0. Nothing is actually elevated —
+power stays zero, this just keeps Debian package scripts happy.</p>
+<h3 id="--no-fakeroot--drop-the-pretense"><a class="header" href="#--no-fakeroot--drop-the-pretense"><code>--no-fakeroot</code> — drop the pretense</a></h3>
+<p>Guest sees the REAL uid (e.g. u0_a372). Most admin-flavored commands fail:
+<code>apt install</code> → EPERM, <code>chown</code> → EPERM, <code>useradd</code> → EPERM. Useful for
+read-only browsing of a rootfs, benchmarking shim overhead against
+unfaked identity, or verifying a guest tool doesn’t actually need root.</p>
+<h3 id="-u-spec----user-spec--pick-a-user-from-guest-etcpasswd"><a class="header" href="#-u-spec----user-spec--pick-a-user-from-guest-etcpasswd"><code>-u SPEC</code> / <code>--user SPEC</code> — pick a user from guest /etc/passwd</a></h3>
+<p><code>-u steamuser</code>, <code>-u 1000:1000</code>, <code>-u steamuser:steamgroup</code> — all valid.
+sprout resolves the name/uid against the guest’s own <code>/etc/passwd</code> and
+<code>/etc/group</code>, then reports the fake IDs. Kernel side stays the launcher
+uid; inside the guest everything looks like that user.</p>
+<ul>
+<li>This flag also sets the fake <code>$HOME</code>, <code>$USER</code>, <code>$LOGNAME</code>, cwd, and
+default shell from /etc/passwd</li>
+<li>Identity syscalls, <code>chown</code>, <code>SO_PEERCRED</code> all anchor to the chosen uid</li>
+</ul>
+<h3 id="-i-spec----change-id-spec--proot--i-alias"><a class="header" href="#-i-spec----change-id-spec--proot--i-alias"><code>-i SPEC</code> / <code>--change-id SPEC</code> — proot <code>-i</code> alias</a></h3>
+<p>Identical contract to <code>-u</code>. Exists only to read proot-distro command lines
+verbatim.</p>
+<hr>
+<h2 id="filesystem-visibility--what-the-guest-can-see"><a class="header" href="#filesystem-visibility--what-the-guest-can-see">Filesystem visibility — what the guest can see</a></h2>
+<h3 id="-b-host-or--b-hostguest----bind--extra-bind-mounts-repeatable"><a class="header" href="#-b-host-or--b-hostguest----bind--extra-bind-mounts-repeatable"><code>-b host</code> or <code>-b host:guest</code> / <code>--bind</code> — extra bind mounts (repeatable)</a></h3>
+<ul>
+<li><code>-b $PREFIX/tmp/x:/mnt</code> — appears inside the guest as /mnt</li>
+<li><code>-b $HOME/documents</code> — same spelling both sides</li>
+<li>Repeatable.</li>
+</ul>
+<p>Under the hood: sprout’s path translation prepends the bind source when
+the guest tries to access the destination. No ptrace, no root, no actual
+mount — only a rewrite applied to every path-argument syscall.</p>
+<h3 id="--shared-tmp--guest--host-socket-lifeline"><a class="header" href="#--shared-tmp--guest--host-socket-lifeline"><code>--shared-tmp</code> — guest ↔ host socket lifeline</a></h3>
+<p>Bind <code>$PREFIX/tmp</code> (host) to <code>/tmp</code> (guest). Lets guest code see and
+connect to:</p>
+<ul>
+<li><code>/tmp/.X11-unix/X0</code> — the X11 socket</li>
+<li>the PulseAudio unix socket</li>
+<li><code>$XDG_RUNTIME_DIR/</code> Wayland sockets</li>
+</ul>
+<p>proot-distro’s <code>--shared-tmp</code> parity. Required for any GUI/audio session.</p>
+<h3 id="--host-home--leak-the-host-home-into-guest"><a class="header" href="#--host-home--leak-the-host-home-into-guest"><code>--host-home</code> — leak the host $HOME into guest</a></h3>
+<p>Default guest $HOME = <code>/root</code> (or /home/<code>&lt;user&gt;</code> from -u). This flag passes
+your Termux home straight through. Footgun: anything written to guest
+<code>$HOME</code> (e.g. game saves, thumbnails) lands in YOUR Termux files. Use
+only when you actually want both sides seeing one dir.</p>
+<h3 id="--host-path--append-prefixbin-to-guest-path"><a class="header" href="#--host-path--append-prefixbin-to-guest-path"><code>--host-path</code> — append <code>$PREFIX/bin</code> to guest PATH</a></h3>
+<p>Default is a clean guest-only PATH. This adds the host one at the end,
+so <code>python3</code> resolves to Termux’s binary from inside the guest.</p>
+<hr>
+<h2 id="display--audio--the-reason-most-people-install-sprout"><a class="header" href="#display--audio--the-reason-most-people-install-sprout">Display / Audio — the reason most people install sprout</a></h2>
+<h3 id="--termux-x11--x11audio-preset"><a class="header" href="#--termux-x11--x11audio-preset"><code>--termux-x11</code> — X11+audio preset</a></h3>
+<ul>
+<li>Exports <code>DISPLAY=:0</code> (when paired with –shared-tmp)</li>
+<li>Exports <code>PULSE_SERVER=127.0.0.1</code> (always, even alone)</li>
+<li>Shows a <em>warning</em> when paired WITHOUT <code>--shared-tmp</code> — the X socket
+won’t reach the guest via fs path; you get pulse but no display</li>
+</ul>
+<p>Most desktop invocations use precisely:</p>
+<pre><code class="language-sh">sprout -r $R --shared-tmp --termux-x11 -- $SOMEGUI
+</code></pre>
+<h3 id="and-the-harness-below-start-desktopsh"><a class="header" href="#and-the-harness-below-start-desktopsh">…and the harness below <code>start-desktop.sh</code></a></h3>
+<p>Rather than plain <code>--termux-x11</code>, the reference launcher (see
+<code>examples/desktop/start-desktop.sh</code>) also:</p>
+<ol>
+<li>starts PulseAudio on the host (pulse-guard)</li>
+<li>starts the Termux:X11 host server and waits for a real handshake
+(x11-rescue)</li>
+<li>sweeps stale socket files that would make your guest say “already
+running” then fail to open</li>
+</ol>
+<p>This is why “raw <code>sprout -r … startxfce4</code>” often fails where
+<code>~/start-desktop.sh start</code> works — the difference is exactly these three
+prep steps.</p>
+<hr>
+<h2 id="network--port-behavior-under-a-rootless-constraint"><a class="header" href="#network--port-behavior-under-a-rootless-constraint">Network — port behavior under a rootless constraint</a></h2>
+<h3 id="-p-base----port-mapping---p----redirect-ports----fix-low-ports"><a class="header" href="#-p-base----port-mapping---p----redirect-ports----fix-low-ports"><code>-p [BASE]</code> / <code>--port-mapping</code> / <code>-P</code> / <code>--redirect-ports</code> / <code>--fix-low-ports</code></a></h3>
+<p>Xiaomi kernel does not enforce CAP_NET_BIND_SERVICE on this device, so
+default sprout behavior is: leave low ports alone. Some devices (and the
+real proot guarding against these situations) map ports below 1024 to
+BASE+port instead. This flag flips that behavior ON:</p>
+<ul>
+<li>Default BASE = 1024, so <code>-p 22</code> becomes host <code>:1046</code></li>
+<li>sprout interposes guest <code>getsockname</code> so <code>sshd</code> <em>still sees itself
+listening on :22</em> (human log stays tidy)</li>
+<li><code>-p</code> with no argument uses BASE=1024; <code>-p 8000</code> picks 8000 → guest :22
+ends up host :8022</li>
+<li>Valid BASE range: 1024..64512</li>
+</ul>
+<p>The translation is host-visible-to-host, so your ssh/ftp/sshd works while
+guest-side programs still <em>think</em> they bound 22/80/443.</p>
+<h3 id="-k-ver----kernel-release-ver--lie-about-guest-uname"><a class="header" href="#-k-ver----kernel-release-ver--lie-about-guest-uname"><code>-k VER</code> / <code>--kernel-release VER</code> — lie about guest uname</a></h3>
+<p>By default the guest reports <code>$ANDROID_HOST_UNAME</code>, e.g.
+<code>5.4.210-android12-9-...</code>. A few apps (mostly enterprise installers)
+block on Android-namespaced kernels. This flag spoofs <code>uname -r</code> inside
+the guest. sprout tracks the spoof through <code>uname</code>/<code>uname -r</code> chains via
+the preload.</p>
+<p>Default without <code>-k</code>: branded <code>Sprout-Android-5.4.x-...</code> so you know
+here-now (and so you can disable the brand with <code>SPROUT_KERNEL_RELEASE=''</code>
+env).</p>
+<hr>
+<h2 id="behavior-switches-most-people-never-touch"><a class="header" href="#behavior-switches-most-people-never-touch">Behavior switches most people never touch</a></h2>
+<h3 id="-v-level----verbose--log-every-path-translation"><a class="header" href="#-v-level----verbose--log-every-path-translation"><code>-v [LEVEL]</code> / <code>--verbose</code> — log every path translation</a></h3>
+<p>Logs syscall name, input path, translated path. Terse at level 1, chatty
+at level 3. Chain-injection rules are printed at level 2 and up as they
+bind.</p>
+<h3 id="--dry-run--print-the-plan-without-executing"><a class="header" href="#--dry-run--print-the-plan-without-executing"><code>--dry-run</code> — print the plan without executing</a></h3>
+<p>Shows the final wrapped invocation: LD_PRELOAD paths, LD_LIBRARY_PATH,
+env additions, loader to spawn, all without actually starting the guest.
+The best place to debug “why did my shim not load” without fighting
+real process IDs.</p>
+<h3 id="--kill-on-exit--sweep-guest-processes-on-parent-exit"><a class="header" href="#--kill-on-exit--sweep-guest-processes-on-parent-exit"><code>--kill-on-exit</code> — sweep guest processes on parent exit</a></h3>
+<p>When the <code>sprout</code> parent dies, anything tagged (env-set, marker on
+process) gets SIGKILL. Use when running long-lived daemons you want
+closed when the terminal closes. Draws the line at “anything I launched
+directly” — grandchildren or things forked from a DIFFERENT sprout
+invocation are out of scope.</p>
+<h3 id="--sysvipc--acceptance-no-op"><a class="header" href="#--sysvipc--acceptance-no-op"><code>--sysvipc</code> — acceptance no-op</a></h3>
+<p>proot-distro <code>--sysvipc</code> parsed as accepted. sprout’s SysV emulation
+(shm+sem via libandroid-shmem protocol + LD_PRELOAD wrappers) is
+<strong>always on</strong> for x86/box64 lanes (kernel has no CONFIG_SYSVIPC).
+Switch off explicitly with <code>SPROUT_SYSVIPC_OFF=1</code> env.</p>
+<h3 id="--ashmem-memfd--acceptance-no-op"><a class="header" href="#--ashmem-memfd--acceptance-no-op"><code>--ashmem-memfd</code> — acceptance no-op</a></h3>
+<p>proot’s equivalent hint when the kernel lacks <code>memfd_create</code>. sprout
+falls back to /dev/ashmem internally regardless; taking this flag is a
+parse-safe no-op for proot-distro compat.</p>
+<hr>
+<h2 id="the-out-of-band-subcommand"><a class="header" href="#the-out-of-band-subcommand">The out-of-band subcommand</a></h2>
+<h3 id="sprout-upkg-tarball--c-dir"><a class="header" href="#sprout-upkg-tarball--c-dir"><code>sprout upkg TARBALL [-C DIR]</code></a></h3>
+<p>Extract a <code>.tar</code> / <code>.tar.gz</code> / <code>.tar.xz</code> / <code>.tar.bz2</code> onto the FS with
+SELinux-aware write-time policy (hardlinks → content copies, setuid
+bits stripped, dev/fifo skipped with warning, path-traversal rejected).
+Replaces proot’s <code>--link2symlink tar -xJf …</code> bootstrap; does not require
+any existing guest. Detailed mechanics + ADR-0022.</p>
+<hr>
+<h2 id="flag-summary-table"><a class="header" href="#flag-summary-table">Flag summary table</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>What it does</th><th>When you need it</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-r PATH</code></td><td>pick guest rootfs</td><td>every time</td></tr>
+<tr><td><code>-w DIR</code></td><td>guest cwd</td><td>when init shell cwd is wrong</td></tr>
+<tr><td><code>-b H:G</code></td><td>extra bind</td><td>exposing host fs slice to guest</td></tr>
+<tr><td><code>-0</code></td><td>fake root (DEFAULT)</td><td>apt/installs/desktop sessions</td></tr>
+<tr><td><code>--no-fakeroot</code></td><td>real uid</td><td>benchmarking fake-id cost</td></tr>
+<tr><td><code>-u U[:G]</code></td><td>pick guest user from /etc/passwd</td><td>pretending to be steamuser / limited user</td></tr>
+<tr><td><code>-i U[:G]</code></td><td>proot -i alias for -u</td><td>copy-pasting user-id proot recipes</td></tr>
+<tr><td><code>--shared-tmp</code></td><td>$PREFIX/tmp ↔ guest /tmp</td><td>X11/Wayland/audio/ssh-agent hosts</td></tr>
+<tr><td><code>--termux-x11</code></td><td>DISPLAY=:0 + PULSE_SERVER</td><td>with –shared-tmp for a desktop</td></tr>
+<tr><td><code>-L</code></td><td>(note-only no-op)</td><td>paste-legacy compat</td></tr>
+<tr><td><code>--mixed-syscall</code></td><td>(no-op)</td><td>paste-legacy compat</td></tr>
+<tr><td><code>--sysvipc</code></td><td>(no-op; ADR-0018 always-on)</td><td>paste-legacy compat</td></tr>
+<tr><td><code>--ashmem-memfd</code></td><td>(no-op)</td><td>paste-legacy compat</td></tr>
+<tr><td><code>--link2symlink</code></td><td>SELinux link fallback (DEFAULT)</td><td>rust-toolchain installs, apt postinsts</td></tr>
+<tr><td><code>--no-link2symlink</code></td><td>disable link fallback</td><td>never unless you’re chasing a file</td></tr>
+<tr><td><code>-p [B]</code></td><td>low-port remap</td><td>devices where CAP_NET_BIND_SERVICE bites</td></tr>
+<tr><td><code>-q PATH</code></td><td>x86 emulator binfmt</td><td>x86_64/i386 guests on arm64 phones</td></tr>
+<tr><td><code>--fallback P</code></td><td>force preload or ptrace</td><td>hand-assembled/weird ELFs, debug</td></tr>
+<tr><td><code>--dry-run</code></td><td>print plan only</td><td>debugging wrapper composition</td></tr>
+<tr><td><code>-v [N]</code></td><td>translation log</td><td>chasing a path translation bug</td></tr>
+<tr><td><code>--kill-on-exit</code></td><td>sweep guest procs on parent exit</td><td>daemon jobs</td></tr>
+<tr><td><code>-k REL</code></td><td>spoof uname -r</td><td>picky enterprise installers</td></tr>
+<tr><td><code>--host-home</code></td><td>reuse host $HOME in guest</td><td>stray cases needing one writable zone</td></tr>
+<tr><td><code>--host-path</code></td><td>append host PATH</td><td>ad-hoc tooling bridging</td></tr>
+<tr><td><code>upkg TAR [-C DIR]</code></td><td>rootfs bootstrapping extractor</td><td>unpacking a tarball into a new rootfs</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="see-also"><a class="header" href="#see-also">See also</a></h2>
+<ul>
+<li><a href="#from-zero-to-a-desktop-step-by-step">From zero to desktop</a> — full onboarding</li>
+<li><a href="#troubleshooting-by-symptom">Troubleshooting</a> — every error and its fix</li>
+<li><a href="#faq">FAQ</a> — long-form maintenance / architecture questions</li>
+<li><a href="#environment-policy-inside-a-sprout-guest">Environment policy</a> — what env sprout injects</li>
+<li><a href="#proot-cli-compatibility">proot compat chart</a> — proot ↔ sprout flag mapping</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="troubleshooting-by-symptom"><a class="header" href="#troubleshooting-by-symptom">Troubleshooting by symptom</a></h1>
+<p>Search this page (Ctrl-F) for the exact string from your terminal. Each
+section has the same shape: <strong>what it means</strong> → <strong>why it happens</strong> →
+<strong>the fix</strong>.</p>
+<hr>
+<h2 id="startup--cli"><a class="header" href="#startup--cli">Startup / CLI</a></h2>
+<h3 id="sprout-guest-loader-not-found"><a class="header" href="#sprout-guest-loader-not-found"><code>sprout: guest loader not found</code></a></h3>
+<pre><code>sprout: guest loader not found: tried ["/lib/ld-linux-aarch64.so.1", ...] inside rootfs
+</code></pre>
+<p><strong>Means:</strong> sprout looked inside the rootfs you picked and found no dynamic
+loader, so no glibc binary can run.</p>
+<p><strong>Why:</strong> wrong rootfs, rootfs not unpacked yet, or the rootfs was built for
+x86_64 while you’re on aarch64.</p>
+<p><strong>Fix:</strong></p>
+<pre><code class="language-sh">ls -la &lt;your-rootfs&gt;/lib/ld-linux-aarch64.so.1
+# if missing: unpack correctly
+sprout upkg rootfs.tar.xz -C &lt;your-rootfs&gt;
+# or: point -r at the actual rootfs directory (the one containing bin/ etc/)
+</code></pre>
+<h3 id="sprout-command-not-found"><a class="header" href="#sprout-command-not-found"><code>sprout: command not found</code></a></h3>
+<p>You installed the source tree but never ran <code>install.sh</code>. Either:</p>
+<ul>
+<li><code>cd ~/sprout &amp;&amp; bash install.sh --verify</code>, or</li>
+<li>Use the absolute path: <code>~/sprout/target/release/sprout ...</code></li>
+</ul>
+<h3 id="sprout-no-such-file-or-directory-os-error-2"><a class="header" href="#sprout-no-such-file-or-directory-os-error-2"><code>sprout: No such file or directory (os error 2)</code></a></h3>
+<p>Most often: a <code>-b</code> or <code>--rootfs</code> path is missing on the host. Re-check
+every path with <code>ls -la</code> before the guest call. <code>sprout --dry-run</code> shows
+the resolved plan.</p>
+<h3 id="sprout---definitely-not-a-flag-doesnt-error"><a class="header" href="#sprout---definitely-not-a-flag-doesnt-error"><code>sprout --definitely-not-a-flag</code> doesn’t error</a></h3>
+<p>It should. If unknown flags are accepted silently you’re running an old
+sprout (&lt;0.5.1). Rebuild or reinstall; upgrade-path doc lives in
+<a href="#installation">installation.md</a>.</p>
+<hr>
+<h2 id="network--dns"><a class="header" href="#network--dns">Network / DNS</a></h2>
+<h3 id="apt-unable-to-locate-package---temporary-failure-resolving-"><a class="header" href="#apt-unable-to-locate-package---temporary-failure-resolving-">apt: <code>Unable to locate package ...</code> / <code>Temporary failure resolving ...</code></a></h3>
+<p><strong>Means:</strong> guest can’t resolve DNS names.</p>
+<p><strong>Why:</strong> Android’s DNS resolver is host-loopback only (127.0.0.1:53);
+inside the guest the same address is the guest’s own loopback with nothing
+listening.</p>
+<p><strong>Fix</strong> (from Termux, replace <code>~/linux</code> with your rootfs dir):</p>
+<pre><code class="language-sh">rm -f ~/linux/etc/resolv.conf
+printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' &gt; ~/linux/etc/resolv.conf
+</code></pre>
+<p>Check: <code>sprout -r ~/linux --user=0:0 -- ping -c 1 deb.debian.org</code>
+shows an IPv4/IPv6 address.</p>
+<h3 id="apt-update-fails-even-after-resolvconf"><a class="header" href="#apt-update-fails-even-after-resolvconf"><code>apt update</code> fails even after resolv.conf</a></h3>
+<p>Network is fine (can ping IPs) but apt transport fails: new Termux ships
+an openssl that wants kernel entropy features not present. Workaround:</p>
+<pre><code class="language-sh"># inside guest
+apt -o Acquire::https::No-Cache=True update
+# or fall back to HTTP mirrors temporarily
+</code></pre>
+<hr>
+<h2 id="dpkg--apt-package-operations"><a class="header" href="#dpkg--apt-package-operations">dpkg / apt package operations</a></h2>
+<h3 id="dpkg--subprocess-returned-error-exit-status-2"><a class="header" href="#dpkg--subprocess-returned-error-exit-status-2"><code>dpkg: ... subprocess returned error exit status 2</code></a></h3>
+<p>Host-path leaking into a postinst (e.g. <code>/data/data/com.termux/...</code>
+appearing in guest error output).</p>
+<p><strong>Why this happens:</strong> a small number of postinsts ask for their own
+realpath (<code>readlink -f $0</code> or <code>realpath()</code> on argv[0]) and sprout returns
+the host-correct answer. The postinst then feeds that path to guest-side
+<code>open()</code>, which can’t read it (not a guest path at all).</p>
+<p><strong>Fix</strong> (the one your friend’s case used):</p>
+<pre><code class="language-sh"># inside the guest
+dpkg --configure -a
+apt --fix-broken install
+# if a specific package refuses, stub that one postinst:
+rm -f /var/lib/dpkg/info/PKG.postinst
+printf '#!/bin/sh\nexit 0\n' &gt; /var/lib/dpkg/info/PKG.postinst
+chmod 755 /var/lib/dpkg/info/PKG.postinst
+dpkg --configure -a &amp;&amp; apt-get -f install
+# optional once everything is green:
+apt install --reinstall PKG
+</code></pre>
+<p>Most postinsts don’t do realpath games. The few that do include
+dictionaries-common, the gdk-pixbuf loaders, some gstreamer metadata
+registrations.</p>
+<h3 id="dpkg-usrbindpkg-returned-an-error-code-1"><a class="header" href="#dpkg-usrbindpkg-returned-an-error-code-1">dpkg: <code>.../usr/bin/dpkg returned an error code (1)</code></a></h3>
+<p>Follows the previous block; one failing package blocks every dependent
+package from configuring. Same fix.</p>
+<hr>
+<h2 id="x11--desktop"><a class="header" href="#x11--desktop">X11 / desktop</a></h2>
+<h3 id="fail-no-socket-after-5s--nohup-failed-to-run-command-termux-x11"><a class="header" href="#fail-no-socket-after-5s--nohup-failed-to-run-command-termux-x11"><code>FAIL: no socket after 5s — nohup: failed to run command '.../termux-x11'</code></a></h3>
+<p>You don’t have the <code>termux-x11-nightly</code> package installed.</p>
+<p><strong>Fix:</strong></p>
+<pre><code class="language-sh">pkg install x11-repo -y
+pkg install termux-x11-nightly -y
+</code></pre>
+<p>(and the companion Android app from F-Droid or GitHub releases —
+that’s the actual X server. The pkg side alone is only a launcher.)</p>
+<h3 id="fail-handshake-after-the-pkg-is-installed"><a class="header" href="#fail-handshake-after-the-pkg-is-installed"><code>FAIL handshake</code> after the pkg is installed</a></h3>
+<p>The termux-x11 <strong>APK</strong> isn’t running:</p>
+<ul>
+<li>Termux from F-Droid + APK from Play Store (or vice versa) — signatures
+don’t match, silent block. Install both from the same store family.</li>
+<li>Or APK simply hasn’t been opened once since install. Open it once,
+then rerun your launcher.</li>
+</ul>
+<h3 id="firefox-style-banner-x-server-already-running-on-display-0-then-xrdb-cant-open-display"><a class="header" href="#firefox-style-banner-x-server-already-running-on-display-0-then-xrdb-cant-open-display">Firefox-style banner: “X server already running on display :0” then <code>xrdb: Can't open display</code></a></h3>
+<p>Stale socket file.</p>
+<p><code>/tmp/.X11-unix/X0</code> is a file that gets left behind when you kill-9’d a
+previous run. startxfce4 sees the file and mistakenly concludes the server
+is alive.</p>
+<p><strong>Fix:</strong></p>
+<pre><code class="language-sh">rm -f $PREFIX/tmp/.X11-unix/X0
+~/start-desktop.sh start
+</code></pre>
+<p>(This is exactly what <code>examples/desktop/x11-rescue.sh</code> does on every run —
+calling raw <code>sprout -r ... startxfce4</code> skips the sweep.)</p>
+<h3 id="xfce4-session-cannot-open-display--dbus-launch--failed-to-connect-to-x11"><a class="header" href="#xfce4-session-cannot-open-display--dbus-launch--failed-to-connect-to-x11"><code>xfce4-session: Cannot open display:</code> / <code>dbus-launch ... failed to connect to X11</code></a></h3>
+<p>The X server never came up — you either launched without <code>termux-x11</code>
+running, or your display env doesn’t match your launcher’s expectation.</p>
+<p>Sprout’s rule: sprout never invents DISPLAY. You opt in with
+<code>--termux-x11</code> (sets <code>DISPLAY=:0</code>) or by passing it
+explicitly: <code>env DISPLAY=:0 sprout ...</code>.</p>
+<h3 id="xdg_runtime_dir-tmpruntime-root-not-available"><a class="header" href="#xdg_runtime_dir-tmpruntime-root-not-available"><code>XDG_RUNTIME_DIR "/tmp/runtime-root" not available</code></a></h3>
+<p>The dir doesn’t exist inside the guest. xfce-session dbus fails without
+it.</p>
+<p><strong>Fix once</strong>, from host-side Termux:</p>
+<pre><code class="language-sh">sprout -r ~/linux --user=0:0 -- mkdir -p /tmp/runtime-root
+chmod 700 ~/linux/tmp/runtime-root
+</code></pre>
+<h3 id="pulseaudio---start-failed-at-desktop-launch"><a class="header" href="#pulseaudio---start-failed-at-desktop-launch"><code>pulseaudio --start failed</code> at desktop launch</a></h3>
+<p>Non-fatal; audio just won’t work. Likely stale pid file. Workaround
+once:</p>
+<pre><code class="language-sh">rm -f $PREFIX/var/run/pulse/pid
+pulseaudio --start --exit-idle-time=-1
+</code></pre>
+<hr>
+<h2 id="permissions--file-behavior"><a class="header" href="#permissions--file-behavior">Permissions / file behavior</a></h2>
+<h3 id="guest-files-created-at-mode-0600-everywhere-when-apt-says-they-should-be-0644"><a class="header" href="#guest-files-created-at-mode-0600-everywhere-when-apt-says-they-should-be-0644">Guest files created at mode <code>0600</code> everywhere when apt says they should be <code>0644</code></a></h3>
+<p>Termux apps run with umask 077. sprout’s CLI applies a default umask of
+022 (unless <code>SPROUT_KEEP_UMASK=1</code>) before exec’ing the guest, so this
+shouldn’t happen in ≥0.5 versions. If it does, you’re either setting a
+custom umask your shell, or running an old sprout.</p>
+<h3 id="chown-from-guest-side-reports-eperm"><a class="header" href="#chown-from-guest-side-reports-eperm"><code>chown</code> from guest side reports EPERM</a></h3>
+<p>Ownership mapping is fake-id. <code>chown</code> of a file OUTSIDE the sprout-managed
+fake-root still touches kernel-truth ownership — denied. If you must
+“change” ownership to another guest-side user, use <code>--user</code> to impersonate
+instead. Never use real root (sprout is rootless).</p>
+<h3 id="grep-etcpasswdlock-file-exists-during-useradd-class-commands"><a class="header" href="#grep-etcpasswdlock-file-exists-during-useradd-class-commands"><code>grep: /etc/passwd.lock: File exists</code> during <code>useradd</code>-class commands</a></h3>
+<p>The link2symlink fallback produced <code>nlink=1</code> behavior somewhere — the
+fake-lock protocol demands nlink=2. This regression was fixed in v0.5.
+If it returns on your build, paste your <code>sprout -v 3</code> log around the
+<code>linkat()</code> call chain into a GitHub bug.</p>
+<hr>
+<h2 id="emulation--x86"><a class="header" href="#emulation--x86">Emulation / x86</a></h2>
+<h3 id="wrong-elf-class-elfclass64-when-launching-an-i386-binary"><a class="header" href="#wrong-elf-class-elfclass64-when-launching-an-i386-binary"><code>wrong ELF class: ELFCLASS64</code> when launching an i386 binary</a></h3>
+<p>box64 handles x86_64; box32 handles i386. In sprout ≥0.5 i386 is auto-
+wrapped via the two-env-row convention (<code>SPROUT_BINFMT_X86_64</code> +
+<code>SPROUT_BINFMT_I386</code>). Check both are exported into the guest session.</p>
+<h3 id="x86_64-binary-dies-at-set_robust_list--rseq-log-lines"><a class="header" href="#x86_64-binary-dies-at-set_robust_list--rseq-log-lines">x86_64 binary dies at <code>set_robust_list</code> / <code>rseq</code> log lines</a></h3>
+<p>Android’s seccomp filter blocks <code>set_robust_list</code> (99) and <code>rseq</code> (293) for
+these app uids. sprout’s preload masks them; the ptrace lane also
+translates the attempts (see ADR-0006 for the kernel-block table). If
+you see the raw error:</p>
+<ul>
+<li>preload lane → check <code>LD_PRELOAD=$PREFIX/bin/libsprout-core.so</code> is in
+the child’s env (use <code>sprout --dry-run ...</code> to inspect)</li>
+<li>ptrace lane → needs a current sprout-super (rebuild + reinstall)</li>
+</ul>
+<h3 id="box64-launches-but-segfaults-inside-a-specific-emulator"><a class="header" href="#box64-launches-but-segfaults-inside-a-specific-emulator">box64 launches but segfaults inside a specific emulator</a></h3>
+<p>That’s box64-the-emulator, not sprout-the-loader. Check
+<code>BOX64_LOG=1 sprout -r ... -- box64 ./yourprog</code> for the JIT trace. Guest
+state goes in GitHub’s <code>ptitSeb/box64</code> issue tracker, not sprout’s.</p>
+<hr>
+<h2 id="slow--performance"><a class="header" href="#slow--performance">Slow / performance</a></h2>
+<h3 id="sprout-feels-slow-on-tiny-commands-like-true-or-echo-hello"><a class="header" href="#sprout-feels-slow-on-tiny-commands-like-true-or-echo-hello">sprout feels slow on tiny commands like <code>true</code> or <code>echo hello</code></a></h3>
+<p>Startup-dominated path. sprout parses CLI, reads ELF headers, plans,
+then spawns. proot’s launcher is lighter in C terms, so sub-100ms
+commands show ~5ms cost. This is inherent and amortized away on any
+meaningful workload.</p>
+<p>Benchmarks: <code>bench/run.sh</code> and <code>bench/run-statics.sh</code>. The controlled
+variant of both sprout-notify-vs-proot vs sprout-ptrace-vs-proot is
+explained in <code>docs/src/benchmarks.md</code>.</p>
+<h3 id="dpkg-postinst-glibc-locale-archive-builder-takes-forever"><a class="header" href="#dpkg-postinst-glibc-locale-archive-builder-takes-forever"><code>dpkg-postinst: glibc-locale-archive-builder takes forever</code></a></h3>
+<p>Long-classic on Termux. The <code>.l2s</code> hash + loader dirs are the right thing
+to check: ensure <code>SPROUT_CACHE_DIR</code> is not on FAT32. sprout does its own
+guest-glibc sanitization in <code>~/.cache/sprout</code> and should fall there
+automatically — if it lands on SD card (exfat) you will feel a 50×
+slowdown.</p>
+<hr>
+<h2 id="still-stuck"><a class="header" href="#still-stuck">Still stuck?</a></h2>
+<ol>
+<li><code>sprout --dry-run -v 3 ... </code> shows the whole launch composition</li>
+<li><code>bash tests/smoke.sh &lt;rootfs&gt;</code> and <code>bash tests/proot-compat.sh &lt;rootfs&gt;</code>
+(in the repo) exercise the gates expected to pass</li>
+<li>Check the FAQ and the ADR index for things that don’t match this page</li>
+<li>Open an issue: https://github.com/YRangel/sprout/issues — include the
+command, the exact error text, and your sprout version
+(<code>sprout --version</code>)</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
 <h2 id="from-a-release-recommended"><a class="header" href="#from-a-release-recommended">From a release (recommended)</a></h2>
 <p>Download the <strong>Termux host tarball</strong> —
@@ -364,7 +1105,7 @@ is a no-op. The table is sorted by how <code>proot-distro login</code> uses flag
 <tr><td><code>-r &lt;path&gt;</code></td><td><code>-r &lt;path&gt;</code></td><td>✅ v0.1</td></tr>
 <tr><td><code>-b &lt;host&gt;[:&lt;guest&gt;]</code></td><td><code>-b &lt;host&gt;[:&lt;guest&gt;]</code></td><td>✅ v0.1 (repeatable)</td></tr>
 <tr><td><code>-0</code></td><td><code>-0</code> / <code>--root-id</code></td><td>✅ v0.1; <strong>DEFAULT since v0.5</strong> (opt out with <code>--no-fakeroot</code>)</td></tr>
-<tr><td><code>-w &lt;dir&gt;</code></td><td><code>-w &lt;dir&gt;</code> / <code>--cwd</code></td><td>✅ v0.1</td></tr>
+<tr><td><code>-w &lt;dir&gt;</code></td><td><code>-w &lt;dir&gt;</code> / <code>--cwd</code></td><td>✅ v0.1. Relative guest dirs are interpreted guest-side (<code>-w etc</code> → <code>/etc</code>), matching proot.</td></tr>
 <tr><td><code>--link2symlink</code></td><td><code>--link2symlink</code></td><td>✅ v0.4.3+; <strong>DEFAULT since v0.5</strong> (opt out with <code>--no-link2symlink</code>). EPERM hardlinks degrade like proot’s <code>.l2s</code> (content relocated to <code>$ROOT/.l2s/.l2s.&lt;name&gt;.&lt;nonce&gt;</code> + symlinks at both src and dst — survives <code>link-then-write-through-fd</code> like glibc’s locale-archive builder), then content-copy, symlink as last resort</td></tr>
 <tr><td><code>-q &lt;qemu&gt;</code></td><td><code>-q &lt;emu&gt;</code></td><td>userspace binfmt adapter: x86_64/i386/box64 execs rewritten through the given guest-side emulator (default <code>/usr/local/bin/box64</code>); env <code>SPROUT_BINFMT_X86_64</code>/<code>SPROUT_BINFMT_I386</code> overrides per arch, <code>SPROUT_BINFMT_ALWAYS=1</code> wraps every exec (ADR-0017)</td></tr>
 <tr><td>(HOME passthrough)</td><td><code>--host-home</code></td><td>v0.5.1+: default is proot’s <code>HOME=/root</code>; flag carries the host <code>$HOME</code> in</td></tr>
@@ -655,7 +1396,11 @@ meaning “host power”, the decision is already wrong on proot as well.</p>
 host and guest and the X server lives in that shared dir. sprout reaches
 exactly the same semantics — through the same mechanism, not virtualization.</p>
 <h2 id="x11-verified"><a class="header" href="#x11-verified">X11 (verified)</a></h2>
-<pre><code>pkg install termux-x11-xfce4     # any X server on the host side
+<pre><code>pkg install x11-repo -y
+pkg install termux-x11-nightly -y
+# AND install the matching Android app (APK) from F-Droid or
+# https://github.com/termux/termux-x11/releases — the pkg is a launcher,
+# the APK is the actual X server. Both halves, same store family.
 termux-x11 :0                    # display :0 lives at $PREFIX/tmp/.X11-unix/X0
 </code></pre>
 <p>In the guest:</p>
@@ -761,7 +1506,7 @@ Same older bug class (unknown tokens after <code>--rootfs</code> became the gues
 program name, not an error). Current build: <code>-L</code> parses as a compat
 no-op printing a one-line note, then <code>cmd</code> resolves normally. Git the
 current build (<code>./install.sh --verify</code>).</p>
-<h2 id="emulation--x86"><a class="header" href="#emulation--x86">Emulation / x86</a></h2>
+<h2 id="emulation--x86-1"><a class="header" href="#emulation--x86-1">Emulation / x86</a></h2>
 <p><strong>Can I run x86_64 apps?</strong>
 Yes — box64 inside the guest: install/build box64 anywhere under the default
 lookup path (<code>/usr/local/bin/box64</code> in the rootfs) and plain
@@ -848,6 +1593,11 @@ the name into <code>.note.gnu.build-id</code> + <code>.symtab</code> — <code>h
 healthcheck (<code>~/projeto/healthcheck.sh</code>) does this L1 leg for you.</p>
 <p><strong>What batteries run before a release?</strong>
 <code>cargo test --workspace</code>, <code>test_translate</code>, <code>cargo fmt --check</code>, <code>cargo clippy -D warnings</code>, <code>bench/run.sh</code>, <code>bench/run-statics.sh</code>, <code>flagmatrix.sh</code> 11/11, <code>healthcheck.sh</code> 0 fails on BOTH lanes (6.12 notify + 4.14 ptrace), desktop spawn smoke.</p>
+<p><strong>Nothing here matches my error?</strong>
+See the <a href="#troubleshooting-by-symptom">troubleshooting by symptom</a> page — every
+failure mode we’ve ever seen in the wild each got its own section there.
+If yours isn’t covered, open an issue with the exact error string and
+<code>sprout --dry-run -v 3</code> output attached.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="architecture-overview"><a class="header" href="#architecture-overview">Architecture overview</a></h1>
 <p>sprout is four small layers, each independently testable:</p>
