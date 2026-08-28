@@ -283,7 +283,43 @@ fn run() -> Result<u8, Error> {
         rootfs.user_shell = Some(shell);
     }
     for spec in &cli.binds {
-        rootfs.bindings.push(Binding::parse(spec)?);
+        match Binding::parse(spec) {
+            Ok(b) => rootfs.bindings.push(b),
+            Err(e) => {
+                /* proot parity: relative -b HOST resolves against the
+                 * launcher's cwd (proot canonicalizes with realpath) and
+                 * sinks in as a valid bind; only malformed specs warn +
+                 * get skipped. */
+                let host_part = spec.split(':').next().unwrap_or(spec);
+                let canon = std::fs::canonicalize(host_part)
+                    .ok()
+                    .filter(|p| p.is_absolute());
+                match canon {
+                    Some(abs) => {
+                        let abs_s = abs.display().to_string();
+                        let fixed = if let Some((_, g)) = spec.split_once(':') {
+                            format!("{abs_s}:{g}")
+                        } else {
+                            abs_s
+                        };
+                        match Binding::parse(&fixed) {
+                            Ok(b) => {
+                                eprintln!(
+                                    "sprout: note: relative -b {spec:?} resolved to {fixed:?}"
+                                );
+                                rootfs.bindings.push(b);
+                            }
+                            Err(_) => {
+                                eprintln!("sprout: warning: can't sanitize binding {spec:?}: {e} — skipped")
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("sprout: warning: can't sanitize binding {spec:?}: {e} — skipped")
+                    }
+                }
+            }
+        }
     }
     if cli.shared_tmp {
         // host $PREFIX/tmp → guest /tmp (proot-distro --shared-tmp)

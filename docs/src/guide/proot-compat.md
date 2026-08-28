@@ -14,7 +14,7 @@ is a no-op. The table is sorted by how `proot-distro login` uses flags.
 | `-r <path>` | `-r <path>` | ✅ v0.1 |
 | `-b <host>[:<guest>]` | `-b <host>[:<guest>]` | ✅ v0.1 (repeatable) |
 | `-0` | `-0` / `--root-id` | ✅ v0.1; **DEFAULT since v0.5** (opt out with `--no-fakeroot`) |
-| `-w <dir>` | `-w <dir>` / `--cwd` | ✅ v0.1 |
+| `-w <dir>` | `-w <dir>` / `--cwd` | ✅ v0.1. Relative guest dirs are interpreted guest-side (`-w etc` → `/etc`), matching proot. |
 | `--link2symlink` | `--link2symlink` | ✅ v0.4.3+; **DEFAULT since v0.5** (opt out with `--no-link2symlink`). EPERM hardlinks degrade like proot's `.l2s` (content relocated to `$ROOT/.l2s/.l2s.<name>.<nonce>` + symlinks at both src and dst — survives `link-then-write-through-fd` like glibc's locale-archive builder), then content-copy, symlink as last resort |
 | `-q <qemu>` | `-q <emu>` | userspace binfmt adapter: x86_64/i386/box64 execs rewritten through the given guest-side emulator (default `/usr/local/bin/box64`); env `SPROUT_BINFMT_X86_64`/`SPROUT_BINFMT_I386` overrides per arch, `SPROUT_BINFMT_ALWAYS=1` wraps every exec (ADR-0017) |
 | (HOME passthrough) | `--host-home` | v0.5.1+: default is proot's `HOME=/root`; flag carries the host `$HOME` in |

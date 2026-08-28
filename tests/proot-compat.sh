@@ -53,6 +53,22 @@ sprout -r "$rootfs" -b "$H:/compat-bind-dst" --user=0:0 -- \
 rm -f "$H"
 pass "-b HOST:GUEST bind visible inside guest"
 
+# -b RELATIVE host path: resolves against launcher cwd (proot canonicalizes
+# silently with realpath; sprout prints a note + takes the absolute form)
+mkdir -p "$PREFIX/tmp/compat-rel-$$"
+echo "REL_CONTENT_$$" > "$PREFIX/tmp/compat-rel-$$/rel.txt"
+(cd "$PREFIX/tmp/compat-rel-$$" &&
+    sprout -r "$rootfs" -b rel.txt:/compat-rel-dst --user=0:0 -- cat /compat-rel-dst 2>&1) \
+    | grep -q "REL_CONTENT_$$" \
+    || fail "-b relative host path bind"
+rm -rf "$PREFIX/tmp/compat-rel-$$"
+pass "-b relative host path resolves against launcher cwd"
+
+# -b nonexistent host path: warn + skip, command still runs (proot parity)
+out=$(sprout -r "$rootfs" -b "/definitely/not/here-$$" -- /bin/true >/dev/null 2>&1 && echo ok)
+[ "$out" = "ok" ] || fail "-b nonexistent must not kill the launch"
+pass "-b nonexistent host path warn+skip, command still runs"
+
 # -w : guest working directory honored. Use /var (real dir, no /tmp ->
 # /dev/shm symlink chase on this rootfs) for a stable pwd.
 run -w /var --user=0:0 -- /bin/sh -c 'pwd'
