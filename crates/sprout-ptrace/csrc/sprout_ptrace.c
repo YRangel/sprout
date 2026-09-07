@@ -3341,7 +3341,17 @@ int main(int argc, char **argv) {
          * signal-handler stack into an unrecoverable state under
          * classic-ptrace (task #13 "B: replay siginfo"; A: this shadow
          * automatic opt-in). */
-        if (t->shadow) {
+        /* Shadow contract is free-run, but only for CONTINUABLE signal
+         * stops. A TRAP stop ((SIGTRAP or SIGTRAP|0x80)) is NOT a signal —
+         * it is a ptrace event report (syscall stop / exec-stop / seccomp
+         * stop depending on options). Re-injecting sig=SIGTRAP/0x85 via
+         * PTRACE_CONT queues a REAL trap signal into the tracee and the
+         * syscall-stop machinery never advances: the tracee loops forever
+         * (observed: glibc-dynamic main child wedged after openat+openat
+         * on a 6.12 host where syscall-entry stops arrive). Fall through
+         * to the generic tail so signal stops keep their signo but TRAP
+         * stops resume with 0 (generic tail already handles both). */
+        if (t->shadow && sig != SIGTRAP && sig != (SIGTRAP | 0x80)) {
             if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE) {
                 /* Re-arm semantically: fetch siginfo + reinject the same
                  * pending signal. PTRACE_CONT(sig) alone can orphan
