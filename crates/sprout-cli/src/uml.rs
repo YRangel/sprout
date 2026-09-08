@@ -265,6 +265,120 @@ pub fn agent_exec_files(
     Ok((code, out, err))
 }
 
+/// Exec via AF_VSOCK (fast path): connects to CID_HOST:port through the
+/// vhost-device-vsock bridge. Same protocol v1 wire format.
+pub fn agent_exec_vsock(
+    uds_path: Option<&std::path::Path>,
+    port: u32,
+    argv: &[String],
+    env: &[String],
+    cwd: &str,
+    stdin_data: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
+    use std::io::Write as _;
+    use std::os::unix::io::FromRawFd;
+    const AF_VSOCK: libc::sa_family_t = 40;
+    const CID_GUEST: u32 = 3;
+
+    #[repr(C)]
+    struct SockAddrVm {
+        family: libc::sa_family_t,
+        reserved1: u16,
+        port: u32,
+        cid: u32,
+        zero: [u8; 4],
+    }
+
+    let mut s = if let Some(uds) = uds_path {
+        // Firecracker hybrid-vsock: connect to the control UDS, send
+        // "CONNECT <port>\n", then the same socket is a raw channel to
+        // the guest vsock listener.
+        let mut u = std::os::unix::net::UnixStream::connect(uds)?;
+        u.set_read_timeout(Some(timeout))?;
+        u.set_write_timeout(Some(timeout))?;
+        u.write_all(format!("CONNECT {port}\n").as_bytes())?;
+        // backend acks "OK <port>\n" before the raw channel starts
+        let mut ack = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            u.read_exact(&mut b)?;
+            ack.push(b[0]);
+            if b[0] == b'\n' {
+                break;
+            }
+            if ack.len() > 32 {
+                anyhow::bail!("vsock handshake: malformed ack {ack:?}");
+            }
+        }
+        u
+    } else {
+        unsafe {
+            let fd = libc::socket(AF_VSOCK as libc::c_int, libc::SOCK_STREAM, 0);
+            if fd < 0 {
+                anyhow::bail!(
+                    "socket(AF_VSOCK) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let addr = SockAddrVm {
+                family: AF_VSOCK,
+                reserved1: 0,
+                port,
+                cid: CID_GUEST,
+                zero: [0; 4],
+            };
+            if libc::connect(
+                fd,
+                &addr as *const SockAddrVm as *const libc::sockaddr,
+                std::mem::size_of::<SockAddrVm>() as libc::socklen_t,
+            ) < 0
+            {
+                let e = std::io::Error::last_os_error();
+                libc::close(fd);
+                anyhow::bail!("vsock connect failed: {}", e);
+            }
+            std::os::unix::net::UnixStream::from_raw_fd(fd)
+        }
+    };
+    s.set_read_timeout(Some(timeout))?;
+    s.set_write_timeout(Some(timeout))?;
+
+    let mut req = Vec::new();
+    req.push(PROTO_EXEC);
+    push_strs(&mut req, argv);
+    push_strs(&mut req, env);
+    push_str(&mut req, cwd.as_bytes());
+    push_u32(&mut req, stdin_data.len() as u32);
+    req.extend_from_slice(stdin_data);
+    push_u32(&mut req, 0);
+    push_u32(&mut req, 0);
+    push_u32(&mut req, timeout.as_millis().min(u32::MAX as u128) as u32);
+    push_u32(&mut req, 0);
+    s.write_all(&req)?;
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    loop {
+        let mut hdr = [0u8; 8];
+        s.read_exact(&mut hdr)?;
+        let stream = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+        let len = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        if stream == RESP_EXIT {
+            let mut code_b = [0u8; 4];
+            s.read_exact(&mut code_b)?;
+            return Ok((i32::from_le_bytes(code_b), out, err));
+        }
+        let mut buf = vec![0u8; len];
+        s.read_exact(&mut buf)?;
+        if stream == RESP_STDOUT {
+            out.extend_from_slice(&buf);
+        } else if stream == RESP_STDERR {
+            err.extend_from_slice(&buf);
+        }
+    }
+}
+
 /// Ping the agent. Ok(true) = alive.
 pub fn agent_ping(sock_path: &str, timeout: Duration) -> bool {
     let s = match UnixStream::connect(sock_path) {
@@ -565,19 +679,31 @@ fn cmd_exec(id: &str, cmd: &[String], timeout: Duration) -> anyhow::Result<u8> {
     // found". Guest cwd is always "/" for v0.1 (guest is a whole rootfs,
     // not a working-dir passthrough — same rule as proot -0-style runs).
     let cwd = "/".to_string();
-    let (code, out, err) = match agent_exec(&sock, cmd, &env, &cwd, &[], timeout) {
-        Ok(r) => r,
-        // hostfs socket nodes are placeholders on the host — file transport
-        Err(e)
-            if e.to_string().contains("Connection refused")
-                || e.to_string().contains("os error 111") =>
-        {
-            let dir = uml_dir(id);
-            let share = dir.join("share");
-            agent_exec_files(&share, cmd, &env, &cwd, &[], timeout)?
-        }
-        Err(e) => return Err(e),
+    const VSOCK_PORT: u32 = 2225;
+    let uds = uml_dir(id).join("vhu-uds");
+    let uds_opt = if uds.exists() {
+        Some(uds.as_path())
+    } else {
+        None
     };
+    let (code, out, err) =
+        match agent_exec_vsock(uds_opt, VSOCK_PORT, cmd, &env, &cwd, &[], timeout) {
+            Ok(r) => r,
+            Err(vs_err) => match agent_exec(&sock, cmd, &env, &cwd, &[], timeout) {
+                Ok(r) => r,
+                // hostfs socket nodes are placeholders on the host — file transport
+                Err(e)
+                    if e.to_string().contains("Connection refused")
+                        || e.to_string().contains("os error 111") =>
+                {
+                    let dir = uml_dir(id);
+                    let share = dir.join("share");
+                    agent_exec_files(&share, cmd, &env, &cwd, &[], timeout)
+                        .map_err(|fe| anyhow::anyhow!("vsock: {vs_err}; unix: {e}; files: {fe}"))?
+                }
+                Err(e) => return Err(anyhow::anyhow!("vsock: {vs_err}; unix: {e}")),
+            },
+        };
     use std::io::Write;
     let _ = std::io::stdout().write_all(&out);
     let _ = std::io::stderr().write_all(&err);

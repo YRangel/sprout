@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <linux/vm_sockets.h>
 #include <dirent.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -248,6 +250,47 @@ static void handle_conn(int cfd, int wfd) {
     }
 }
 
+/* ---------- vsock transport (fast host path over virtio-vsock) ----------
+ * Guest listens on VMADDR_CID_ANY:<port>; the host CLI connects to
+ * CID_HOST (2):<port> through the vhost-device-vsock UDS bridge.
+ * Protocol v1, byte-identical to the unix/file transports. */
+#define VSOCK_PORT 2225
+
+static int make_vsock_listener(int port) {
+    int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_vm a;
+    memset(&a, 0, sizeof a);
+    a.svm_family = AF_VSOCK;
+    a.svm_cid = VMADDR_CID_ANY;
+    a.svm_port = port;
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0 ||
+        listen(fd, 64) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* vsock worker loop: accept serially; each conn served inline (prefork
+ * pool is for the unix fast path; vsock conns are one-per-exec). */
+static void vsock_loop(int lfd) {
+    FILE *df = fopen("/run/sprout/state.log", "a");
+    for (;;) {
+        int c = accept(lfd, NULL, NULL);
+        if (df) { fprintf(df, "vsock accept=%d\n", c); fflush(df); }
+        if (c < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        handle_conn(c, c);
+        if (df) { fprintf(df, "vsock conn done\n"); fflush(df); }
+        close(c);
+    }
+    if (df) fclose(df);
+    _exit(0);
+}
+
 /* ---------- file transport (host <-> guest via the hostfs share) ----------
  * The hostfs share cannot carry AF_UNIX to the host: a socket node created
  * inside the guest is only a placeholder file on the host (hostfs mknod),
@@ -386,6 +429,29 @@ int main(int argc, char **argv) {
     {
         FILE *df = fopen("/run/sprout/agent-debug.log", "a");
         if (df) { fprintf(df, "listening pid=%d\n", getpid()); fclose(df); }
+    }
+    /* vsock: fast host path (no fs, no polling). One dedicated process;
+     * its death never touches the unix pool. */
+    {
+        int vfd = make_vsock_listener(VSOCK_PORT);
+        {
+            FILE *df = fopen("/run/sprout/state.log", "a");
+            if (df) {
+                fprintf(df, "vsock listener fd=%d (%s)\n", vfd,
+                        vfd >= 0 ? "ok" : strerror(errno));
+                fclose(df);
+            }
+        }
+        if (vfd >= 0) {
+            pid_t v = fork();
+            if (v == 0) {
+                vsock_loop(vfd);
+                _exit(0);
+            }
+            close(vfd);
+        }
+        /* vsock unavailable (no device / old kernel): file + unix still
+         * carry everything. Degradation, not failure. */
     }
     /* file transport: one extra process polls the share dir (hostfs has
      * no usable inotify on this port) so the socket pool stays untouched */
