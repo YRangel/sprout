@@ -15,6 +15,8 @@ use sprout_core::{
     classify, elf_meta, Binding, Error, GuestClass, LaunchPlan, LibcFlavor, Rootfs, Strategy,
 };
 
+mod uml;
+
 /// Rootless glibc Linux userspace for Android (proot-compatible CLI).
 ///
 /// Runs guest binaries through `LD_PRELOAD` path translation with an
@@ -981,6 +983,17 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::from(0),
                 Err(e) => {
                     eprintln!("sprout upkg: {e:#}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        /* `sprout uml ...` — UML sidecar (ADR-0023). Separate arm BEFORE
+         * clap: fast-lane flag surface provably untouched. */
+        if args.len() >= 2 && args[1] == "uml" {
+            return match uml::uml_main(&args[2..]) {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    eprintln!("sprout uml: {e:#}");
                     ExitCode::from(1)
                 }
             };

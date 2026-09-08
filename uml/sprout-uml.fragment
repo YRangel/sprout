@@ -1,0 +1,92 @@
+# sprout UML kernel config fragment (appended on top of x86_64_defconfig).
+# Applies via scripts/kconfig/merge_config.sh. Pinned to v6.16; re-check
+# symbols on rebase (CONFIG_ names drift between releases).
+#
+# Design: the guest kernel supplies ONLY what the fast lane cannot —
+# a real PID 1, cgroup hierarchy, namespaces, module loading, binfmt_misc.
+# Everything userspace-emulatable stays OUT (sprout owns it at ~1.0x).
+
+# --- the whole point: init, containment, virtualization-inside ---
+CONFIG_CGROUPS=y
+# NOTE: no CONFIG_CGROUP_V1/V2 knobs in 6.16 — unified hierarchy is
+# always built when CGROUPS=y. Docker/systemd inside guest just work.
+CONFIG_CGROUP_SCHED=y
+CONFIG_CGROUP_CPUACCT=y
+CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_CPUSETS=y
+CONFIG_BLK_CGROUP=y
+CONFIG_NAMESPACES=y
+CONFIG_UTS_NS=y
+CONFIG_IPC_NS=y
+CONFIG_PID_NS=y            # defconfig disables; UML sidecar needs containers
+CONFIG_NET_NS=y
+CONFIG_USER_NS=y           # userns INSIDE guest works (host denies it, guest allows)
+CONFIG_CHECKPOINT_RESTORE=y
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+CONFIG_BPF_SYSCALL=y
+# No BPF_JIT: ARCH=um selects neither HAVE_CBPF_JIT nor HAVE_EBPF_JIT
+# (arch/x86's select does not apply to the um subarch), so the symbol has
+# no dependencies to satisfy — the interpreter covers guest BPF needs.
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+CONFIG_SMP=y                  # subarch selects UML_SUBARCH_SUPPORTS_SMP (rqspinlock.h override)
+CONFIG_NR_CPUS=8              # range 2..64 on um/arm64; runtime count via ncpus= boot arg
+CONFIG_BINFMT_MISC=y       # real binfmt_misc registration inside guest (replaces ADR-0017 sniffing)
+CONFIG_OVERLAY_FS=y        # docker-inside storage driver
+
+# --- networking: UML vector driver + host-side slirp helper ---
+# NOTE: there is no CONFIG_SLIRP in UML. The guest side is the in-tree
+# UML_NET_VECTOR driver (transport=tap/vde/gre); the "slirp" part is a
+# HOST userspace helper (slirp-fullbolt / libslirp) plumbed via --hostfwd.
+# uml.rs passes eth0=slirp-fullbolt on the cmdline; here we only ensure
+# the guest net stack + vector driver exist. No TUN/TAP needed on host
+# (slirp is pure userspace), so this works rootless on Android.
+CONFIG_NET=y
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+CONFIG_IPV6=y
+CONFIG_UML_NET_VECTOR=y         # guest side of vector transports
+CONFIG_SLIP=y
+CONFIG_PPP=y
+
+# --- block/filesystems: UBD root + hostfs exchange ---
+CONFIG_BLK_DEV_UBD=y
+CONFIG_BLK_DEV_LOOP=y
+CONFIG_BLK_DEV_NBD=m
+CONFIG_HOSTFS=y
+CONFIG_EXT4_FS=y
+CONFIG_TMPFS=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+
+# --- guest virtio (block/console for UBD root) ---
+# NOTE: no VIRTIO_VSOCKETS — nothing in the um tree selects HAVE_EBPF_JIT
+# (so BPF_JIT is unsatisfiable) and vsock-virtio has no transport on um.
+# The agent rides the hostfs-backed AF_UNIX socket (uml.rs agent_sock),
+# which needs no guest network at all. OVERLAY_FS stays single (up in
+# the containment block: docker-inside storage driver).
+CONFIG_VIRTIO_UML=y
+
+# --- IPC the fast lane shims today; guest does it for real ---
+CONFIG_SYSVIPC=y
+CONFIG_POSIX_MQUEUE=y
+
+# --- trimmed for build speed / RAM (phone has 14GB, keep guest lean) ---
+CONFIG_CC_OPTIMIZE_FOR_SIZE=y
+CONFIG_NO_HZ=y
+CONFIG_HIGH_RES_TIMERS=y
+# CONFIG_COMPACTION is not set
+# CONFIG_HW_RANDOM is not set
+CONFIG_UML_RANDOM=y
+CONFIG_LOG_BUF_SHIFT=14
+
+# --- debuggability of the guest itself ---
+CONFIG_MAGIC_SYSRQ=y
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
