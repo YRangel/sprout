@@ -90,3 +90,12 @@ CONFIG_MAGIC_SYSRQ=y
 CONFIG_IKCONFIG=y
 CONFIG_IKCONFIG_PROC=y
 CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+
+# --- host<->guest transport: virtio-vsock over vhost-user ---
+# Replaces the file transport as the fast path (measured 15.9us pipe RTT
+# host-side; vsock adds vring hops, still ~50-100us class). Backend =
+# rust-vmm vhost-device-vsock; guest instantiates via
+# virtio_uml.device=<socket>:19 on the kernel cmdline.
+CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS_COMMON=y
