@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -91,7 +92,7 @@ static int send_frame(int fd, uint32_t stream, const void *b, size_t n) {
 
 /* pump fd -> socket as RESP frames until EOF. single-threaded select loop
  * over stdout+stderr of the child. */
-static void pump(int cfd, int out_fd, int err_fd) {
+static void pump(int wfd, int out_fd, int err_fd) {
     uint8_t buf[IO_CHUNK];
     int o_open = 1, e_open = 1;
     while (o_open || e_open) {
@@ -107,12 +108,12 @@ static void pump(int cfd, int out_fd, int err_fd) {
         if (o_open && FD_ISSET(out_fd, &rf)) {
             ssize_t r = read(out_fd, buf, sizeof buf);
             if (r <= 0) o_open = 0;
-            else if (send_frame(cfd, RESP_STDOUT, buf, (size_t)r) < 0) break;
+            else if (send_frame(wfd, RESP_STDOUT, buf, (size_t)r) < 0) break;
         }
         if (e_open && FD_ISSET(err_fd, &rf)) {
             ssize_t r = read(err_fd, buf, sizeof buf);
             if (r <= 0) e_open = 0;
-            else if (send_frame(cfd, RESP_STDERR, buf, (size_t)r) < 0) break;
+            else if (send_frame(wfd, RESP_STDERR, buf, (size_t)r) < 0) break;
         }
     }
 }
@@ -140,7 +141,7 @@ static int become(uint32_t uid, uint32_t gid) {
     return 0;
 }
 
-static void handle_exec(int cfd) {
+static void handle_exec(int cfd, int wfd) {
     uint32_t argc, envc, i;
     char **argv = NULL, **envp = NULL, *cwd = NULL, *stdin_b = NULL;
     uint32_t stdin_n = 0, uid = 0, gid = 0, tmo = 0, flags = 0;
@@ -174,7 +175,12 @@ static void handle_exec(int cfd) {
     int in_p[2] = {-1, -1}, out_p[2] = {-1, -1}, err_p[2] = {-1, -1};
     if (pipe(in_p) < 0 || pipe(out_p) < 0 || pipe(err_p) < 0) goto bad2;
 
-    pid_t pid = vfork();
+    /* fork(), not vfork(): the child runs become() (NSS malloc) and
+     * execvpe before exec. Under bionic, vfork shares the parent's
+     * memory (CLONE_VM), so any allocation here is undefined behavior
+     * and was observed losing the child's stdout on Android.
+     * The hot path never spawns, so fork() cost is fine. */
+    pid_t pid = fork();
     if (pid < 0) goto bad2;
     if (pid == 0) {
         /* child: minimal work between vfork and execve */
@@ -198,28 +204,28 @@ static void handle_exec(int cfd) {
         write_full(in_p[1], stdin_b, stdin_n);
     }
     close(in_p[1]);
-    pump(cfd, out_p[0], err_p[0]);
+    pump(wfd, out_p[0], err_p[0]);
     close(out_p[0]); close(err_p[0]);
     int st = 0;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
     int32_t code = WIFEXITED(st) ? (int32_t)WEXITSTATUS(st)
                  : WIFSIGNALED(st) ? -(int32_t)WTERMSIG(st) : -99;
-    send_frame(cfd, RESP_EXIT, NULL, 0);
-    write_full(cfd, &code, 4);
+    send_frame(wfd, RESP_EXIT, NULL, 0);
+    write_full(wfd, &code, 4);
     goto done;
 bad2:;
     /* best-effort error exit */
-    send_frame(cfd, RESP_EXIT, NULL, 0);
+    send_frame(wfd, RESP_EXIT, NULL, 0);
     {
         int32_t code = 125;
-        write_full(cfd, &code, 4);
+        write_full(wfd, &code, 4);
     }
     goto done;
 bad:
-    send_frame(cfd, RESP_EXIT, NULL, 0);
+    send_frame(wfd, RESP_EXIT, NULL, 0);
     {
         int32_t code = 125;
-        write_full(cfd, &code, 4);
+        write_full(wfd, &code, 4);
     }
 done:
     if (argv) { for (i = 0; i < argc; i++) free(argv[i]); free(argv); }
@@ -228,17 +234,101 @@ done:
     free(stdin_b);
 }
 
-static void handle_conn(int cfd) {
+static void handle_conn(int cfd, int wfd) {
     uint8_t op;
     if (read_full(cfd, &op, 1) != 1) return;
     if (op == PROTO_PING) {
-        write_full(cfd, &op, 1);
+        write_full(wfd, &op, 1);
     } else if (op == PROTO_EXEC) {
-        handle_exec(cfd);
+        handle_exec(cfd, wfd);
     } else if (op == PROTO_SHUTDOWN) {
         /* ack then terminate the whole daemon (systemd restarts us) */
-        write_full(cfd, &op, 1);
+        write_full(wfd, &op, 1);
         _exit(0);
+    }
+}
+
+/* ---------- file transport (host <-> guest via the hostfs share) ----------
+ * The hostfs share cannot carry AF_UNIX to the host: a socket node created
+ * inside the guest is only a placeholder file on the host (hostfs mknod),
+ * so host connect() always gets ECONNREFUSED.  Requests are therefore
+ * passed as files: the host writes req.<n> (EXEC request body, same wire
+ * format as the socket op payload), the agent answers resp.<n> with the
+ * same frame stream the socket path uses, then removes req.<n>.
+ * Latency is polling-bound (DIR_POLL_MS); correctness first, the socket
+ * path remains the in-guest fast path. */
+#define DIR_POLL_MS 300
+
+static void file_handle_req(const char *path, const char *reppath) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    FILE *in = fdopen(fd, "rb");
+    if (!in) { close(fd); return; }
+    /* read the request body into memory, then reuse the socket handler by
+     * feeding it through socketpair: least code, one code path to trust. */
+    fseek(in, 0, SEEK_END);
+    long sz = ftell(in);
+    fseek(in, 0, SEEK_SET);
+    if (sz < 0 || sz > (32L << 20)) { fclose(in); return; }
+    char *body = malloc(sz ? sz : 1);
+    if (!body || (sz && fread(body, 1, sz, in) != (size_t)sz)) {
+        free(body); fclose(in); return;
+    }
+    fclose(in);
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) { free(body); return; }
+    pid_t w = fork();
+    if (w < 0) { close(sv[0]); close(sv[1]); free(body); return; }
+    if (w == 0) {
+        close(sv[0]);
+        if (write_full(sv[1], body, sz) < 0) _exit(1);
+        close(sv[1]);
+        _exit(0);
+    }
+    free(body);
+    close(sv[1]);
+    /* serve the fake connection; responses go to the reply file */
+    int out = open(reppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    handle_conn(sv[0], out >= 0 ? out : sv[0]);
+    if (out >= 0) close(out);
+    close(sv[0]);
+    int st = 0;
+    while (waitpid(w, &st, 0) < 0 && errno == EINTR) {}
+    unlink(path);
+}
+
+static void file_transport_loop(const char *dir) {
+    int tick = 0;
+    for (;;) {
+        DIR *d = opendir(dir);
+        if (d) {
+            struct dirent *e;
+            long youngest = -1;
+            char ypath[512], rpath[512];
+            ypath[0] = 0;
+            while ((e = readdir(d))) {
+                if (strncmp(e->d_name, "req.", 4)) continue;
+                snprintf(ypath, sizeof ypath, "%s/%s", dir, e->d_name);
+                struct stat stt;
+                if (stat(ypath, &stt) == 0 &&
+                    (youngest < 0 || stt.st_mtime < youngest)) {
+                    youngest = stt.st_mtime;
+                }
+            }
+            closedir(d);
+            if (ypath[0]) {
+                snprintf(rpath, sizeof rpath, "%s/resp.%s", dir,
+                         strrchr(ypath, '.') + 1);
+                file_handle_req(ypath, rpath);
+                continue; /* drain immediately */
+            }
+        }
+        if ((++tick % 20) == 0) {
+            FILE *df = fopen("/run/sprout/agent-debug.log", "a");
+            if (df) { fprintf(df, "poll tick %d\n", tick); fclose(df); }
+        }
+        usleep(DIR_POLL_MS * 1000);
     }
 }
 
@@ -289,7 +379,22 @@ int main(int argc, char **argv) {
     int lfd = make_listener();
     if (lfd < 0) {
         perror("listen");
+        FILE *df = fopen("/run/sprout/agent-debug.log", "a");
+        if (df) { fprintf(df, "listen failed errno=%d\n", errno); fclose(df); }
         return 1;
+    }
+    {
+        FILE *df = fopen("/run/sprout/agent-debug.log", "a");
+        if (df) { fprintf(df, "listening pid=%d\n", getpid()); fclose(df); }
+    }
+    /* file transport: one extra process polls the share dir (hostfs has
+     * no usable inotify on this port) so the socket pool stays untouched */
+    {
+        pid_t f = fork();
+        if (f == 0) {
+            file_transport_loop("/run/sprout");
+            _exit(0);
+        }
     }
     /* prefork pool: no fork on the hot path, workers block in accept() */
     for (int i = 1; i < workers; i++) {
@@ -311,7 +416,7 @@ int main(int argc, char **argv) {
         tv.tv_sec = 30;
         tv.tv_usec = 0;
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        handle_conn(c);
+        handle_conn(c, c);
         close(c);
     }
     return 0;

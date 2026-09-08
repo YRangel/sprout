@@ -73,14 +73,29 @@ pub fn build_cmdline(
     umid: &str,
     extra: &[String],
 ) -> (PathBuf, Vec<String>) {
+    // COW is opt-in (SPROUT_UML_COW=1): the empty-cow-file trick needs a
+    // kernel whose COW driver accepts zeroed files (upstream does; some
+    // ports reject them with errno 22). Default = direct backing, which
+    // every kernel accepts and matches the harness boot path.
+    let cow_enabled = std::env::var("SPROUT_UML_COW")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let ubd = if cow_enabled {
+        format!("ubd0={},{}", cow.display(), backing.display())
+    } else {
+        format!("ubd0={}", backing.display())
+    };
     let mut args = vec![
-        format!("ubd0={},{}", cow.display(), backing.display()),
+        ubd,
         "root=/dev/ubda".to_string(),
         format!("mem={mem}"),
         format!("ncpus={cpus}"),
-        // Hostfs exchange dirs (NOT root — UBD is root; hostfs is the
-        // suitcase, measured ~10x slower for bulk IO).
-        format!("hostfs=/run/sprout,{}", share_dir.display()),
+        // Hostfs exchange dir (NOT root — UBD is root; hostfs is the
+        // suitcase, measured ~10x slower for bulk IO). Kernel-side
+        // hostfs= takes <host dir>,<flags> and CONFINES all guest
+        // hostfs mounts to that host tree; the guest mounts it with
+        // `mount -t hostfs none /run/sprout` (init script).
+        format!("hostfs={}", share_dir.display()),
         // Console off: console emulation is a trap per character.
         "con=null".to_string(),
         "con0=null,fd:2".to_string(),
@@ -91,8 +106,31 @@ pub fn build_cmdline(
         // inside the guest when needed).
         "sprout_uml=1".to_string(),
     ];
+    // Android: exec'ing the stub from a memfd is denied (SELinux/app exec
+    // rules), so UML needs stub_exe=<file> pointing at the
+    // stub built next to the kernel (arch/um/kernel/skas/stub_exe).
+    // SPROUT_UML_STUB overrides; else stub_exe beside the kernel binary.
+    if let Some(stub) = find_stub(&uml_bin) {
+        args.push(format!("stub_exe={}", stub.display()));
+    }
     args.extend(extra.iter().cloned());
     (uml_bin.to_path_buf(), args)
+}
+
+/// Locate stub_exe: $SPROUT_UML_STUB, then <kernel dir>/stub_exe.
+fn find_stub(uml_bin: &std::path::Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SPROUT_UML_STUB") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    let beside = uml_bin.parent()?.join("stub_exe");
+    if beside.is_file() {
+        Some(beside)
+    } else {
+        None
+    }
 }
 
 /// Send one protocol frame over the hostfs-shared AF_UNIX socket, read
@@ -145,6 +183,86 @@ pub fn agent_exec(
             err.extend_from_slice(&buf);
         }
     }
+}
+
+/// Exec via the file transport (hostfs share): hostfs socket nodes are
+/// placeholders on the host, so host->guest exec rides req.<n>/resp.<n>
+/// files. Wire format identical to the socket protocol.
+pub fn agent_exec_files(
+    share: &std::path::Path,
+    argv: &[String],
+    env: &[String],
+    cwd: &str,
+    stdin_data: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
+    use std::io::Write;
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let req = share.join(format!("req.{n}"));
+    let resp = share.join(format!("resp.{n}"));
+    let mut body = Vec::new();
+    body.push(PROTO_EXEC);
+    push_strs(&mut body, argv);
+    push_strs(&mut body, env);
+    push_str(&mut body, cwd.as_bytes());
+    push_u32(&mut body, stdin_data.len() as u32);
+    body.extend_from_slice(stdin_data);
+    push_u32(&mut body, 0);
+    push_u32(&mut body, 0);
+    push_u32(&mut body, timeout.as_millis().min(u32::MAX as u128) as u32);
+    push_u32(&mut body, 0);
+    std::fs::write(&req, &body)?;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut raw = Vec::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(meta) = std::fs::metadata(&resp) {
+            if meta.len() >= 12 {
+                // wait briefly for the exit frame tail to settle, then read
+                std::thread::sleep(Duration::from_millis(150));
+                raw = std::fs::read(&resp)?;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let _ = std::fs::remove_file(&req);
+    let _ = std::fs::remove_file(&resp);
+    if raw.is_empty() {
+        anyhow::bail!("file transport: no response from agent within timeout");
+    }
+    // parse frame stream
+    let mut cur = &raw[..];
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code;
+    loop {
+        if cur.len() < 8 {
+            anyhow::bail!("file transport: truncated frame header");
+        }
+        let stream = u32::from_le_bytes(cur[0..4].try_into().unwrap());
+        let len = u32::from_le_bytes(cur[4..8].try_into().unwrap()) as usize;
+        cur = &cur[8..];
+        if stream == RESP_EXIT {
+            if cur.len() < 4 {
+                anyhow::bail!("file transport: truncated exit code");
+            }
+            code = i32::from_le_bytes(cur[0..4].try_into().unwrap());
+            break;
+        }
+        if cur.len() < len {
+            anyhow::bail!("file transport: truncated frame body");
+        }
+        let (b, rest) = cur.split_at(len);
+        if stream == RESP_STDOUT {
+            out.extend_from_slice(b);
+        } else if stream == RESP_STDERR {
+            err.extend_from_slice(b);
+        }
+        cur = rest;
+    }
+    Ok((code, out, err))
 }
 
 /// Ping the agent. Ok(true) = alive.
@@ -442,10 +560,24 @@ fn cmd_up(
 fn cmd_exec(id: &str, cmd: &[String], timeout: Duration) -> anyhow::Result<u8> {
     let sock = agent_sock_str(id)?;
     let env: Vec<String> = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "/".to_string());
-    let (code, out, err) = agent_exec(&sock, cmd, &env, &cwd, &[], timeout)?;
+    // Host cwd rarely exists in the guest; passing it makes the agent's
+    // chdir fail and the exec exit 127, which reads as "command not
+    // found". Guest cwd is always "/" for v0.1 (guest is a whole rootfs,
+    // not a working-dir passthrough — same rule as proot -0-style runs).
+    let cwd = "/".to_string();
+    let (code, out, err) = match agent_exec(&sock, cmd, &env, &cwd, &[], timeout) {
+        Ok(r) => r,
+        // hostfs socket nodes are placeholders on the host — file transport
+        Err(e)
+            if e.to_string().contains("Connection refused")
+                || e.to_string().contains("os error 111") =>
+        {
+            let dir = uml_dir(id);
+            let share = dir.join("share");
+            agent_exec_files(&share, cmd, &env, &cwd, &[], timeout)?
+        }
+        Err(e) => return Err(e),
+    };
     use std::io::Write;
     let _ = std::io::stdout().write_all(&out);
     let _ = std::io::stderr().write_all(&err);
@@ -655,15 +787,13 @@ mod tests {
         );
         assert_eq!(bin, PathBuf::from("/x/linux.uml"));
         let joined = args.join(" ");
-        assert!(
-            joined.contains("ubd0=/s/cow.img,/s/backing.ext4"),
-            "{joined}"
-        );
+        // default: no COW (kernel-agnostic); SPROUT_UML_COW=1 opts in
+        assert!(joined.contains("ubd0=/s/backing.ext4"), "{joined}");
         assert!(joined.contains("root=/dev/ubda"), "{joined}");
         assert!(joined.contains("con=null"), "{joined}");
         assert!(joined.contains("umid=sprout0"), "{joined}");
         // No guest networking: agent socket rides the hostfs share dir.
-        assert!(joined.contains("hostfs=/run/sprout,/s/share"), "{joined}");
+        assert!(joined.contains("hostfs=/s/share"), "{joined}");
         assert!(!joined.contains("eth0="), "{joined}");
         assert!(!joined.contains("slirp"), "{joined}");
     }
