@@ -540,6 +540,9 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
                 } else {
                     "files".to_string()
                 };
+            // Rung 3: --shm / SPROUT_UML_SHM=1 — guest physmem backed by a
+            // host memfd (physmem_fd= fd-passing; see cmd_up).
+            let mut shm = std::env::var("SPROUT_UML_SHM").as_deref() == Ok("1");
             let mut i = 1;
             while i < argv.len() {
                 match argv[i].as_str() {
@@ -596,6 +599,9 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
                         }
                         transport = t.clone();
                     }
+                    "--shm" => {
+                        shm = true;
+                    }
                     "--" => {
                         extra.extend(argv[i + 1..].iter().cloned());
                         break;
@@ -612,6 +618,7 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
                 timeout,
                 &transport,
                 mini,
+                shm,
                 &extra,
             )
         }
@@ -723,6 +730,7 @@ fn cmd_up(
     timeout: Duration,
     transport: &str,
     mini: bool,
+    shm: bool,
     extra: &[String],
 ) -> anyhow::Result<u8> {
     use anyhow::anyhow;
@@ -864,6 +872,32 @@ fn cmd_up(
         extra.push("init=/root/mini-init".to_string());
         extra.push("quiet".to_string());
     }
+    // Rung 3: shared guest physmem. When SPROUT_UML_SHM=1 (or
+    // --shm), create a host memfd sized to `mem` and hand the fd to
+    // the kernel via physmem_fd=. The fd must stay open for the
+    // guest's lifetime — it IS the guest RAM. We keep it in the
+    // child's fd table (inherited on spawn, never closed by us) and
+    // also keep our own dup so `sprout uml exec`-style host-side
+    // mmaps are possible later (rung 3.1: ring protocol).
+    let shm_fd: Option<std::os::unix::io::OwnedFd> = if shm {
+        use anyhow::Context;
+        use std::os::fd::AsRawFd;
+        let mem_bytes: u64 = parse_mem(mem)?;
+        let fd = memfd_create(&format!("sprout-uml-physmem-{id}"), mem_bytes)
+            .context("SPROUT_UML_SHM: memfd_create failed")?;
+        // fd 3 is the first free slot in the child (0/1/2 set by
+        // stdio); we pass "physmem_fd=3" and arrange spawn so that fd
+        // survives (no close-on-exec; spawn_uml keeps it).
+        extra.push("physmem_fd=3".to_string());
+        eprintln!(
+            "sprout uml: shared physmem memfd {} ({} bytes, guest RAM is host-shareable)",
+            fd.as_raw_fd(),
+            fmt_mb(mem_bytes)
+        );
+        Some(fd)
+    } else {
+        None
+    };
     let (bin, args) = build_cmdline(
         &uml_bin,
         &cow,
@@ -880,13 +914,14 @@ fn cmd_up(
         &extra,
     );
     let log = dir.join("uml.log");
-    let child = spawn_uml(&bin, &args, &log)?;
+    let child = spawn_uml(&bin, &args, &log, shm_fd.as_ref())?;
     std::fs::write(dir.join("pid"), child.id().to_string())?;
     std::fs::write(
         dir.join("conf"),
         format!(
-            "bin={}\nmem={mem}\ncpus={cpus}\ntransport={transport}\n",
-            bin.display()
+            "bin={}\nmem={mem}\ncpus={cpus}\ntransport={transport}\nshm={}\n",
+            bin.display(),
+            if shm { "1" } else { "0" }
         ),
     )?;
     // Child handle dropped on purpose: guest outlives the CLI (setsid).
@@ -1146,6 +1181,7 @@ pub fn spawn_uml(
     bin: &std::path::Path,
     args: &[String],
     log: &std::path::Path,
+    shm_fd: Option<&std::os::unix::io::OwnedFd>,
 ) -> anyhow::Result<Child> {
     let logf = std::fs::OpenOptions::new()
         .create(true)
@@ -1182,6 +1218,39 @@ pub fn spawn_uml(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(logf);
+    // physmem_fd handoff: dup the memfd into fd 3 of the child. fd 3
+    // is free (stdio took 0/1/2; no other pre-exec fds survive Rust's
+    // default close-on-exec behavior). dup2 NOT dup2_cloexec on purpose —
+    // the kernel must keep this fd open forever; it is the guest RAM.
+    if let Some(fd) = shm_fd {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // SAFETY: dup into a fixed slot; on success the child owns fd 3.
+        let raw = fd.as_raw_fd();
+        let duped = unsafe { libc::dup(raw) };
+        if duped < 0 {
+            anyhow::bail!("dup physmem fd: {}", std::io::Error::last_os_error());
+        }
+        // Pre-spawn: we cannot set fd 3 via std Command pre-1.68-ish
+        // portably, so use the documented CommandExt trick: clear CLOEXEC
+        // on the duped fd and let it land where the OS puts it, then fix
+        // up the physmem_fd= number if the kernel arg needs it. But we
+        // promised fd 3 in the cmdline — force it with dup2 before spawn
+        // via a process_group/unsafe wrapper.
+        unsafe {
+            if libc::dup2(duped, 3) < 0 {
+                anyhow::bail!("dup2 to fd 3: {}", std::io::Error::last_os_error());
+            }
+            libc::close(duped);
+            // clear close-on-exec on fd 3 so the child inherits it
+            let fl = libc::fcntl(3, libc::F_GETFD);
+            if fl >= 0 && (fl & libc::FD_CLOEXEC) != 0 {
+                libc::fcntl(3, libc::F_SETFD, fl & !libc::FD_CLOEXEC);
+            }
+        }
+        // Keep our own copy alive for rung 3.1 (host-side mmap of guest
+        // physmem). Leaked intentionally: lives until process exit.
+        std::mem::forget(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(3) });
+    }
     if std::env::var("SPROUT_UML_SPAWN_DEBUG").is_ok() {
         let dump = format!(
             "cwd={:?}\nargv={:?}\nenv_has_ld_preload={:?}\n",
@@ -1280,6 +1349,50 @@ fn seed_image(root: &std::path::Path, backing: &std::path::Path) -> anyhow::Resu
 
 fn fmt_mb(n: u64) -> String {
     format!("{}M", n >> 20)
+}
+
+/// Create a sealed-nothing host memfd of `size` bytes (ftruncate'd).
+/// Raw libc — memfd_create is Linux-only and rustix may not be in the dep
+/// tree. MFD_ALLOW_SEALING off: the guest kernel writes freely.
+fn memfd_create(name: &str, size: u64) -> anyhow::Result<std::os::unix::io::OwnedFd> {
+    use anyhow::Context;
+    use std::os::fd::FromRawFd;
+    const MFD_CLOEXEC: u32 = 0x0001;
+    let cname = std::ffi::CString::new(name).context("memfd name")?;
+    // SAFETY: plain syscall wrapper, no memory the kernel retains.
+    let fd = unsafe { libc::syscall(libc::SYS_memfd_create, cname.as_ptr(), MFD_CLOEXEC) };
+    if fd < 0 {
+        anyhow::bail!("memfd_create({name}): {}", std::io::Error::last_os_error());
+    }
+    let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd as i32) };
+    // CLOEXEC set (we dup + clear later for the child); size it now.
+    let f = &owned;
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::ftruncate(f.as_raw_fd(), size as libc::off_t) } < 0 {
+        anyhow::bail!(
+            "ftruncate({name}, {size}): {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(owned)
+}
+
+/// "512M"/"2G"/plain bytes → byte count. Mirrors UML's own parser
+/// (memparse in arch/um): suffixes k/K, m/M, g/G, case-insensitive.
+fn parse_mem(s: &str) -> anyhow::Result<u64> {
+    use anyhow::Context;
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('k' | 'K') => (&s[..s.len() - 1], 1024u64),
+        Some('m' | 'M') => (&s[..s.len() - 1], 1 << 20),
+        Some('g' | 'G') => (&s[..s.len() - 1], 1 << 30),
+        _ => (s, 1),
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .with_context(|| format!("bad mem spec '{s}'"))?;
+    n.checked_mul(mult).context("mem overflow")
 }
 
 #[cfg(test)]
