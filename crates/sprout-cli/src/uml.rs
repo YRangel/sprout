@@ -120,7 +120,11 @@ pub fn build_cmdline(
     (uml_bin.to_path_buf(), args)
 }
 
-/// Locate stub_exe: $SPROUT_UML_STUB, then <kernel dir>/stub_exe.
+/// Locate stub_exe: $SPROUT_UML_STUB, then <kernel dir>/stub_exe, then
+/// the real build path <kernel dir>/arch/um/kernel/skas/stub_exe.
+/// The deep path is the one kbuild actually produces; missing it meant
+/// no stub_exe= arg → memfd exec (SELinux-denied on Android) → every
+/// guest execve failed (init exec error -12 panic loop).
 fn find_stub(uml_bin: &std::path::Path) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SPROUT_UML_STUB") {
         let pb = PathBuf::from(p);
@@ -128,12 +132,16 @@ fn find_stub(uml_bin: &std::path::Path) -> Option<PathBuf> {
             return Some(pb);
         }
     }
-    let beside = uml_bin.parent()?.join("stub_exe");
-    if beside.is_file() {
-        Some(beside)
-    } else {
-        None
+    let parent = uml_bin.parent()?;
+    for cand in [
+        parent.join("stub_exe"),
+        parent.join("arch/um/kernel/skas/stub_exe"),
+    ] {
+        if cand.is_file() {
+            return Some(cand);
+        }
     }
+    None
 }
 
 /// Send one protocol frame over the hostfs-shared AF_UNIX socket, read
@@ -199,7 +207,6 @@ pub fn agent_exec_files(
     stdin_data: &[u8],
     timeout: Duration,
 ) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
-    use std::io::Write;
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
@@ -642,7 +649,7 @@ fn cmd_up(
     timeout: Duration,
     extra: &[String],
 ) -> anyhow::Result<u8> {
-    use anyhow::{anyhow, bail};
+    use anyhow::anyhow;
     let dir = uml_dir(id);
     let boot_t0 = Instant::now();
     // Idempotency: any live transport = up is a no-op success.
@@ -686,7 +693,6 @@ fn cmd_up(
     // live backend if one is already serving this id's socket.
     let vhu_uds = dir.join("vhu-uds");
     let vm_sock = dir.join("vm.sock");
-    let mut backend_pid: Option<i32> = None;
     let backend_bin =
         std::env::var("SPROUT_UML_VHOST").unwrap_or_else(|_| "vhost-device-vsock".to_string());
     let backend_live = vm_sock.exists()
@@ -716,10 +722,17 @@ fn cmd_up(
             .stdout(Stdio::null())
             .stderr(logf)
             .spawn()?;
-        backend_pid = Some(child.id() as i32);
         std::fs::write(dir.join("vhu.pid"), child.id().to_string())?;
-        // vhost-device-vsock binds both sockets on startup
-        std::thread::sleep(Duration::from_millis(300));
+        // vhost-device-vsock binds both sockets on startup — WAIT for
+        // them instead of a blind sleep: the guest's virtio_uml connect
+        // against a half-ready backend wedges the boot (init exec -12).
+        let sock_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < sock_deadline {
+            if vm_sock.exists() && vhu_uds.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     let (bin, args) = build_cmdline(
@@ -938,7 +951,19 @@ pub fn spawn_uml(
                 .any(|d| PathBuf::from(d).join("setsid").is_file())
         })
         .unwrap_or(false);
-    let mut cmd = if has_setsid {
+    // SPROUT_UML_SPAWN=bash: go through `bash -c` instead of the direct
+    // Rust spawn — bisect tool for the init-exec-ENOMEM failure where the
+    // manual bash-spawned guest boots and the CLI-spawned one doesn't.
+    let spawn_mode = std::env::var("SPROUT_UML_SPAWN").unwrap_or_default();
+    let mut cmd = if spawn_mode == "bash" {
+        let quoted: Vec<String> = std::iter::once(bin.to_string_lossy().into_owned())
+            .chain(args.iter().cloned())
+            .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+            .collect();
+        let mut c = Command::new("bash");
+        c.arg("-c").arg(format!("exec setsid {}", quoted.join(" ")));
+        c
+    } else if has_setsid {
         let mut c = Command::new("setsid");
         c.arg(bin);
         c
@@ -949,6 +974,15 @@ pub fn spawn_uml(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(logf);
+    if std::env::var("SPROUT_UML_SPAWN_DEBUG").is_ok() {
+        let dump = format!(
+            "cwd={:?}\nargv={:?}\nenv_has_ld_preload={:?}\n",
+            std::env::current_dir(),
+            cmd.get_args().collect::<Vec<_>>(),
+            std::env::var("LD_PRELOAD"),
+        );
+        let _ = std::fs::write(log.with_extension("spawn-debug"), dump);
+    }
     Ok(cmd.spawn()?)
 }
 
