@@ -288,6 +288,61 @@ manual boot — "identical" spawns usually differ in one argument.
 
 ---
 
+## UML sidecar: guest writes vanish or image corrupts after down
+
+**Symptoms:** files written inside the guest are missing after
+`sprout uml down`; in the worst case the ext4 image needs
+`e2fsck -f -y` (run it through a Termux glibc root, not the Termux
+host loader: `proot -R <rootfs> /usr/sbin/e2fsck -f -y <img>`).
+
+**Cause:** the guest was SIGKILL'd with a dirty page cache. A SIGKILL
+guest never flushes; ext4 journal replay on the host can leave the
+image half-written.
+
+**Fix:** use the normal `sprout uml down` — it powers the guest off
+gracefully first (files transport: a `/sbin/poweroff` request through
+the files carrier plus a guest-exit poll). Never `kill -9` a guest
+whose writes matter.
+
+**Related landmine:** if a poweroff request survives guest death, the
+next boot's agent drains it and powers off instantly, so every `up`
+fails. `sprout uml up` purges stale `req.*`/`resp.*` files from the
+share; if you hand-edit the share, remove them yourself.
+
+---
+
+## UML sidecar: `Failed to lock 'backing.ext4', err = 11`
+
+**Cause:** another `linux.uml` process still holds the image flock —
+usually an orphan from a previous run whose CLI was killed (timeout,
+Ctrl-C) while the guest kept booting.
+
+**Fix:** kill the orphan guest (`pkill -f linux.uml` — or scan
+`/proc/*/comm` for `linux` if your shell matches its own wrapper),
+then `sprout uml up` again. Every `up` while the lock is held fails
+with `Unable to mount root fs on unknown-block(0,0)`.
+
+---
+
+## UML sidecar: all guest rootfs writes return EROFS
+
+**Cause:** the kernel booted read-only and nothing ever remounted
+(small images without a configured fstab have no remount-fs unit).
+
+**Fix:** sprout passes the `rw` kernel argument automatically. If you
+compose the cmdline by hand, include `rw` after the `root=` argument.
+
+---
+
+## UML sidecar: mini profile (`--profile mini`)
+
+Boots `init=/root/mini-init` — the sprout UML agent as PID 1, no
+systemd. Boot is ~0.5s instead of ~8s. The mini lane is **stateless**:
+treat it as ephemeral compute, do the stateful work (packages,
+persistent files) under the default systemd profile.
+
+---
+
 ## Still stuck?
 
 1. `sprout --dry-run -v 3 ... ` shows the whole launch composition

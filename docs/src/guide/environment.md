@@ -92,7 +92,8 @@ The `sprout uml` subcommand (ADR-0023) reads these variables:
 | `SPROUT_UML_BIN` | Path to the `linux.uml` kernel binary (else `PATH`, else `./linux.uml`) |
 | `SPROUT_UML_STUB` | Path to the SKAS `stub_exe` (else discovered next to the kernel: `arch/um/kernel/skas/stub_exe`) |
 | `SPROUT_UML_VHOST` | Path to `vhost-device-vsock` backend (default: `PATH` lookup). Only used with the vsock transport |
-| `SPROUT_UML_VSOCK` | `1` = default to the vsock transport for `uml up` (same as `--transport vsock`) |
+| `SPROUT_UML_VSOCK` | `1` = prefer the vsock transport for `uml up` (same as `--transport vsock`) |
+| `SPROUT_UML_MINI` | `1` = boot the mini profile for `uml up` (same as `--profile mini`) |
 | `SPROUT_UML_COW` | `1` = boot with a COW overlay (`cow.img`) instead of direct backing |
 | `SPROUT_UML_TEST_HOME` | Test hook: anchor the per-guest state dir somewhere else |
 | `SPROUT_UML_SPAWN_DEBUG` | Any value = dump the exact guest argv + spawn cwd to `uml.spawn-debug` in the state dir |

@@ -69,6 +69,35 @@ shared state, bench gate enforces ±2%.
 - cmd_down tears down the backend unconditionally (vhost-user master
   never reconnects, so a stale backend poisons the next boot).
 
+## Field notes (2026-09-09, second E2E wave: profiles, durability)
+
+- **`--profile mini`** (`SPROUT_UML_MINI=1`): boots with
+  `init=/root/mini-init` — the agent as PID 1 over a bare devtmpfs.
+  Boot drops 13.2s → **0.5s**. Stateless by design (no persistent
+  guest state should be written in mini); systemd profile remains the
+  default for stateful work. Mini verified over both vsock and files.
+- **Graceful down is mandatory for dirty rootfs.** A SIGKILL'd guest
+  loses its page cache: writes vanish, partial flushes can corrupt the
+  ext4 image. cmd_down now powers off files-transport guests through
+  the files carrier (`/sbin/poweroff` request + guest-exit poll, 25s)
+  before any SIGTERM/KILL. Never kill -9 a guest whose writes matter.
+- **Stale poweroff request = boot landmine.** If the poweroff request
+  survives guest death, the next boot's agent drains it and powers off
+  instantly — every subsequent `up` fails. cmd_up purges `req.*`/
+  `resp.*` from the share before boot.
+- **`rw` kernel arg is required**: fstab in the trimmed image is
+  unconfigured, so the classic remount-fs never runs and the kernel
+  default `ro` sticks — every rootfs write returns EROFS.
+  build_cmdline passes `rw` explicitly.
+- **Auto transport default**: vsock when the vhost-user backend is
+  resolvable (`SPROUT_UML_VHOST` or `PATH`), files otherwise. Explicit
+  `--transport` always wins.
+- **Rung 3 (shared-memory ring, ~10µs) is blocked**, not dropped:
+  guest hostfs mmap SEGVs (guest page cache is a copy, not shared
+  pages), and a vhost-user master inside the CLI is a kernel-adjacent
+  project. The adaptive files poller (rung 2.5, exec 340→~50ms) ships
+  instead. Revisit only with a real kernel-side driver.
+
 ## Alternatives rejected
 
 1. **Per-syscall lane hop** (route systemd-ish syscalls to UML, rest to
