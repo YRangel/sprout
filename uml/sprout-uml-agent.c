@@ -343,21 +343,20 @@ static void file_handle_req(const char *path, const char *reppath) {
 
 static void file_transport_loop(const char *dir) {
     int tick = 0;
+    fprintf(stderr, "[agent] poller starting dir=%s\n", dir);
     for (;;) {
         DIR *d = opendir(dir);
+        if (!d && tick==0) fprintf(stderr, "[agent] opendir failed errno=%d\n", errno);
         if (d) {
             struct dirent *e;
-            long youngest = -1;
             char ypath[512], rpath[512];
             ypath[0] = 0;
             while ((e = readdir(d))) {
                 if (strncmp(e->d_name, "req.", 4)) continue;
+                /* copy the name while d is open: `e` dangles after
+                 * closedir (segfaulted at 0x13 here once) */
                 snprintf(ypath, sizeof ypath, "%s/%s", dir, e->d_name);
-                struct stat stt;
-                if (stat(ypath, &stt) == 0 &&
-                    (youngest < 0 || stt.st_mtime < youngest)) {
-                    youngest = stt.st_mtime;
-                }
+                break;
             }
             closedir(d);
             if (ypath[0]) {
@@ -434,14 +433,6 @@ int main(int argc, char **argv) {
      * its death never touches the unix pool. */
     {
         int vfd = make_vsock_listener(VSOCK_PORT);
-        {
-            FILE *df = fopen("/run/sprout/state.log", "a");
-            if (df) {
-                fprintf(df, "vsock listener fd=%d (%s)\n", vfd,
-                        vfd >= 0 ? "ok" : strerror(errno));
-                fclose(df);
-            }
-        }
         if (vfd >= 0) {
             pid_t v = fork();
             if (v == 0) {
@@ -450,8 +441,13 @@ int main(int argc, char **argv) {
             }
             close(vfd);
         }
-        /* vsock unavailable (no device / old kernel): file + unix still
-         * carry everything. Degradation, not failure. */
+        /* vsock unavailable (no device / old kernel / backend quirk):
+         * file + unix still carry everything. Degradation, not failure. */
+    }
+    /* readiness marker: the file transport poller + unix listener are up */
+    {
+        FILE *rf = fopen("/run/sprout/agent-ready", "w");
+        if (rf) { fputs("1", rf); fclose(rf); }
     }
     /* file transport: one extra process polls the share dir (hostfs has
      * no usable inotify on this port) so the socket pool stays untouched */

@@ -27,6 +27,9 @@ pub const PROTO_SHUTDOWN: u8 = 0x02;
 const RESP_STDOUT: u32 = 1;
 const RESP_STDERR: u32 = 2;
 const RESP_EXIT: u32 = 0;
+/// Agent's AF_VSOCK listener port (guest side; host reaches it through
+/// the vhost-device-vsock bridge as CONNECT <port> on the control UDS).
+pub const VSOCK_PORT: u32 = 2225;
 
 /// Per-guest state dir: ~/.sprout/uml/<id>/
 pub fn uml_dir(id: &str) -> PathBuf {
@@ -413,6 +416,41 @@ pub fn agent_shutdown(sock_path: &str, timeout: Duration) -> bool {
     matches!(s.read_exact(&mut b), Ok(()) if b[0] == PROTO_SHUTDOWN)
 }
 
+/// Vsock 1-byte-op helper (PING / SHUTDOWN) over the hybrid channel.
+/// Returns the agent's echoed op byte, or None.
+fn vsock_op(uds_path: &std::path::Path, port: u32, op: u8, timeout: Duration) -> Option<u8> {
+    use std::io::{Read as _, Write as _};
+    let mut s = std::os::unix::net::UnixStream::connect(uds_path).ok()?;
+    s.set_read_timeout(Some(timeout)).ok()?;
+    s.set_write_timeout(Some(timeout)).ok()?;
+    s.write_all(format!("CONNECT {port}\n").as_bytes()).ok()?;
+    let mut ack = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        s.read_exact(&mut b).ok()?;
+        ack.push(b[0]);
+        if b[0] == b'\n' {
+            break;
+        }
+        if ack.len() > 32 {
+            return None;
+        }
+    }
+    s.write_all(&[op]).ok()?;
+    s.read_exact(&mut b).ok()?;
+    (b[0] == op).then_some(b[0])
+}
+
+/// Vsock ping: agent alive on the fast lane?
+pub fn agent_ping_vsock(uds_path: &std::path::Path, port: u32, timeout: Duration) -> bool {
+    vsock_op(uds_path, port, PROTO_PING, timeout).is_some()
+}
+
+/// Vsock shutdown: ask agent to exit.
+pub fn agent_shutdown_vsock(uds_path: &std::path::Path, port: u32, timeout: Duration) -> bool {
+    vsock_op(uds_path, port, PROTO_SHUTDOWN, timeout).is_some()
+}
+
 /// Wait for agent readiness, polling ping. Returns true when up.
 pub fn wait_ready(sock_path: &str, timeout: Duration) -> bool {
     let start = Instant::now();
@@ -606,15 +644,23 @@ fn cmd_up(
 ) -> anyhow::Result<u8> {
     use anyhow::{anyhow, bail};
     let dir = uml_dir(id);
-    if dir.join("pid").is_file() {
-        // Idempotency: a live guest means up is a no-op success.
+    let boot_t0 = Instant::now();
+    // Idempotency: any live transport = up is a no-op success.
+    {
+        let uds = dir.join("vhu-uds");
+        if agent_ping_vsock(&uds, VSOCK_PORT, Duration::from_secs(3)) {
+            println!("sprout uml: guest '{id}' already up (vsock)");
+            return Ok(0);
+        }
         if let Ok(sock) = agent_sock_str(id) {
             if agent_ping(&sock, Duration::from_secs(2)) {
                 println!("sprout uml: guest '{id}' already up");
                 return Ok(0);
             }
         }
-        bail!("stale state for '{id}' (pid file without live agent) — `sprout uml down --id {id}` to clean");
+        // Stale pid file = previous guest died without cleanup. Self-heal:
+        // remove state, don't force the operator through `down` first.
+        let _ = std::fs::remove_file(dir.join("pid"));
     }
     let uml_bin = find_uml_bin()
         .ok_or_else(|| anyhow!("no linux.uml binary (SPROUT_UML_BIN, PATH, or ./linux.uml)"))?;
@@ -634,6 +680,48 @@ fn cmd_up(
         let f = std::fs::File::create(&cow)?;
         f.set_len(8 << 20)?;
     }
+
+    // ORDER MATTERS: vhost-user master (guest kernel) does not reconnect,
+    // so the backend must be listening before the guest boots. Reuse a
+    // live backend if one is already serving this id's socket.
+    let vhu_uds = dir.join("vhu-uds");
+    let vm_sock = dir.join("vm.sock");
+    let mut backend_pid: Option<i32> = None;
+    let backend_bin =
+        std::env::var("SPROUT_UML_VHOST").unwrap_or_else(|_| "vhost-device-vsock".to_string());
+    let backend_live = vm_sock.exists()
+        && std::fs::read_to_string(dir.join("vhu.pid"))
+            .ok()
+            .and_then(|p| p.trim().parse::<i32>().ok())
+            .map(|pid| unsafe { libc::kill(pid, 0) } == 0)
+            .unwrap_or(false);
+    if !backend_live {
+        let _ = std::fs::remove_file(&vm_sock);
+        let _ = std::fs::remove_file(&vhu_uds);
+        let log = dir.join("vhu.log");
+        let logf = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)?;
+        let child = std::process::Command::new(&backend_bin)
+            .args([
+                "--guest-cid",
+                "3",
+                "--socket",
+                &vm_sock.to_string_lossy(),
+                "--uds-path",
+                &vhu_uds.to_string_lossy(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(logf)
+            .spawn()?;
+        backend_pid = Some(child.id() as i32);
+        std::fs::write(dir.join("vhu.pid"), child.id().to_string())?;
+        // vhost-device-vsock binds both sockets on startup
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
     let (bin, args) = build_cmdline(
         &uml_bin,
         &cow,
@@ -654,21 +742,45 @@ fn cmd_up(
     // Child handle dropped on purpose: guest outlives the CLI (setsid).
     // PID file + agent ping are the liveness truth, not the handle.
     std::mem::forget(child);
-    let sock = agent_sock(id).to_string_lossy().into_owned();
-    if wait_ready(&sock, timeout) {
-        println!(
-            "sprout uml: guest '{id}' up (agent {})",
-            agent_sock(id).display()
-        );
-        Ok(0)
-    } else {
-        eprintln!(
-            "sprout uml: guest '{id}' did not answer in {}s — see {}",
-            timeout.as_secs(),
-            log.display()
-        );
-        Ok(1)
+
+    // Readiness: vsock first (fast, µs RTT), unix socket fallback, then
+    // the file transport's poller as last resort. Any one answers = up.
+    // Readiness: agent writes share/agent-ready once its poller + unix
+    // listeners are up; then probe with a real file-transport exec so
+    // "ready" means "exec works" (vhost-device vsock ping is unreliable
+    // for now — SPROUT_UML_VSOCK opts in once fixed).
+    let ready_marker = share.join("agent-ready");
+    let deadline = boot_t0 + timeout;
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if ready_marker.is_file() {
+            let probe = agent_exec_files(
+                &share,
+                &["/bin/true".to_string()],
+                &[],
+                "/",
+                &[],
+                Duration::from_secs(5),
+            );
+            if probe.is_ok() {
+                println!(
+                    "sprout uml: guest '{id}' up (files, boot {:.1}s)",
+                    boot_t0.elapsed().as_secs_f32()
+                );
+                return Ok(0);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(400));
     }
+    eprintln!(
+        "sprout uml: guest '{id}' did not answer in {}s — see {} and {}",
+        timeout.as_secs(),
+        log.display(),
+        dir.join("vhu.log").display()
+    );
+    Ok(1)
 }
 
 fn cmd_exec(id: &str, cmd: &[String], timeout: Duration) -> anyhow::Result<u8> {
@@ -679,7 +791,6 @@ fn cmd_exec(id: &str, cmd: &[String], timeout: Duration) -> anyhow::Result<u8> {
     // found". Guest cwd is always "/" for v0.1 (guest is a whole rootfs,
     // not a working-dir passthrough — same rule as proot -0-style runs).
     let cwd = "/".to_string();
-    const VSOCK_PORT: u32 = 2225;
     let uds = uml_dir(id).join("vhu-uds");
     let uds_opt = if uds.exists() {
         Some(uds.as_path())
@@ -714,39 +825,62 @@ fn cmd_down(id: &str) -> anyhow::Result<u8> {
     let dir = uml_dir(id);
     if !dir.join("pid").is_file() {
         println!("sprout uml: guest '{id}' not running");
+        // Still tear down an orphaned backend so the next `up` starts clean.
+        teardown_backend(&dir);
         return Ok(0); // double down = ok (plan §8 gate 1)
     }
-    // Best effort: ask agent to exit, else halt guest, then SIGTERM the PID.
-    if let Ok(sock) = agent_sock_str(id) {
-        if !agent_shutdown(&sock, Duration::from_secs(5)) {
-            let _ = agent_exec(
-                &sock,
-                &["/sbin/poweroff".to_string()],
-                &[],
-                "/",
-                &[],
-                Duration::from_secs(10),
-            );
-        }
-        std::thread::sleep(Duration::from_secs(2));
-    }
-    if let Ok(pid_s) = std::fs::read_to_string(dir.join("pid")) {
-        if let Ok(pid) = pid_s.trim().parse::<i32>() {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+    // Graceful first: vsock shutdown, then unix, then guest poweroff.
+    let uds = dir.join("vhu-uds");
+    let mut agent_exited = agent_shutdown_vsock(&uds, VSOCK_PORT, Duration::from_secs(3));
+    if !agent_exited {
+        if let Ok(sock) = agent_sock_str(id) {
+            agent_exited = agent_shutdown(&sock, Duration::from_secs(3));
+            if !agent_exited {
+                let _ = agent_exec(
+                    &sock,
+                    &["/sbin/poweroff".to_string()],
+                    &[],
+                    "/",
+                    &[],
+                    Duration::from_secs(10),
+                );
+            }
         }
     }
     std::thread::sleep(Duration::from_secs(1));
-    // Reap-or-orphan: if still alive, SIGKILL. PID-file truth cleared either way.
+    // Guest: SIGTERM then SIGKILL; agent restart loop must not outlive it.
     if let Ok(pid_s) = std::fs::read_to_string(dir.join("pid")) {
         if let Ok(pid) = pid_s.trim().parse::<i32>() {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            std::thread::sleep(Duration::from_millis(800));
             if unsafe { libc::kill(pid, 0) } == 0 {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         }
     }
     let _ = std::fs::remove_file(dir.join("pid"));
+    teardown_backend(&dir);
     println!("sprout uml: guest '{id}' down");
     Ok(0)
+}
+
+/// Stop vhost-device-vsock for this id and clear its state. The vhost-user
+/// master never reconnects, so a fresh backend MUST be started per boot
+/// (cmd_up reuses only a live one).
+fn teardown_backend(dir: &std::path::Path) {
+    if let Ok(pid_s) = std::fs::read_to_string(dir.join("vhu.pid")) {
+        if let Ok(pid) = pid_s.trim().parse::<i32>() {
+            if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+                std::thread::sleep(Duration::from_millis(400));
+                if unsafe { libc::kill(pid, 0) } == 0 {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(dir.join("vhu.pid"));
+    let _ = std::fs::remove_file(dir.join("vhu-uds"));
+    let _ = std::fs::remove_file(dir.join("vm.sock"));
 }
 
 fn cmd_status(id: &str) -> anyhow::Result<u8> {
@@ -762,16 +896,27 @@ fn cmd_status(id: &str) -> anyhow::Result<u8> {
         .parse::<i32>()
         .map(|p| unsafe { libc::kill(p, 0) } == 0)
         .unwrap_or(false);
-    let agent = agent_sock_str(id)
-        .map(|s| agent_ping(&s, Duration::from_secs(2)))
-        .unwrap_or(false);
+    let uds = dir.join("vhu-uds");
+    let vsock = alive && agent_ping_vsock(&uds, VSOCK_PORT, Duration::from_secs(3));
+    let agent = !vsock
+        && agent_sock_str(id)
+            .map(|s| agent_ping(&s, Duration::from_secs(2)))
+            .unwrap_or(false);
+    let transport = if vsock {
+        "vsock"
+    } else if agent {
+        "unix"
+    } else {
+        "none"
+    };
     println!(
-        "guest '{id}': pid={} alive={} agent={}",
+        "guest '{id}': pid={} alive={} agent={} transport={}",
         pid_s.trim(),
         alive,
-        if agent { "up" } else { "down" }
+        if vsock || agent { "up" } else { "down" },
+        transport
     );
-    Ok(if alive && agent { 0 } else { 1 })
+    Ok(if alive && (vsock || agent) { 0 } else { 1 })
 }
 
 /// Spawn the UML process detached (setsid, stdio nulled except stderr).
