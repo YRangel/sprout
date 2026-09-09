@@ -300,7 +300,8 @@ static void vsock_loop(int lfd) {
  * same frame stream the socket path uses, then removes req.<n>.
  * Latency is polling-bound (DIR_POLL_MS); correctness first, the socket
  * path remains the in-guest fast path. */
-#define DIR_POLL_MS 300
+#define DIR_POLL_MS 300       /* unused now: adaptive poll below */
+#define FILE_IDLE_MS 50
 
 static void file_handle_req(const char *path, const char *reppath) {
     int fd = open(path, O_RDONLY);
@@ -343,6 +344,7 @@ static void file_handle_req(const char *path, const char *reppath) {
 
 static void file_transport_loop(const char *dir) {
     int tick = 0;
+    int idle_ms = 1; /* hot after activity, decays to FILE_IDLE_MS */
     fprintf(stderr, "[agent] poller starting dir=%s\n", dir);
     for (;;) {
         DIR *d = opendir(dir);
@@ -363,14 +365,20 @@ static void file_transport_loop(const char *dir) {
                 snprintf(rpath, sizeof rpath, "%s/resp.%s", dir,
                          strrchr(ypath, '.') + 1);
                 file_handle_req(ypath, rpath);
+                idle_ms = 1; /* activity: stay hot */
                 continue; /* drain immediately */
             }
         }
+        /* adaptive poll: 1ms while hot, exponential decay to 50ms idle.
+         * exec RTT is poll-bound; 300ms flat made the files transport
+         * ~300ms per exec. 1ms hot lands it under ~25ms (fork+exec
+         * dominates), ~3% CPU worst case during a burst. */
+        if (idle_ms < FILE_IDLE_MS) idle_ms = idle_ms * 2;
         if ((++tick % 20) == 0) {
             FILE *df = fopen("/run/sprout/agent-debug.log", "a");
             if (df) { fprintf(df, "poll tick %d\n", tick); fclose(df); }
         }
-        usleep(DIR_POLL_MS * 1000);
+        usleep(idle_ms * 1000);
     }
 }
 

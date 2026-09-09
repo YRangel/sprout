@@ -91,7 +91,12 @@ pub fn build_cmdline(
     };
     let mut args = vec![
         ubd,
+        // rw: the guest fstab is unconfigured ("UNCONFIGURED FSTAB"), so
+        // systemd-remount-fs has nothing to remount and the kernel default
+        // (ro) would stick — every rootfs write (agent install, dpkg, …)
+        // would fail with EROFS.
         "root=/dev/ubda".to_string(),
+        "rw".to_string(),
         format!("mem={mem}"),
         format!("ncpus={cpus}"),
         // Hostfs exchange dir (NOT root — UBD is root; hostfs is the
@@ -114,7 +119,7 @@ pub fn build_cmdline(
     // rules), so UML needs stub_exe=<file> pointing at the
     // stub built next to the kernel (arch/um/kernel/skas/stub_exe).
     // SPROUT_UML_STUB overrides; else stub_exe beside the kernel binary.
-    if let Some(stub) = find_stub(&uml_bin) {
+    if let Some(stub) = find_stub(uml_bin) {
         args.push(format!("stub_exe={}", stub.display()));
     }
     // vsock fast transport: attach the virtio-uml device only when a
@@ -140,15 +145,10 @@ fn find_stub(uml_bin: &std::path::Path) -> Option<PathBuf> {
         }
     }
     let parent = uml_bin.parent()?;
-    for cand in [
-        parent.join("stub_exe"),
-        parent.join("arch/um/kernel/skas/stub_exe"),
-    ] {
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
+    ["stub_exe", "arch/um/kernel/skas/stub_exe"]
+        .iter()
+        .map(|rel| parent.join(rel))
+        .find(|c| c.is_file())
 }
 
 /// Send one protocol frame over the hostfs-shared AF_UNIX socket, read
@@ -203,6 +203,38 @@ pub fn agent_exec(
     }
 }
 
+/// Parse a protocol-v1 response frame stream: u32 type + u32 len frames,
+/// type 1=stdout 2=stderr 0=exit(+i32 code). Returns (code, stdout, stderr).
+fn parse_frames(mut cur: &[u8]) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    loop {
+        if cur.len() < 8 {
+            anyhow::bail!("truncated frame header");
+        }
+        let stream = u32::from_le_bytes(cur[0..4].try_into().unwrap());
+        let len = u32::from_le_bytes(cur[4..8].try_into().unwrap()) as usize;
+        cur = &cur[8..];
+        if stream == RESP_EXIT {
+            if cur.len() < 4 {
+                anyhow::bail!("truncated exit code");
+            }
+            let code = i32::from_le_bytes(cur[0..4].try_into().unwrap());
+            return Ok((code, out, err));
+        }
+        if cur.len() < len {
+            anyhow::bail!("truncated frame body");
+        }
+        let (b, rest) = cur.split_at(len);
+        if stream == RESP_STDOUT {
+            out.extend_from_slice(b);
+        } else if stream == RESP_STDERR {
+            err.extend_from_slice(b);
+        }
+        cur = rest;
+    }
+}
+
 /// Exec via the file transport (hostfs share): hostfs socket nodes are
 /// placeholders on the host, so host->guest exec rides req.<n>/resp.<n>
 /// files. Wire format identical to the socket protocol.
@@ -232,53 +264,39 @@ pub fn agent_exec_files(
     push_u32(&mut body, 0);
     std::fs::write(&req, &body)?;
     let deadline = std::time::Instant::now() + timeout;
-    let mut raw = Vec::new();
-    while std::time::Instant::now() < deadline {
-        if let Ok(meta) = std::fs::metadata(&resp) {
-            if meta.len() >= 12 {
-                // wait briefly for the exit frame tail to settle, then read
-                std::thread::sleep(Duration::from_millis(150));
-                raw = std::fs::read(&resp)?;
+
+    // The agent writes stdout/stderr frames first and the exit frame LAST,
+    // so a single read races the writer. Re-read + re-parse until the exit
+    // frame is present or the deadline passes (the file only ever grows).
+    let (code, out, err);
+    // reassign-in-loop is the whole point (retry until exit frame); the
+    // first assignment is always overwritten — that is not a bug.
+    #[allow(unused_assignments)]
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        raw = std::fs::read(&resp).unwrap_or_default();
+        match parse_frames(&raw) {
+            Ok((c, o, e)) => {
+                code = c;
+                out = o;
+                err = e;
                 break;
             }
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&req);
+                let _ = std::fs::remove_file(&resp);
+                if raw.is_empty() {
+                    anyhow::bail!("file transport: no response from agent within timeout");
+                }
+                anyhow::bail!("file transport: {e}");
+            }
         }
-        std::thread::sleep(Duration::from_millis(150));
     }
     let _ = std::fs::remove_file(&req);
     let _ = std::fs::remove_file(&resp);
-    if raw.is_empty() {
-        anyhow::bail!("file transport: no response from agent within timeout");
-    }
-    // parse frame stream
-    let mut cur = &raw[..];
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let code;
-    loop {
-        if cur.len() < 8 {
-            anyhow::bail!("file transport: truncated frame header");
-        }
-        let stream = u32::from_le_bytes(cur[0..4].try_into().unwrap());
-        let len = u32::from_le_bytes(cur[4..8].try_into().unwrap()) as usize;
-        cur = &cur[8..];
-        if stream == RESP_EXIT {
-            if cur.len() < 4 {
-                anyhow::bail!("file transport: truncated exit code");
-            }
-            code = i32::from_le_bytes(cur[0..4].try_into().unwrap());
-            break;
-        }
-        if cur.len() < len {
-            anyhow::bail!("file transport: truncated frame body");
-        }
-        let (b, rest) = cur.split_at(len);
-        if stream == RESP_STDOUT {
-            out.extend_from_slice(b);
-        } else if stream == RESP_STDERR {
-            err.extend_from_slice(b);
-        }
-        cur = rest;
-    }
     Ok((code, out, err))
 }
 
@@ -474,6 +492,24 @@ pub fn agent_shutdown_vsock(uds_path: &std::path::Path, port: u32, timeout: Dura
 /// sprout uml down [--id NAME]
 /// sprout uml status [--id NAME]
 /// ```
+/// Is a vhost-device-vsock backend binary resolvable? $SPROUT_UML_VHOST
+/// if set (must exist), else PATH lookup. Governs the DEFAULT transport
+/// only — explicit --transport always wins.
+fn backend_available() -> bool {
+    match std::env::var("SPROUT_UML_VHOST") {
+        Ok(p) => std::path::PathBuf::from(p).is_file(),
+        Err(_) => std::env::var("PATH")
+            .map(|p| {
+                p.split(':').any(|d| {
+                    std::path::PathBuf::from(d)
+                        .join("vhost-device-vsock")
+                        .is_file()
+                })
+            })
+            .unwrap_or(false),
+    }
+}
+
 pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
     use anyhow::{anyhow, bail};
     let argv: Vec<String> = args
@@ -489,12 +525,21 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
             let mut id = "default".to_string();
             let mut timeout = Duration::from_secs(120);
             let mut extra: Vec<String> = Vec::new();
-            // Transport: --transport wins, else SPROUT_UML_VSOCK=1 opts in,
-            // else files (default: no backend, no vhost-user attachment).
-            let mut transport = match std::env::var("SPROUT_UML_VSOCK").as_deref() {
-                Ok("1") => "vsock".to_string(),
-                _ => "files".to_string(),
-            };
+            // --profile mini: boot the agent as PID1 (no systemd) via
+            // init=/root/mini-init — ~0.5s boot for stateless exec lanes.
+            // The image must contain /root/mini-init (seeded once from the
+            // share dir while a systemd guest is up; see docs).
+            let mut mini = std::env::var("SPROUT_UML_MINI").as_deref() == Ok("1");
+            // Transport: --transport wins, else SPROUT_UML_VSOCK=1 forces
+            // vsock, else AUTO: vsock when a backend binary is available
+            // (soaked 2026-09-09: 6 cycles clean), files otherwise —
+            // no backend, no vhost-user attachment, zero fail surface.
+            let mut transport =
+                if std::env::var("SPROUT_UML_VSOCK").as_deref() == Ok("1") || backend_available() {
+                    "vsock".to_string()
+                } else {
+                    "files".to_string()
+                };
             let mut i = 1;
             while i < argv.len() {
                 match argv[i].as_str() {
@@ -533,6 +578,14 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
                             .parse()?;
                         timeout = Duration::from_secs(s);
                     }
+                    "--profile" => {
+                        i += 1;
+                        match argv.get(i).map(|s| s.as_str()) {
+                            Some("mini") => mini = true,
+                            Some("systemd") => mini = false,
+                            _ => bail!("--profile needs mini|systemd"),
+                        }
+                    }
                     "--transport" => {
                         i += 1;
                         let t = argv
@@ -558,6 +611,7 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
                 cpus,
                 timeout,
                 &transport,
+                mini,
                 &extra,
             )
         }
@@ -660,6 +714,7 @@ fn agent_sock_str(id: &str) -> anyhow::Result<String> {
     Ok(agent_sock(id).to_string_lossy().into_owned())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_up(
     id: &str,
     root: Option<&std::path::Path>,
@@ -667,6 +722,7 @@ fn cmd_up(
     cpus: u32,
     timeout: Duration,
     transport: &str,
+    mini: bool,
     extra: &[String],
 ) -> anyhow::Result<u8> {
     use anyhow::anyhow;
@@ -696,6 +752,19 @@ fn cmd_up(
     let cow = dir.join("cow.img");
     let share = dir.join("share");
     std::fs::create_dir_all(&share)?;
+    // Purge stale transport requests: a req file that outlived its guest
+    // (poweroff kills the agent mid-handle, before the unlink) is drained
+    // by the NEXT boot's poller — a stale /sbin/poweroff req turns every
+    // future up into an instant self-poweroff.
+    if let Ok(rd) = std::fs::read_dir(&share) {
+        for e in rd.flatten() {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            if n.starts_with("req.") || n.starts_with("resp.") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     if !backing.is_file() {
         let root =
             root.ok_or_else(|| anyhow!("first boot needs -r ROOT to seed the guest image"))?;
@@ -759,6 +828,11 @@ fn cmd_up(
         }
     }
 
+    let mut extra: Vec<String> = extra.to_vec();
+    if mini {
+        extra.push("init=/root/mini-init".to_string());
+        extra.push("quiet".to_string());
+    }
     let (bin, args) = build_cmdline(
         &uml_bin,
         &cow,
@@ -772,7 +846,7 @@ fn cmd_up(
         } else {
             None
         },
-        extra,
+        &extra,
     );
     let log = dir.join("uml.log");
     let child = spawn_uml(&bin, &args, &log)?;
@@ -881,6 +955,47 @@ fn cmd_exec(id: &str, cmd: &[String], timeout: Duration) -> anyhow::Result<u8> {
     Ok(code as u8)
 }
 
+/// Files-transport poweroff: write an EXEC /sbin/poweroff request into the
+/// share dir, then wait for the guest pid to exit. A SIGKILL'd guest loses
+/// its dirty page cache (rootfs writes never reach the image), so every
+/// down MUST attempt this before any kill. Returns true on clean exit.
+fn poweroff_files(dir: &std::path::Path) -> bool {
+    let share = dir.join("share");
+    let mut body = vec![PROTO_EXEC];
+    push_strs(&mut body, &["/sbin/poweroff".to_string()]);
+    push_strs(&mut body, &[]);
+    push_str(&mut body, b"/");
+    push_u32(&mut body, 0);
+    push_u32(&mut body, 0);
+    push_u32(&mut body, 0);
+    push_u32(&mut body, 10000);
+    push_u32(&mut body, 0);
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let req = share.join(format!("req.{n}"));
+    if std::fs::write(&req, &body).is_err() {
+        return false;
+    }
+    if let Ok(pid_s) = std::fs::read_to_string(dir.join("pid")) {
+        if let Ok(pid) = pid_s.trim().parse::<i32>() {
+            let dl = Instant::now() + Duration::from_secs(25);
+            while Instant::now() < dl {
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    // guest exited; the agent died mid-handle and could not
+                    // unlink its own request — do not leave it as a landmine
+                    let _ = std::fs::remove_file(&req);
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let _ = std::fs::remove_file(&req);
+        }
+    }
+    false
+}
+
 fn cmd_down(id: &str) -> anyhow::Result<u8> {
     let dir = uml_dir(id);
     if !dir.join("pid").is_file() {
@@ -906,6 +1021,21 @@ fn cmd_down(id: &str) -> anyhow::Result<u8> {
                 );
             }
         }
+    }
+    // Files-transport boots have no working unix/vsock path (hostfs socket
+    // nodes are placeholders), so the graceful attempts above never fired
+    // and every down degraded to SIGKILL — losing all dirty guest writes
+    // (and occasionally corrupting the image with a partial flush). Always
+    // offer the files-transport poweroff before reaching for signals.
+    let mut clean = agent_exited;
+    if !clean {
+        clean = poweroff_files(&dir);
+    }
+    if clean {
+        println!("sprout uml: guest '{id}' down");
+        let _ = std::fs::remove_file(dir.join("pid"));
+        teardown_backend(&dir);
+        return Ok(0);
     }
     std::thread::sleep(Duration::from_secs(1));
     // Guest: SIGTERM then SIGKILL; agent restart loop must not outlive it.

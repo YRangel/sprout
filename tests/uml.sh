@@ -24,7 +24,7 @@ if "$SPROUT_BIN" uml status --id uml-test >/dev/null 2>&1; then
     no "status down code" "expected exit != 0 when down"
 else ok "status down code (non-zero when down)"; fi
 
-if "$SPROUT_BIN" uml up --id uml-test 2>&1 | grep -qi "no linux.uml binary"; then
+if env -u SPROUT_UML_BIN -u SPROUT_UML_VHOST "$SPROUT_BIN" uml up --id uml-test 2>&1 | grep -qi "no linux.uml binary"; then
     ok "up fails clean without kernel"
 else no "up fails clean without kernel" "wrong error"; fi
 
