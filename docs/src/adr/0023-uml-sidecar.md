@@ -50,6 +50,25 @@ shared state, bench gate enforces ±2%.
 - Inside the guest we are root: real `binfmt_misc` registration there
   replaces ADR-0017 sniffing for guest-side foreign-arch execs.
 
+## Field notes (2026-09-09, first E2E cycles)
+
+- **`stub_exe=` is load-bearing on Android.** kbuild emits the SKAS
+  stub at `<build-dir>/arch/um/kernel/skas/stub_exe`; if the cmdline
+  lacks `stub_exe=`, UML memfd-execs the stub, SELinux denies it, and
+  every guest execve returns `-ENOMEM` — which the boot log reports as
+  `Starting init: … (error -12)`. See troubleshooting.md.
+- **UML panics reboot in-process** (~17s/cycle). `uml.log` also appends
+  across boots: a log showing N "No working init" panics is one boot
+  panicking N times, not N boots. Truncate before fresh runs.
+- **Backend lifecycle**: vhost-device-vsock is spawned only for the
+  vsock transport, before the guest, with a socket-existence wait
+  (no blind sleep). Files transport boots with no vhost-user
+  attachment at all. Transport is chosen by `--transport files|vsock`
+  or `SPROUT_UML_VSOCK=1`; the readiness probe execs `/bin/true`
+  through the *chosen* carrier, so "up" means that carrier works.
+- cmd_down tears down the backend unconditionally (vhost-user master
+  never reconnects, so a stale backend poisons the next boot).
+
 ## Alternatives rejected
 
 1. **Per-syscall lane hop** (route systemd-ish syscalls to UML, rest to

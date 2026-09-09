@@ -74,6 +74,7 @@ pub fn build_cmdline(
     mem: &str,
     cpus: u32,
     umid: &str,
+    vsock_dev: Option<&std::path::Path>,
     extra: &[String],
 ) -> (PathBuf, Vec<String>) {
     // COW is opt-in (SPROUT_UML_COW=1): the empty-cow-file trick needs a
@@ -115,6 +116,12 @@ pub fn build_cmdline(
     // SPROUT_UML_STUB overrides; else stub_exe beside the kernel binary.
     if let Some(stub) = find_stub(&uml_bin) {
         args.push(format!("stub_exe={}", stub.display()));
+    }
+    // vsock fast transport: attach the virtio-uml device only when a
+    // backend is guaranteed to be listening (cmd_up socket-waits before
+    // this). Device id 19 = virtio-uml.0 in the guest.
+    if let Some(vm_sock) = vsock_dev {
+        args.push(format!("virtio_uml.device={}:19", vm_sock.display()));
     }
     args.extend(extra.iter().cloned());
     (uml_bin.to_path_buf(), args)
@@ -458,18 +465,6 @@ pub fn agent_shutdown_vsock(uds_path: &std::path::Path, port: u32, timeout: Dura
     vsock_op(uds_path, port, PROTO_SHUTDOWN, timeout).is_some()
 }
 
-/// Wait for agent readiness, polling ping. Returns true when up.
-pub fn wait_ready(sock_path: &str, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if agent_ping(sock_path, Duration::from_secs(2)) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    false
-}
-
 /// `sprout uml ...` entry point. Owns argv parsing (no clap — keeps the
 /// fast-lane flag surface provably untouched).
 ///
@@ -494,6 +489,12 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
             let mut id = "default".to_string();
             let mut timeout = Duration::from_secs(120);
             let mut extra: Vec<String> = Vec::new();
+            // Transport: --transport wins, else SPROUT_UML_VSOCK=1 opts in,
+            // else files (default: no backend, no vhost-user attachment).
+            let mut transport = match std::env::var("SPROUT_UML_VSOCK").as_deref() {
+                Ok("1") => "vsock".to_string(),
+                _ => "files".to_string(),
+            };
             let mut i = 1;
             while i < argv.len() {
                 match argv[i].as_str() {
@@ -532,6 +533,16 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
                             .parse()?;
                         timeout = Duration::from_secs(s);
                     }
+                    "--transport" => {
+                        i += 1;
+                        let t = argv
+                            .get(i)
+                            .ok_or_else(|| anyhow!("--transport needs files|vsock"))?;
+                        if t != "files" && t != "vsock" {
+                            bail!("--transport must be 'files' or 'vsock'");
+                        }
+                        transport = t.clone();
+                    }
                     "--" => {
                         extra.extend(argv[i + 1..].iter().cloned());
                         break;
@@ -540,7 +551,15 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
                 }
                 i += 1;
             }
-            cmd_up(&id, root.as_deref(), &mem, cpus, timeout, &extra)
+            cmd_up(
+                &id,
+                root.as_deref(),
+                &mem,
+                cpus,
+                timeout,
+                &transport,
+                &extra,
+            )
         }
         "exec" => {
             let mut id = "default".to_string();
@@ -622,7 +641,7 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
             cmd_status(&id)
         }
         _ => {
-            println!("sprout uml — UML sidecar (real guest kernel next to the fast lane)\n\nUSAGE:\n    sprout uml up [-r ROOT] [--mem 2G] [--cpus 4] [--id NAME]\n    sprout uml exec [--id NAME] CMD...\n    sprout uml down [--id NAME]\n    sprout uml status [--id NAME]\n\nup boots a headless linux.uml guest (UBD image seeded from -r on first\nrun); exec runs one command inside via the guest agent and returns its\nexit code. Fast lane (`sprout -r ROOT -- CMD`) is unaffected.");
+            println!("sprout uml — UML sidecar (real guest kernel next to the fast lane)\n\nUSAGE:\n    sprout uml up [-r ROOT] [--mem 2G] [--cpus 4] [--id NAME] [--transport files|vsock]\n    sprout uml exec [--id NAME] CMD...\n    sprout uml down [--id NAME]\n    sprout uml status [--id NAME]\n\nup boots a headless linux.uml guest (UBD image seeded from -r on first\nrun); exec runs one command inside via the guest agent and returns its\nexit code. Transport: files (default, hostfs share, no backend) or\nvsock (virtio-uml + vhost-device-vsock, needs the backend binary;\nSPROUT_UML_VHOST sets its path). Fast lane (`sprout -r ROOT -- CMD`)\nis unaffected.");
             Ok(0)
         }
     }
@@ -647,6 +666,7 @@ fn cmd_up(
     mem: &str,
     cpus: u32,
     timeout: Duration,
+    transport: &str,
     extra: &[String],
 ) -> anyhow::Result<u8> {
     use anyhow::anyhow;
@@ -690,48 +710,52 @@ fn cmd_up(
 
     // ORDER MATTERS: vhost-user master (guest kernel) does not reconnect,
     // so the backend must be listening before the guest boots. Reuse a
-    // live backend if one is already serving this id's socket.
+    // live backend if one is already serving this id's socket. The
+    // backend is ONLY needed for the vsock transport: files mode boots
+    // with no vhost-user attachment at all (cleaner fail surface).
     let vhu_uds = dir.join("vhu-uds");
     let vm_sock = dir.join("vm.sock");
-    let backend_bin =
-        std::env::var("SPROUT_UML_VHOST").unwrap_or_else(|_| "vhost-device-vsock".to_string());
-    let backend_live = vm_sock.exists()
-        && std::fs::read_to_string(dir.join("vhu.pid"))
-            .ok()
-            .and_then(|p| p.trim().parse::<i32>().ok())
-            .map(|pid| unsafe { libc::kill(pid, 0) } == 0)
-            .unwrap_or(false);
-    if !backend_live {
-        let _ = std::fs::remove_file(&vm_sock);
-        let _ = std::fs::remove_file(&vhu_uds);
-        let log = dir.join("vhu.log");
-        let logf = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)?;
-        let child = std::process::Command::new(&backend_bin)
-            .args([
-                "--guest-cid",
-                "3",
-                "--socket",
-                &vm_sock.to_string_lossy(),
-                "--uds-path",
-                &vhu_uds.to_string_lossy(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(logf)
-            .spawn()?;
-        std::fs::write(dir.join("vhu.pid"), child.id().to_string())?;
-        // vhost-device-vsock binds both sockets on startup — WAIT for
-        // them instead of a blind sleep: the guest's virtio_uml connect
-        // against a half-ready backend wedges the boot (init exec -12).
-        let sock_deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < sock_deadline {
-            if vm_sock.exists() && vhu_uds.exists() {
-                break;
+    if transport == "vsock" {
+        let backend_bin =
+            std::env::var("SPROUT_UML_VHOST").unwrap_or_else(|_| "vhost-device-vsock".to_string());
+        let backend_live = vm_sock.exists()
+            && std::fs::read_to_string(dir.join("vhu.pid"))
+                .ok()
+                .and_then(|p| p.trim().parse::<i32>().ok())
+                .map(|pid| unsafe { libc::kill(pid, 0) } == 0)
+                .unwrap_or(false);
+        if !backend_live {
+            let _ = std::fs::remove_file(&vm_sock);
+            let _ = std::fs::remove_file(&vhu_uds);
+            let log = dir.join("vhu.log");
+            let logf = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)?;
+            let child = std::process::Command::new(&backend_bin)
+                .args([
+                    "--guest-cid",
+                    "3",
+                    "--socket",
+                    &vm_sock.to_string_lossy(),
+                    "--uds-path",
+                    &vhu_uds.to_string_lossy(),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(logf)
+                .spawn()?;
+            std::fs::write(dir.join("vhu.pid"), child.id().to_string())?;
+            // vhost-device-vsock binds both sockets on startup — WAIT for
+            // them instead of a blind sleep: the guest's virtio_uml connect
+            // against a half-ready backend wedges the boot (init exec -12).
+            let sock_deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < sock_deadline {
+                if vm_sock.exists() && vhu_uds.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -743,6 +767,11 @@ fn cmd_up(
         mem,
         cpus,
         &format!("sprout-{id}"),
+        if transport == "vsock" {
+            Some(vm_sock.as_path())
+        } else {
+            None
+        },
         extra,
     );
     let log = dir.join("uml.log");
@@ -750,7 +779,10 @@ fn cmd_up(
     std::fs::write(dir.join("pid"), child.id().to_string())?;
     std::fs::write(
         dir.join("conf"),
-        format!("bin={}\nmem={mem}\ncpus={cpus}\n", bin.display()),
+        format!(
+            "bin={}\nmem={mem}\ncpus={cpus}\ntransport={transport}\n",
+            bin.display()
+        ),
     )?;
     // Child handle dropped on purpose: guest outlives the CLI (setsid).
     // PID file + agent ping are the liveness truth, not the handle.
@@ -769,17 +801,32 @@ fn cmd_up(
             break;
         }
         if ready_marker.is_file() {
-            let probe = agent_exec_files(
-                &share,
-                &["/bin/true".to_string()],
-                &[],
-                "/",
-                &[],
-                Duration::from_secs(5),
-            );
+            // "Ready" = a real exec through the CHOSEN transport works.
+            let probe = if transport == "vsock" {
+                agent_exec_vsock(
+                    Some(&vhu_uds),
+                    VSOCK_PORT,
+                    &["/bin/true".to_string()],
+                    &[],
+                    "/",
+                    &[],
+                    Duration::from_secs(5),
+                )
+                .map(|_| ())
+            } else {
+                agent_exec_files(
+                    &share,
+                    &["/bin/true".to_string()],
+                    &[],
+                    "/",
+                    &[],
+                    Duration::from_secs(5),
+                )
+                .map(|_| ())
+            };
             if probe.is_ok() {
                 println!(
-                    "sprout uml: guest '{id}' up (files, boot {:.1}s)",
+                    "sprout uml: guest '{id}' up ({transport}, boot {:.1}s)",
                     boot_t0.elapsed().as_secs_f32()
                 );
                 return Ok(0);
@@ -1088,6 +1135,7 @@ mod tests {
             "2G",
             8,
             "sprout0",
+            None,
             &[],
         );
         assert_eq!(bin, PathBuf::from("/x/linux.uml"));
@@ -1101,6 +1149,31 @@ mod tests {
         assert!(joined.contains("hostfs=/s/share"), "{joined}");
         assert!(!joined.contains("eth0="), "{joined}");
         assert!(!joined.contains("slirp"), "{joined}");
+        // stub_exe at its real kbuild path (missing = memfd exec = SELinux
+        // denial = guest execve -12); absent here because /x/ is a fake tree.
+        assert!(!joined.contains("stub_exe="), "{joined}");
+        // files transport: no vhost-user device attached
+        assert!(!joined.contains("virtio_uml.device="), "{joined}");
+    }
+
+    #[test]
+    fn cmdline_attaches_vsock_device() {
+        let (_, args) = build_cmdline(
+            std::path::Path::new("/x/linux.uml"),
+            std::path::Path::new("/s/cow.img"),
+            std::path::Path::new("/s/backing.ext4"),
+            std::path::Path::new("/s/share"),
+            "2G",
+            8,
+            "sprout0",
+            Some(std::path::Path::new("/s/vm.sock")),
+            &[],
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("virtio_uml.device=/s/vm.sock:19"),
+            "{joined}"
+        );
     }
 
     #[test]

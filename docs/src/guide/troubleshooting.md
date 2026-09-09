@@ -262,6 +262,32 @@ slowdown.
 
 ---
 
+## UML sidecar: `error -12` boot panic ("No working init found")
+
+**Symptom:** `sprout uml up` (or a manual `linux.uml` boot) prints
+`Starting init: /sbin/init exists but couldn't execute it (error -12)`,
+falls through `/etc/init`, `/bin/init`, `/bin/sh`, then panics with
+`No working init found`. On UML the panic auto-reboots in-process, so
+the log fills with one panic per ~17s — it looks like repeated boots.
+
+**Cause:** UML execs its SKAS stub from a memfd by default. Android's
+SELinux/app exec rules deny memfd exec, so *every* guest `execve` fails
+with `-ENOMEM` — init included. The boot log blames "init", but the
+real question is whether `stub_exe=` was passed to the kernel.
+
+**Fix:** locate the stub kbuild emits at
+`<kernel-build-dir>/arch/um/kernel/skas/stub_exe` and boot with
+`stub_exe=<that file>`. sprout does this automatically
+(`SPROUT_UML_STUB` overrides). If you build the kernel yourself and
+copy only `linux.uml` out of the build tree, you MUST copy
+`arch/um/kernel/skas/stub_exe` next to it (or set `SPROUT_UML_STUB`).
+
+**Diagnosis tip:** dump the exact guest argv with
+`SPROUT_UML_SPAWN_DEBUG=1 sprout uml up …` and diff against a working
+manual boot — "identical" spawns usually differ in one argument.
+
+---
+
 ## Still stuck?
 
 1. `sprout --dry-run -v 3 ... ` shows the whole launch composition
