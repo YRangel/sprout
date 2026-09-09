@@ -745,6 +745,37 @@ fn cmd_up(
         // remove state, don't force the operator through `down` first.
         let _ = std::fs::remove_file(dir.join("pid"));
     }
+    // Orphaned linux.uml from a killed CLI (timeout/Ctrl-C) still holds the
+    // backing.ext4 flock: every up then dies with "Failed to lock ... err 11"
+    // and panics ("Unable to mount root"). Detect + reap the orphan first.
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for e in rd.flatten() {
+            let pid: i32 = match e.file_name().to_string_lossy().parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if pid == std::process::id() as i32 {
+                continue;
+            }
+            // comm truncates at 15 chars: "linux.uml" shows as "linux".
+            // Pair the prefix with our unique umid= kernel arg for precision.
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            if comm.starts_with("linux") {
+                let cmdline =
+                    std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                if cmdline.contains(&format!("umid=sprout-{id}")) {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    // wait for exit so the flock is released before we boot
+                    for _ in 0..40 {
+                        if unsafe { libc::kill(pid, 0) } != 0 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+    }
     let uml_bin = find_uml_bin()
         .ok_or_else(|| anyhow!("no linux.uml binary (SPROUT_UML_BIN, PATH, or ./linux.uml)"))?;
     std::fs::create_dir_all(&dir)?;
