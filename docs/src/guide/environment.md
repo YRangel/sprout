@@ -95,6 +95,7 @@ The `sprout uml` subcommand (ADR-0023) reads these variables:
 | `SPROUT_UML_VSOCK` | `1` = prefer the vsock transport for `uml up` (same as `--transport vsock`) |
 | `SPROUT_UML_MINI` | `1` = boot the mini profile for `uml up` (same as `--profile mini`) |
 | `SPROUT_UML_COW` | `1` = boot with a COW overlay (`cow.img`) instead of direct backing |
+| `SPROUT_UML_SHM` | `1` = rung 3: guest RAM backed by a host memfd (`physmem_fd=` fd-passing), ring carrier via `/dev/sprout-shm`; same as `uml up --shm`. Requires the sprout kernel port (legacy kernels ignore the arg and boot private physmem) |
 | `SPROUT_UML_TEST_HOME` | Test hook: anchor the per-guest state dir somewhere else |
 | `SPROUT_UML_SPAWN_DEBUG` | Any value = dump the exact guest argv + spawn cwd to `uml.spawn-debug` in the state dir |
 | `SPROUT_UML_SPAWN` | `bash` = spawn the guest through `bash -c 'exec setsid …'` instead of the direct Rust spawn (bisect tool for spawn-path issues) |

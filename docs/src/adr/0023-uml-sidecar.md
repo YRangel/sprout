@@ -92,11 +92,35 @@ shared state, bench gate enforces ±2%.
 - **Auto transport default**: vsock when the vhost-user backend is
   resolvable (`SPROUT_UML_VHOST` or `PATH`), files otherwise. Explicit
   `--transport` always wins.
-- **Rung 3 (shared-memory ring, ~10µs) is blocked**, not dropped:
-  guest hostfs mmap SEGVs (guest page cache is a copy, not shared
-  pages), and a vhost-user master inside the CLI is a kernel-adjacent
-  project. The adaptive files poller (rung 2.5, exec 340→~50ms) ships
-  instead. Revisit only with a real kernel-side driver.
+- **Rung 3 (shared-memory ring) SHIPPED 2026-09-09** — `--shm`/
+  `SPROUT_UML_SHM=1`: guest RAM backed by a host memfd
+  (`physmem_fd=` fd-passing), exposed to guest userspace as
+  `/dev/sprout-shm` (kernel device in the uml-kernel port), with the
+  exec ring carved out of the LAST 2 MiB of physmem. Three pieces
+  were needed beyond the wave-2 insight:
+  1. **memblock-reserve the ring tail** (kernel `physmem.c`): without
+     it the buddy allocator freely hands ring pages to guest
+     userspace/page-cache and the host ring is silently corrupted by
+     unrelated guest memory.
+  2. **`remap_pfn_range` via `virt_to_page(uml_physmem + phys)`**
+     (kernel `sprout_shm.c`): the driver must remap the pfn of the
+     page that the kernel's own MAP_SHARED linear mapping uses —
+     that is what makes agent mmap genuinely share memfd pages with
+     the host holder (earlier attempt remapped the raw file offset
+     and the guest saw zeros/hangs).
+  3. **Publish the exact physmem size**: UML strips every
+     kernel-consumed arg (`mem=`, `rw`, `ncpus=`…) from
+     `/proc/cmdline`, so the agent cannot learn RAM size that way,
+     and `/proc/meminfo` is short by the kernel reserve. The device
+     publishes it via `read()` (8-byte LE u64); the agent maps the
+     ring at `size - 2MiB`.
+  Measured: ring ping (holder↔agent) 8–11ms — dominated by the
+  agent's 4ms idle poll cap and guest fork; exec ≈ files-transport
+  (guest fork/exec floor) but with a deterministic, zero-IO
+  carrier. Holder teardown on `down` kills the memfd holder
+  (earlier leak) and clears `ring.sock`.
+  Perf work for later rungs: pre-forked ring workers / vfork to
+  cut the two forks per exec.
 
 ## Alternatives rejected
 

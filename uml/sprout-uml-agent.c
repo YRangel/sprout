@@ -1,3 +1,6 @@
+#if !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1 /* setresuid/setresgid, fd_set, _SC_NPROCESSORS_ONLN */
+#endif
 //! `sprout-uml-agent` — guest-side exec daemon for the UML sidecar.
 //!
 //! Runs as a systemd unit inside the UML guest. Preforks N workers that
@@ -18,6 +21,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <linux/vm_sockets.h>
 #include <dirent.h>
@@ -37,6 +42,58 @@
 #define SOCK_PATH "/run/sprout/exec.sock"
 static int tcp_port = 2225;
 #define IO_CHUNK (128u * 1024u)
+
+/* ---------- rung 3: shared-physmem ring transport ----------
+ * The sprout fork kernel exposes /dev/sprout-shm: guest userspace mmaps
+ * the shared physmem window (backed by the host launcher's memfd via
+ * physmem_fd=). The ring lives in the LAST 2MiB of physmem — kernel
+ * never allocates from beyond mem= so it is ours. Layout must match
+ * crates/sprout-cli/src/bin/sprout-uml-hold.rs exactly:
+ *   [0..4096)                ring header (magic, seqs)
+ *   [4096..4096+8*16)        8 slot headers (status,len,seq,pad)
+ *   [then]                   8 x 60KB payload areas
+ * A slot is BUSY(host-wrote)/FREE(host-consumed); the reply reuses the
+ * same slot, status DONE until host resets FREE. Seqs in the header are
+ * doorbells; both sides poll at ~1ms hot / exponential decay idle.
+ */
+#define RING_BYTES (2u << 20)
+#define RING_HDR_PAGE 4096u
+#define RING_SLOTS 8u
+#define RING_SLOT_HDR 16u
+#define RING_MAX_FRAME (60u * 1024u)
+#define RING_FRAME_FREE 0u
+#define RING_FRAME_BUSY 1u
+#define RING_FRAME_DONE 2u
+#define RING_MAGIC 0x31525053u /* "SPR1" LE */
+
+static void *ring_map(void) {
+    int fd = open("/dev/sprout-shm", O_RDWR);
+    if (fd < 0) return NULL;
+    /* UML strips mem=/rw=/ncpus=... from /proc/cmdline (only unknown
+     * args survive), so we cannot parse the RAM size from there; and
+     * /proc/meminfo MemTotal is short by the kernel reserve. The
+     * device publishes the exact physmem size: read 8 bytes, LE u64. */
+    unsigned long long mem = 0;
+    {
+        unsigned char b[8];
+        ssize_t n = read(fd, b, 8);
+        if (n != 8) { close(fd); return NULL; }
+        for (int i = 7; i >= 0; i--) mem = (mem << 8) | b[i];
+    }
+    { int c = open("/dev/console", O_WRONLY); if (c >= 0) { dprintf(c, "[ring] mem=%llu off=%llu\n", mem, mem - RING_BYTES); close(c); } }
+    if (mem < RING_BYTES) { close(fd); return NULL; }
+    unsigned long long off = mem - RING_BYTES;
+    void *r = mmap(NULL, RING_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   fd, off);
+    if (r == MAP_FAILED) {
+        int c = open("/dev/console", O_WRONLY);
+        if (c >= 0) { dprintf(c, "[ring] mmap off=0x%llx errno=%d\n", off, errno); close(c); }
+        close(fd);
+        return NULL;
+    }
+    close(fd);
+    return r;
+}
 
 static ssize_t read_full(int fd, void *b, size_t n) {
     size_t off = 0;
@@ -412,6 +469,144 @@ static int make_listener(void) {
     return fd;
 }
 
+/* ---------- rung 3 ring loop ---------- */
+static uint32_t ring_rd32(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+static void ring_wr32(uint8_t *p, uint32_t v) {
+    memcpy(p, &v, 4);
+}
+
+/* serve one CLI request body arriving in slot i; reply into the same
+ * slot by reusing the socket-op handler over a socketpair (identical to
+ * the files transport's file_handle_req). */
+static void ring_handle_slot(uint8_t *base, unsigned i) {
+    uint8_t *hdr = base + RING_HDR_PAGE + i * RING_SLOT_HDR;
+    uint32_t *hdr32 = (uint32_t *)base;
+    uint32_t len = ring_rd32(hdr + 4);
+    uint32_t seq = ring_rd32(hdr + 8);
+    uint8_t *pay = base + RING_HDR_PAGE + RING_SLOTS * RING_SLOT_HDR + i * RING_MAX_FRAME;
+
+    /* Copy the request OUT of shared memory first: ring_handle_slot
+     * runs in the ring server process while the host may already be
+     * writing the NEXT request into another slot — payload ownership
+     * must be local before we fork anything. */
+    char *body = malloc(len ? len : 1);
+    if (!body || (len && memcpy(body, pay, len) != body)) {
+        ring_wr32(hdr, RING_FRAME_DONE);
+        __atomic_store_n(&hdr32[3], seq, __ATOMIC_RELEASE);
+        return;
+    }
+
+    /* Serve the request through the regular socket handler: a helper
+     * child feeds the body into a socketpair and runs handle_conn,
+     * whose response stream we capture into the SAME slot (reuse the
+     * payload area for the reply — host has stopped touching it after
+     * seeing BUSY->DONE with the same seq it wrote). */
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+        free(body);
+        ring_wr32(hdr, RING_FRAME_DONE);
+        __atomic_store_n(&hdr32[3], seq, __ATOMIC_RELEASE);
+        return;
+    }
+    pid_t w = fork();
+    if (w < 0) {
+        close(sv[0]); close(sv[1]); free(body);
+        ring_wr32(hdr, RING_FRAME_DONE);
+        __atomic_store_n(&hdr32[3], seq, __ATOMIC_RELEASE);
+        return;
+    }
+    if (w == 0) {
+        close(sv[0]);
+        if (write_full(sv[1], body, len) < 0) _exit(1);
+        close(sv[1]);
+        handle_conn(sv[0], sv[0]); /* reads body, execs, writes frames */
+        _exit(0);
+    }
+    free(body);
+    close(sv[1]);
+    /* capture the response stream (frames identical to files transport)
+     * into the slot payload, then publish DONE. */
+    size_t got = 0;
+    for (;;) {
+        if (got == RING_MAX_FRAME) break;
+        ssize_t r = read(sv[0], pay + got, RING_MAX_FRAME - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (r == 0) break;
+        got += (size_t)r;
+    }
+    close(sv[0]);
+    int st = 0;
+    while (waitpid(w, &st, 0) < 0 && errno == EINTR) {}
+
+    /* publish reply: len update then DONE (release after payload) */
+    __atomic_store_n((uint32_t *)(hdr + 4), (uint32_t)got, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    ring_wr32(hdr, RING_FRAME_DONE);
+    /* doorbell the host: guest_seq = this frame's seq */
+    __atomic_store_n(&hdr32[3], seq, __ATOMIC_RELEASE);
+}
+
+static void ring_log(const char *msg, int n) {
+    int c = open("/dev/console", O_WRONLY);
+    if (c < 0) return;
+    if (n >= 0) dprintf(c, "[ring] %s (%d)\n", msg, n);
+    else dprintf(c, "[ring] %s\n", msg);
+    close(c);
+}
+
+static void ring_loop(void) {
+    ring_log("loop enter", -1);
+    uint8_t *base = ring_map();
+    if (!base) {
+        ring_log("map FAILED errno", errno);
+        FILE *df = fopen("/run/sprout/agent-debug.log", "a");
+        if (df) { fprintf(df, "ring: no /dev/sprout-shm, transport disabled\n"); fclose(df); }
+        return;
+    }
+    uint32_t *hdr32 = (uint32_t *)base;
+    /* wait for the host holder to initialize the header */
+    {
+        int spins = 0;
+        while (__atomic_load_n(&hdr32[0], __ATOMIC_ACQUIRE) != RING_MAGIC) {
+            if (++spins > 6000) { /* 60s */
+                FILE *df = fopen("/run/sprout/agent-debug.log", "a");
+                if (df) { fprintf(df, "ring: header magic never appeared\n"); fclose(df); }
+                return;
+            }
+            usleep(10000);
+        }
+    }
+    ring_log("attached magic ok", -1);
+    uint32_t last_seen = 0;
+    int idle_us = 1000;
+    for (;;) {
+        uint32_t host_seq = __atomic_load_n(&hdr32[2], __ATOMIC_ACQUIRE);
+        if (host_seq != last_seen) {
+            /* find the slot(s) newer than what we served: the header does
+             * not carry an index; scan for BUSY slots (v1: one request in
+             * flight is the norm, 8 slots just absorb bursts) */
+            for (unsigned i = 0; i < RING_SLOTS; i++) {
+                uint8_t *hdr = base + RING_HDR_PAGE + i * RING_SLOT_HDR;
+                if (ring_rd32(hdr) == RING_FRAME_BUSY) {
+                    ring_handle_slot(base, i);
+                    idle_us = 1000; /* hot */
+                }
+            }
+            last_seen = host_seq;
+            continue;
+        }
+        if (idle_us < 4000) idle_us *= 2;
+        usleep((useconds_t)idle_us);
+    }
+}
+
 int main(int argc, char **argv) {
     int workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (workers < 2) workers = 2;
@@ -463,6 +658,15 @@ int main(int argc, char **argv) {
         pid_t f = fork();
         if (f == 0) {
             file_transport_loop("/run/sprout");
+            _exit(0);
+        }
+    }
+    /* rung 3 ring: dedicated process on /dev/sprout-shm. Silent no-op
+     * (fork returns) when the kernel lacks the device — like vsock. */
+    {
+        pid_t r = fork();
+        if (r == 0) {
+            ring_loop();
             _exit(0);
         }
     }

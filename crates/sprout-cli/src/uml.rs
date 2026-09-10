@@ -238,6 +238,53 @@ fn parse_frames(mut cur: &[u8]) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
 /// Exec via the file transport (hostfs share): hostfs socket nodes are
 /// placeholders on the host, so host->guest exec rides req.<n>/resp.<n>
 /// files. Wire format identical to the socket protocol.
+/// Ring transport (rung 3): body identical to the files transport, but
+/// the round trip goes CLI -> holder (unix socket) -> shared-physmem ring
+/// -> agent. The holder does the memfd-slot dance; we just speak
+/// length-prefixed frames to it.
+pub fn agent_exec_ring(
+    ring_sock: &std::path::Path,
+    argv: &[String],
+    env: &[String],
+    cwd: &str,
+    stdin_data: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<(i32, Vec<u8>, Vec<u8>)> {
+    use anyhow::Context;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    let mut conn = UnixStream::connect(ring_sock)
+        .with_context(|| format!("ring connect {}", ring_sock.display()))?;
+    let mut body = Vec::new();
+    body.push(PROTO_EXEC);
+    push_strs(&mut body, argv);
+    push_strs(&mut body, env);
+    push_str(&mut body, cwd.as_bytes());
+    push_u32(&mut body, stdin_data.len() as u32);
+    body.extend_from_slice(stdin_data);
+    push_u32(&mut body, 0);
+    push_u32(&mut body, 0);
+    push_u32(&mut body, timeout.as_millis().min(u32::MAX as u128) as u32);
+    push_u32(&mut body, 0);
+    conn.write_all(&(body.len() as u32).to_le_bytes())?;
+    conn.write_all(&body)?;
+    conn.flush()?;
+
+    let deadline = Instant::now() + timeout + Duration::from_secs(10);
+    conn.set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))?;
+    let mut lenb = [0u8; 4];
+    conn.read_exact(&mut lenb)
+        .context("ring: holder closed before reply len")?;
+    let rlen = u32::from_le_bytes(lenb) as usize;
+    if rlen > 8 << 20 {
+        anyhow::bail!("ring reply too big ({rlen})");
+    }
+    let mut raw = vec![0u8; rlen];
+    conn.read_exact(&mut raw)
+        .context("ring: short reply from holder")?;
+    parse_frames(&raw)
+}
+
 pub fn agent_exec_files(
     share: &std::path::Path,
     argv: &[String],
@@ -625,6 +672,7 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
         "exec" => {
             let mut id = "default".to_string();
             let mut timeout = Duration::from_secs(60);
+            let mut env_extra: Vec<String> = Vec::new();
             let mut i = 1;
             while i < argv.len() {
                 match argv[i].as_str() {
@@ -650,6 +698,17 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
                             .parse()?;
                         timeout = Duration::from_secs(s);
                     }
+                    "--env" => {
+                        i += 1;
+                        let kv = argv
+                            .get(i)
+                            .ok_or_else(|| anyhow!("--env needs K=V"))?
+                            .clone();
+                        if !kv.contains('=') {
+                            bail!("--env needs K=V (got '{kv}')");
+                        }
+                        env_extra.push(kv);
+                    }
                     "--" => {
                         i += 1;
                         break;
@@ -661,9 +720,9 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
             }
             let cmd: Vec<String> = argv[i..].to_vec();
             if cmd.is_empty() {
-                bail!("usage: sprout uml exec [--id NAME] [--timeout S] CMD...");
+                bail!("usage: sprout uml exec [--id NAME] [--timeout S] [--env K=V] CMD...");
             }
-            cmd_exec(&id, &cmd, timeout)
+            cmd_exec(&id, &cmd, &env_extra, timeout)
         }
         "down" => {
             let mut id = "default".to_string();
@@ -913,6 +972,48 @@ fn cmd_up(
         },
         &extra,
     );
+    // Rung 3.1: holder daemon keeps the ring + physmem fd alive past
+    // this CLI's exit and serves exec requests on dir/ring.sock. It gets
+    // the memfd via argv fd number (pre_exec clears CLOEXEC), binds its
+    // own listener, writes dir/holder.pid. `down` kills it. Legacy
+    // transports (vsock/unix/files) stay primary until the ring wins
+    // benchmarks; holder is additive, not a replacement.
+    if let Some(fd) = shm_fd.as_ref() {
+        use anyhow::Context;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let hold_bin = std::env::current_exe()?
+            .parent()
+            .map(|p| p.join("sprout-uml-hold"))
+            .filter(|p| p.exists())
+            .ok_or_else(|| {
+                anyhow::anyhow!("--shm needs sprout-uml-hold beside the sprout binary")
+            })?;
+        let raw = fd.as_raw_fd();
+        let ring_sock = dir.join("ring.sock");
+        let mut hc = std::process::Command::new(&hold_bin);
+        hc.arg(raw.to_string()).arg(&ring_sock);
+        // SAFETY: pre_exec runs post-fork pre-exec in the child; only
+        // touches the two inherited fds (clear CLOEXEC on the memfd).
+        unsafe {
+            hc.pre_exec(move || {
+                let fl = libc::fcntl(raw, libc::F_GETFD);
+                if fl >= 0 {
+                    libc::fcntl(raw, libc::F_SETFD, fl & !libc::FD_CLOEXEC);
+                }
+                Ok(())
+            });
+        }
+        hc.stdin(Stdio::null()).stdout(Stdio::null()).stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("holder.log"))?,
+        );
+        let hchild = hc.spawn().context("spawn sprout-uml-hold")?;
+        std::fs::write(dir.join("holder.pid"), hchild.id().to_string())?;
+        std::mem::forget(hchild); // outlives the CLI, like the guest
+    }
     let log = dir.join("uml.log");
     let child = spawn_uml(&bin, &args, &log, shm_fd.as_ref())?;
     std::fs::write(dir.join("pid"), child.id().to_string())?;
@@ -983,38 +1084,83 @@ fn cmd_up(
     Ok(1)
 }
 
-fn cmd_exec(id: &str, cmd: &[String], timeout: Duration) -> anyhow::Result<u8> {
+fn cmd_exec(
+    id: &str,
+    cmd: &[String],
+    env_extra: &[String],
+    timeout: Duration,
+) -> anyhow::Result<u8> {
     let sock = agent_sock_str(id)?;
-    let env: Vec<String> = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
+    // Guest env: passing the HOST env leaks host paths into the guest
+    // (dash's PATH then misses /usr/bin → "ls: not found"). Clean guest
+    // default instead; SPROUT_UML_ENV="K=V K=V" appends overrides and
+    // explicit --env flags win over everything.
+    let mut env: Vec<String> = vec![
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+        "HOME=/root".into(),
+        "TERM=xterm-256color".into(),
+    ];
+    if let Ok(extra) = std::env::var("SPROUT_UML_ENV") {
+        env.extend(
+            extra
+                .split_whitespace()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+        );
+    }
+    env.extend(env_extra.iter().cloned());
+    let env: Vec<String> = env.into_iter().filter(|e| !e.is_empty()).collect();
     // Host cwd rarely exists in the guest; passing it makes the agent's
     // chdir fail and the exec exit 127, which reads as "command not
     // found". Guest cwd is always "/" for v0.1 (guest is a whole rootfs,
     // not a working-dir passthrough — same rule as proot -0-style runs).
     let cwd = "/".to_string();
-    let uds = uml_dir(id).join("vhu-uds");
+    let dir = uml_dir(id);
+    let uds = dir.join("vhu-uds");
     let uds_opt = if uds.exists() {
         Some(uds.as_path())
     } else {
         None
     };
-    let (code, out, err) =
-        match agent_exec_vsock(uds_opt, VSOCK_PORT, cmd, &env, &cwd, &[], timeout) {
-            Ok(r) => r,
-            Err(vs_err) => match agent_exec(&sock, cmd, &env, &cwd, &[], timeout) {
-                Ok(r) => r,
-                // hostfs socket nodes are placeholders on the host — file transport
-                Err(e)
-                    if e.to_string().contains("Connection refused")
-                        || e.to_string().contains("os error 111") =>
-                {
-                    let dir = uml_dir(id);
-                    let share = dir.join("share");
-                    agent_exec_files(&share, cmd, &env, &cwd, &[], timeout)
-                        .map_err(|fe| anyhow::anyhow!("vsock: {vs_err}; unix: {e}; files: {fe}"))?
-                }
-                Err(e) => return Err(anyhow::anyhow!("vsock: {vs_err}; unix: {e}")),
-            },
+    let (code, out, err) = {
+        // Rung 3: ring.sock holder first (zero-copy shared physmem path).
+        let ring_sock = dir.join("ring.sock");
+        let ring_res = if ring_sock.exists() {
+            agent_exec_ring(&ring_sock, cmd, &env, &cwd, &[], timeout)
+        } else {
+            Err(anyhow::anyhow!("no ring"))
         };
+        match ring_res {
+            Ok(r) => r,
+            Err(ring_err) => {
+                match agent_exec_vsock(uds_opt, VSOCK_PORT, cmd, &env, &cwd, &[], timeout) {
+                    Ok(r) => r,
+                    Err(vs_err) => match agent_exec(&sock, cmd, &env, &cwd, &[], timeout) {
+                        Ok(r) => r,
+                        // hostfs socket nodes are placeholders on the host — file transport
+                        Err(e)
+                            if e.to_string().contains("Connection refused")
+                                || e.to_string().contains("os error 111") =>
+                        {
+                            let share = dir.join("share");
+                            agent_exec_files(&share, cmd, &env, &cwd, &[], timeout).map_err(
+                                |fe| {
+                                    anyhow::anyhow!(
+                                        "ring: {ring_err}; vsock: {vs_err}; unix: {e}; files: {fe}"
+                                    )
+                                },
+                            )?
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "ring: {ring_err}; vsock: {vs_err}; unix: {e}"
+                            ))
+                        }
+                    },
+                }
+            }
+        }
+    };
     use std::io::Write;
     let _ = std::io::stdout().write_all(&out);
     let _ = std::io::stderr().write_all(&err);
@@ -1124,6 +1270,21 @@ fn cmd_down(id: &str) -> anyhow::Result<u8> {
 /// master never reconnects, so a fresh backend MUST be started per boot
 /// (cmd_up reuses only a live one).
 fn teardown_backend(dir: &std::path::Path) {
+    // Ring holder (rung 3): holds the shared physmem memfd + one unix
+    // listener. It must die with the guest or the memfd leaks (and the
+    // next up's holder would fight over a stale ring.sock).
+    if let Ok(pid_s) = std::fs::read_to_string(dir.join("holder.pid")) {
+        if let Ok(pid) = pid_s.trim().parse::<i32>() {
+            if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+                std::thread::sleep(Duration::from_millis(300));
+                if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+                    // already gone; harmless
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(dir.join("holder.pid"));
+    let _ = std::fs::remove_file(dir.join("ring.sock"));
     if let Ok(pid_s) = std::fs::read_to_string(dir.join("vhu.pid")) {
         if let Ok(pid) = pid_s.trim().parse::<i32>() {
             if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
