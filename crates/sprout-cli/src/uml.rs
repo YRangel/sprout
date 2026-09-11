@@ -285,6 +285,255 @@ pub fn agent_exec_ring(
     parse_frames(&raw)
 }
 
+/* ADR-0024 §9: PROTO_MOUNT over the ring (op 0x03). Wire:
+ *   [u8 0x03][16B auth hdr: u64 token LE | u32 flags=0 | u32 rsvd=0]
+ *   [u8 subop][lp src][lp dst][lp fstype][u64 mflags][lp data]
+ * Reply: [u8 status][u32 len][payload]. Status 0 = ok, else errno. */
+const PROTO_MOUNT: u8 = 0x03;
+
+fn agent_bridge_op_ring(
+    ring_sock: &std::path::Path,
+    token: u64,
+    subop: u8,
+    src: &str,
+    dst: &str,
+    fstype: &str,
+    mflags: u64,
+    data: &str,
+    timeout: Duration,
+) -> anyhow::Result<u8> {
+    use anyhow::Context;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let mut conn = UnixStream::connect(ring_sock)
+        .with_context(|| format!("ring connect {}", ring_sock.display()))?;
+    let mut body = Vec::with_capacity(64);
+    body.push(PROTO_MOUNT);
+    body.extend_from_slice(&token.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // flags
+    body.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    body.push(subop);
+    push_str(&mut body, src.as_bytes());
+    push_str(&mut body, dst.as_bytes());
+    push_str(&mut body, fstype.as_bytes());
+    body.extend_from_slice(&mflags.to_le_bytes());
+    push_str(&mut body, data.as_bytes());
+    conn.write_all(&(body.len() as u32).to_le_bytes())?;
+    conn.write_all(&body)?;
+    conn.flush()?;
+    conn.set_read_timeout(Some(timeout))?;
+    let mut hdr = [0u8; 5];
+    conn.read_exact(&mut hdr)
+        .context("ring: no bridge-op reply")?;
+    let plen = u32::from_le_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+    if plen > 0 {
+        let mut pay = vec![0u8; plen];
+        let _ = conn.read_exact(&mut pay);
+    }
+    Ok(hdr[0])
+}
+
+/// Replay the intent journal into a freshly booted guest (T9). Best-effort:
+/// failures are logged, rows stay pending for the next up. Token: read from
+/// dir/token (provisioned into the guest at up by the caller); falls back to
+/// exec-free skip when absent.
+fn journal_replay(dir: &std::path::Path) {
+    use crate::journal::Journal;
+    let j = Journal::open(dir);
+    let pending = match j.pending() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sprout: journal read failed: {e}");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let ring = dir.join("ring.sock");
+    let token = read_token(dir);
+    let ring_ok = ring.exists();
+    let tok_ok = token.is_some();
+    if !ring_ok || !tok_ok {
+        eprintln!(
+            "sprout: journal replay skipped (ring={} token={}) — will retry next up",
+            ring_ok, tok_ok
+        );
+        return;
+    }
+    let token = token.unwrap();
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    for row in &pending {
+        match row.op.as_str() {
+            "mount" if row.args.len() >= 2 => {
+                let (src, dst) = (row.args[0].clone(), row.args[1].clone());
+                let fstype = row.args.get(2).cloned().unwrap_or_default();
+                let mflags: u64 = row
+                    .args
+                    .get(3)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let data = row.args.get(4).cloned().unwrap_or_default();
+                let mdata = hostfs_to_guest(dir, &data).unwrap_or_default();
+                let _ = agent_exec_files(
+                    &dir.join("share"),
+                    &[
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        format!("mkdir -p '{dst}'"),
+                    ],
+                    &[],
+                    "/",
+                    &[],
+                    Duration::from_secs(10),
+                );
+                let st = agent_bridge_op_ring(
+                    &ring,
+                    token,
+                    0,
+                    &src,
+                    &dst,
+                    &fstype,
+                    mflags,
+                    &mdata,
+                    Duration::from_secs(10),
+                );
+                match st {
+                    Ok(0) | Ok(16) | Ok(17) | Ok(68) => {
+                        // 0=ok; EBUSY/EALREADY/EADDRINUSE = already mounted
+                        // (idempotent retry across holds; at/near mount
+                        // collision, the table row state is "done")
+                        let _ = j.confirm("mount", &row.args);
+                        applied += 1;
+                    }
+                    Ok(e) => {
+                        eprintln!("sprout: replay mount {src} -> {dst}: errno {e}");
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("sprout: replay mount {src} -> {dst}: {e:#}");
+                        failed += 1;
+                    }
+                }
+            }
+            "umount" if !row.args.is_empty() => {
+                let dst = row.args[0].clone();
+                let st = agent_bridge_op_ring(
+                    &ring,
+                    token,
+                    1,
+                    "",
+                    &dst,
+                    "",
+                    0,
+                    "",
+                    Duration::from_secs(10),
+                );
+                match st {
+                    Ok(0) | Ok(2) | Ok(22) => {
+                        // 0=ok; ENOENT/EINVAL = already unmounted
+                        let _ = j.confirm("umount", &row.args);
+                        applied += 1;
+                    }
+                    Ok(e) => {
+                        eprintln!("sprout: replay umount {dst}: errno {e}");
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("sprout: replay umount {dst}: {e:#}");
+                        failed += 1;
+                    }
+                }
+            }
+            _ => {
+                eprintln!("sprout: journal: unknown op '{}' — skipped", row.op);
+            }
+        }
+    }
+    println!(
+        "sprout: journal replay: {applied} applied, {failed} failed ({} pending)",
+        pending.len()
+    );
+}
+
+fn read_token(dir: &std::path::Path) -> Option<u64> {
+    let s = std::fs::read_to_string(dir.join("token")).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(s, 16).ok()
+}
+
+/// hostfs wire convention: paths are of the form "hostfs/<x>" where "<x>"
+/// is the name of a dir under the host mount-point root. Wire replication
+/// maps it to the GUEST-visible point /run/sprout/<x>, creates the dir
+/// in the guest hostfs if needed.
+fn hostfs_to_guest(dir: &std::path::Path, wire_path: &str) -> Option<String> {
+    if wire_path.is_empty() || wire_path.starts_with("/run/sprout") {
+        return Some(wire_path.into());
+    }
+    let mut rest = wire_path.strip_prefix("hostfs/").unwrap_or(wire_path).trim_start_matches('/').to_string();
+    Some(format!("/run/sprout/{rest}"))
+}
+
+/// Host-side hostfs path for the agent bridge: the hostfs mount planted at
+/// /hostfs in the guest maps a host dir (usually ~/sprouted-image-dir).
+fn hostfs_share(dir: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(dir.join("hostfs-share")).ok()?;
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    Some(s.to_string())
+}
+
+/// ADR-0024 session token: reuse dir/token when present, else 64-bit
+/// random from /dev/urandom; install into the guest at
+/// /run/sprout/session.token (mode 600) via an agent exec. Fail-open:
+/// provisioning errors only disable bridge ops for this session.
+fn provision_token(
+    dir: &std::path::Path,
+    _id: &str,
+    transport: &str,
+    vhu_uds: &std::path::Path,
+    share: &std::path::Path,
+) {
+    let hex = match std::fs::read_to_string(dir.join("token")) {
+        Ok(s) if s.trim().len() >= 8 => s.trim().to_string(),
+        _ => {
+            // /dev/urandom → 8 bytes → 16 hex chars
+            let mut b = [0u8; 8];
+            match std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
+            {
+                Ok(()) => {
+                    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+                    if std::fs::write(dir.join("token"), &h).is_err() {
+                        return; // no host token -> replay will skip
+                    }
+                    h
+                }
+                Err(_) => return,
+            }
+        }
+    };
+    let script = format!(
+        "mkdir -p /run/sprout && printf %s {hex} > /run/sprout/session.token && chmod 600 /run/sprout/session.token"
+    );
+    let cmd = ["/bin/sh".to_string(), "-c".to_string(), script];
+    let _ = transport;
+    let _ = vhu_uds;
+    // One-shot per up() — use the files transport unconditionally (ring
+    // framing on the mini profile has a scheduled-for-fix quirk, and this
+    // path is never hot).
+    let res = agent_exec_files(share, &cmd, &[], "/", &[], Duration::from_secs(10))
+        .map(|_| ());
+    if let Err(e) = res {
+        eprintln!("sprout: token provisioning failed: {e:#}");
+        let _ = std::fs::remove_file(dir.join("token"));
+    }
+}
+
 pub fn agent_exec_files(
     share: &std::path::Path,
     argv: &[String],
@@ -1070,6 +1319,8 @@ fn cmd_up(
                     "sprout uml: guest '{id}' up ({transport}, boot {:.1}s)",
                     boot_t0.elapsed().as_secs_f32()
                 );
+                provision_token(&dir, id, transport, &vhu_uds, &share);
+                journal_replay(&dir);
                 return Ok(0);
             }
         }

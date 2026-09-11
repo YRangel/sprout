@@ -15,6 +15,8 @@ use sprout_core::{
     classify, elf_meta, Binding, Error, GuestClass, LaunchPlan, LibcFlavor, Rootfs, Strategy,
 };
 
+mod journal;
+mod session_owner;
 mod uml;
 
 /// Rootless glibc Linux userspace for Android (proot-compatible CLI).
@@ -630,7 +632,7 @@ fn run() -> Result<u8, Error> {
         }
     }
 
-    let plan = if strategy == Strategy::Ptrace || rootfs.libc_flavor() == LibcFlavor::Musl {
+    let mut plan = if strategy == Strategy::Ptrace || rootfs.libc_flavor() == LibcFlavor::Musl {
         /* Last-resort path (ADR-0002): supervisor translates syscall args
          * for static / preload-incapable images, and rewrites static→dynamic
          * exec into the sanitized loader chain. MUSL guests (v0.4) take this
@@ -768,6 +770,22 @@ fn run() -> Result<u8, Error> {
         }
     };
 
+    /* Force the actual pre_exec: sprout-super spawns the guest loader with
+     * pre_exec that dup2s this fd into the child, CLOEXEC cleared.        */
+    if let Some(fd) = plan.env.iter().position(|(k, _)| k == "SPROUT_SHADOW_FD")
+        .map(|i| plan.env[i].1.clone())
+    {
+        let fd: i32 = fd.parse().unwrap_or(-1);
+        if fd >= 0 {
+            plan.env.push((
+                "SPROUT_SHADOW_FD_PARENT".into(),
+                format!("{}", std::process::id()),
+            ));
+            plan.env
+                .push(("SPROUT_SHADOW_FD_INHERITED".into(), format!("{fd}")));
+        }
+    }
+
     let mut plan = plan;
     /* Static binaries launched from INSIDE the preload interposer must
      * route through the supervisor (the interposer can't seccomp-emulate
@@ -807,6 +825,46 @@ fn run() -> Result<u8, Error> {
         }
     };
     plan.env.push(("SPROUT_KERNEL_RELEASE".into(), rel));
+    /* ADR-0024 L0: if a UML session owner is live for the default instance,
+     * hand the shadow fd to the fast-lane child. The interposer fails open
+     * when the env/owner is absent. */
+    if std::env::var_os("SPROUT_SHADOW_FD").is_none()
+        && std::env::var_os("SPROUT_SHADOW_FILE").is_none()
+    {
+        let uml_id = std::env::var("SPROUT_UML_ID").unwrap_or_else(|_| "main".to_string());
+        let dir = uml::uml_dir(&uml_id);
+        /* File fallback takes priority: SELinux-friendly and survives
+         * cross-process without pidfd. fd only when SELinux allows. */
+        let file = dir.join("shadow.bin");
+        if file.is_file() {
+            plan.env.push((
+                "SPROUT_SHADOW_FILE".into(),
+                file.to_string_lossy().into_owned(),
+            ));
+        } else if let Some(fd) = session_owner::connect_shadow(&dir) {
+            if std::env::var_os("SPROUT_DEBUG_SHADOW").is_some() {
+                eprintln!("sprout: shadow fd {fd} -> guest env");
+            }
+            plan.env.push(("SPROUT_SHADOW_FD".into(), fd.to_string()));
+        }
+    }
+    /* Force the actual pre_exec: sprout-super spawns the guest loader with
+     * pre_exec that dup2s this fd into the child, CLOEXEC cleared.        */
+    if let Some(fd) = plan.env.iter().position(|(k, _)| k == "SPROUT_SHADOW_FD")
+        .map(|i| plan.env[i].1.clone())
+    {
+        let fd: i32 = fd.parse().unwrap_or(-1);
+        if fd >= 0 {
+            /* leave parent's copy alone; the supervisor's pre_exec CLOEXEC=0
+             * dance makes the child inherit it.                            */
+            plan.env.push((
+                "SPROUT_SHADOW_FD_PARENT".into(),
+                format!("{}", std::process::id()),
+            ));
+            plan.env
+                .push(("SPROUT_SHADOW_FD_INHERITED".into(), format!("{fd}")));
+        }
+    }
     if let Some(base) = cli.port_mapping {
         if !(1024..=64512).contains(&base) {
             return Err(Error::Cli(format!(
