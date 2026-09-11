@@ -21,9 +21,21 @@
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::io::{FromRawFd, OwnedFd};
-use std::os::unix::net::UnixListener;
 use std::sync::atomic::{fence, Ordering};
 use std::time::{Duration, Instant};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+#[path = "../session_owner.rs"]
+mod session_owner;
+#[path = "../journal.rs"]
+mod journal;
+use session_owner::{Shadow, acquire_lock, write_state};
+use journal::Journal;
+
+static ctl_journal: std::sync::OnceLock<Journal> = std::sync::OnceLock::new();
 
 const RING_BYTES: usize = 2 << 20;
 const HDR_PAGE: usize = 4096;
@@ -161,6 +173,42 @@ fn run() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path)?;
 
+    // --- Session owner (ADR-0024 §5) ---
+    let uml_dir = sock_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let _lock = acquire_lock(&uml_dir)?;
+    let shadow = Arc::new(Mutex::new(Shadow::create_file(&uml_dir, session_owner::DEFAULT_CAP)?));
+    write_state(&uml_dir, shadow.lock().unwrap().as_raw_fd())?;
+    let _ = ctl_journal.set(Journal::open(&uml_dir));
+
+    let hb_shadow = Arc::clone(&shadow);
+    let hb_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hb_stop2 = hb_stop.clone();
+    let hb = thread::spawn(move || loop {
+        if hb_stop2.load(Ordering::Relaxed) {
+            break;
+        }
+        hb_shadow.lock().unwrap().pulse();
+        thread::sleep(Duration::from_millis(250));
+    });
+
+    let ctl_path = uml_dir.join("shadow.ctl");
+    let _ = std::fs::remove_file(&ctl_path);
+    let ctl_listener = UnixListener::bind(&ctl_path)?;
+    let ctl_shadow = Arc::clone(&shadow);
+    thread::spawn(move || {
+        for conn in ctl_listener.incoming() {
+            match conn {
+                Ok(mut c) => {
+                    let _ = ctl_handle(&mut c, &ctl_shadow);
+                }
+                Err(_) => continue,
+            }
+        }
+    });
+
     for conn in listener.incoming() {
         let mut conn = match conn {
             Ok(c) => c,
@@ -226,6 +274,106 @@ fn run() -> anyhow::Result<()> {
         // release the slot only AFTER the reply is fully read out
         fence(Ordering::Acquire);
         unsafe { std::ptr::write_volatile(ring.slot_hdr(i), FRAME_FREE) };
+    }
+    // hb_stop/drop happens when run() returns (down path)
+    hb_stop.store(true, Ordering::Relaxed);
+    let _ = hb.join();
+    Ok(())
+}
+
+fn ctl_handle(s: &mut UnixStream, shadow: &Arc<Mutex<Shadow>>) -> std::io::Result<()> {
+    use std::io::BufRead;
+    let s2 = s.try_clone()?;
+    let mut s2 = s2;
+    let mut r = std::io::BufReader::new(s);
+    let mut buf = String::new();
+    while r.read_line(&mut buf)? > 0 {
+        let line = buf.trim().to_string();
+        buf.clear();
+        let mut parts = line.split_whitespace();
+        let op = parts.next().unwrap_or("");
+        match op {
+            "bind" => {
+                let (dst, src) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                {
+                    let mut sh = shadow.lock().unwrap();
+                    match sh.add_bind(dst, src) {
+                        Ok(i) => { sh.commit(); writeln!(s2, "ok {i}")?; }
+                        Err(e) => writeln!(s2, "err {e}")?,
+                    }
+                }
+                /* Journal the intent — replay handles guest-side mount on
+                 * the next `sprout uml up` (T9). Logged AFTER the shadow
+                 * commit so a crash between them replays a noop anyway.  */
+                if let Some(j) = ctl_journal.get() {
+                    /* JOURNAL args shape (replay understands):
+                     *   arg[0]=src       (empty => "none")
+                     *   arg[1]=dst       (guest mount point)
+                     *   arg[2]=fstype
+                     *   arg[3]=flags     (int64)
+                     *   arg[4]=data      (hostfs path: RELATIVE to the
+                     *                     share dir, or ABSOLUTE path in the
+                     *                     guest's hostfs view like
+                     *                     "/run/sprout/share/..." which we
+                     *                     pass through unchanged)         
+                     */
+                    let hostsrc_abs = {
+                        let hs = parts.next().unwrap_or("");
+                        if hs.is_empty() { "".into() }
+                        else if hs.starts_with('/') { hs.into() }
+                        else { hs.into() }  // relative — replay maps
+                    };
+                    let _ = j.append(&journal::Row {
+                        intent: true,
+                        op: "mount".into(),
+                        args: vec![
+                            if src.is_empty() { "none".into() } else { src.into() },
+                            dst.into(),
+                            "hostfs".into(),
+                            "0".into(),
+                            hostsrc_abs,
+                        ],
+                    });
+                }
+            }
+            "unbind" => {
+                let dst = parts.next().unwrap_or("");
+                let mut sh = shadow.lock().unwrap();
+                let idx = sh.list_binds()
+                    .iter().position(|(d, _, _)| d == dst)
+                    .map(|i| i as u32);
+                if let Some(i) = idx {
+                    sh.mark_state(i, session_owner::S_REMOVED)?;
+                    sh.commit();
+                    writeln!(s2, "ok {i}")?;
+                } else {
+                    writeln!(s2, "err not found")?;
+                }
+                if let Some(j) = ctl_journal.get() {
+                    let _ = j.append(&journal::Row {
+                        intent: true,
+                        op: "umount".into(),
+                        args: vec![dst.into()],
+                    });
+                }
+            }
+            "dump" => {
+                let sh = shadow.lock().unwrap();
+                for (dst, src, state) in sh.list_binds() {
+                    writeln!(s2, "{dst} <- {src} state={state}")?;
+                }
+            }
+            "quiesce" => {
+                let mut sh = shadow.lock().unwrap();
+                for i in 0..sh.count() {
+                    let _ = sh.mark_state(i, session_owner::S_REMOVED);
+                }
+                sh.commit();
+                writeln!(s2, "ok")?;
+            }
+            "ping" => writeln!(s2, "ok")?,
+            _      => writeln!(s2, "err unknown op")?,
+        }
     }
     Ok(())
 }
