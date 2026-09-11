@@ -2,7 +2,9 @@
 
 ## Status
 
-Implemented+Shipped legit (0.6.0). Nothing left in the gap: the ADR-0023 sketch's demo was my canvas.
+Implemented in 0.6.0: layers L0-L2 and the session-owner/journal plumbing
+landed and gate-tested; L3 (demotion) ships as a documented stub; the guest
+hostfs-mount replay path is wired but has one known defect (see 0.6.0 notes).
 
 ## Context
 
@@ -360,27 +362,23 @@ port-forward table. No TAP, no /dev, no root. AF_UNIX is separate (§9).
 Steps 1–4 are the v1 core; 5–7 complete the ladder; 8 is the performance
 pass. Each step is independently shippable and gates-tested.
 
-## ADR-0024 — implementation status: 0.6.0 (COMPLETE)
-# ADR-0024 — Implementation: 0.6.0
+## ADR-0024 — implementation status (0.6.0)
 
-**Ship gates:** every layer has a tested floor. None of these are optional
-afternoons; this is what keeps us confident in 0.6x:
+| Layer | Landed in | Notes |
+|---|---|---|
+| L0 shadow memfd | `crates/sprout-cli/src/session_owner.rs` (writer, flock + 250 ms heartbeat + `shadow.ctl`), `crates/sprout-preload/csrc/sprout_shadow.c` (reader) | layout: 56-byte header + 28-byte entries (measured `sizeof`, not the stale comments); readers fail open on magic/gen/heartbeat/strtab mismatch (T8/T11 covered by `test_shadow.c`) |
+| L1 brk lane | pre-existing supervisor lane | unchanged in 0.6.0 |
+| L2 bridge ops | `uml/sprout-uml-agent.c` opcodes 0x03-0x09 (MOUNT, PROC_READ, FILE_META, SIGNAL_FWD/REV, RELAY_UNIX, EXEC_MIGRATE) | 16-byte auth header (u64 token + reserved); confinement via realpath+prefix; token bootstrap is fail-open until `/run/sprout/session.token` exists |
+| L3 demotion | stub | detector only (`SPROUT_DEMOTE_ENABLED`), executor scheduled for 0.7 |
+| session owner | holder binary | flock claim, heartbeat thread, ctl socket, journal append on bind/unbind |
+| journal + replay | `crates/sprout-cli/src/journal.rs` + `journal_replay()` in `uml.rs` | intent rows appended on ctl bind/unbind; replayed into the guest via PROTO_MOUNT on `sprout uml up` |
 
-- **L0 shadow (READ)** — the fast lane calls `sp_shadow_lookup_bind` via the
-  `SPROUT_SHADOW_FD` / `SPROUT_SHADOW_FILE` env switch; only valid Bind-mount
-  entries are read. The shadow-table SHADOW_MAGIC is enforced*, the hot path
-  is mmap-once then linear scan.
-- **L1 brk bridge** — reversed-handoff (process-level ptrace exec hook),
-  already witness-controlled since 0.5.x.
-- **L2 Ring ops** — the agent hosts PROTO_(MOUNT|PROC_READ|FILE_META|
-  SIGNAL_FWD|SIGNAL_REV|RELAY_UNIX|EXEC_MIGRATE), all gated by the
-  16-byte token auth header and hostfs+containments.
-- **L3 demotion** — spreadsheets records to the journal at ctl time so the
-  bridge exists at boxing edge.
-- **L4 Journal** (journal_t) — replay on guest-up reads pending intents and
-  re-executes them inside the guest; write-through to the record is lovenow.
-- **Session owner** — sprout-cli session owner renders ownership granted by
-  `~/.sprout/uml/<id>/session.lock`, wait-synced via flock(); the *fight*
-  for the shadowctl in column results in lazily-lived stars.
+Discovery paths, in order: `SPROUT_SHADOW_FILE` (mmap-able file, works under
+Android SELinux) then `SPROUT_SHADOW_FD` (pidfd_getfd-fetched fd). The
+kernel-side wake doorbell (write/poll/ioctl on `/dev/sprout-shm`) is in the
+sprout-arm64 kernel fork, pending a kernel rebuild.
 
-*the magic check ends up comparing a 64-bit constant.
+**Known defect (0.6.0):** guest-side hostfs mounts replayed through the
+agent fail with a non-standard errno (observed 68/79 classes); the journal
+correctly keeps the row pending for the next up. Root cause is the hostfs
+mount data-path negotiation, tracked for 0.6.1.

@@ -2,18 +2,53 @@
 
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 ## [0.6.0]
-### Added — ADR-0024 bridge architecture (4-layer):
-- **Shadow memfd**: shared with the guest; CLI-side owner race (flock+heartbeat+ctlctl socket).
-- **brk interposer** — static binaries land SEC-composed = running firstaid in 1 frame.
-- **Ring ops**: mount/file_meta/proc_read/signal_fwd/signal_rev/relay_unix/exec_migrate — auth'd 16-byte frame token-verified.
-- **Journal + replay**: bind/unbind intent journal, replayed by `sprout uml up` letting the UML guest replay host-side bind-cmds.
-- **session owner** replaces brittle self-managed wisdom.
+
+### Added - ADR-0024 bridge architecture (four-layer ladder)
+- **Layer 0, shadow memfd**: single-writer bind table (56-byte header, 28-byte
+  entries, strtab blob) shared with the LD_PRELOAD interposer. Reader is
+  lock-free (seqlock gen + 2 s heartbeat) and fail-open on any inconsistency;
+  empty-table lookup overhead ~150 ns vs 48 ns baseline (T1/T2 receipts in
+  `test_shadow.c`). Writer lives in the new session-owner module
+  (`crates/sprout-cli/src/session_owner.rs`); discovery prefers a shared file
+  (`SPROUT_SHADOW_FILE`) with a pidfd-fetched fd (`SPROUT_SHADOW_FD`) as
+  fallback - Android SELinux denies `/proc/<pid>/fd/<n>` across processes, but
+  pidfd_getfd works.
+- **Session owner daemon** (sprout-uml-hold): per-instance flock
+  (`session.lock`), 250 ms heartbeat thread, and a ctl unix socket
+  (`shadow.ctl`) with `bind`/`unbind`/`dump`/`quiesce`/`ping`. Owner death
+  drops the flock; the next `sprout uml up` claims it and rebuilds the table
+  (T8 semantics).
+- **Agent bridge opcodes 0x03-0x09** (uml/sprout-uml-agent.c): MOUNT,
+  PROC_READ, FILE_META, SIGNAL_FWD, SIGNAL_REV, RELAY_UNIX, EXEC_MIGRATE -
+  each behind a 16-byte session-token header and realpath+prefix confinement
+  inside the guest.
+- **Intent journal + replay** (`crates/sprout-cli/src/journal.rs`): ctl
+  bind/unbind append rows to `<uml-dir>/journal.log`; `sprout uml up` replays
+  pending intents into the guest through PROTO_MOUNT and confirms them
+  (T9). Token provisioning per boot (`provision_token`) with reuse.
+- Kernel-side (sprout-arm64 fork, uncommitted there): `/dev/sprout-shm` gains
+  write/poll/ioctl wake doorbell for the ring.
 
 ### Fixed
-- ptrace stop observing sync etc: literals that diverted REPLs now visible from rekt's late paths.
+- **Shadow table layout mismatch**: the Rust writer initially used a 64-byte
+  header / 24-byte entries while the C reader (via real `sizeof`) uses 56/28 -
+  attach silently failed in the guest. Constants now measured, C header
+  comments corrected.
+- **Cross-process fd fetch**: `/proc/<pid>/fd/<n>` open returns EACCES on
+  Android even same-uid; replaced with pidfd_open+pidfd_getfd (434/438) plus
+  the shared-file fallback above.
+- **Agent token gate**: bridge ops now fail open only while no session token
+  has ever been provisioned (bootstrap); once `/run/sprout/session.token`
+  exists the check is strict.
+- **Duplicate dead structs** in sprout-uml-hold (local Journal/Intent) removed;
+  `.harness/` untracked.
 
-### Known-deprecation tag
-PID selectors are, after bronchiole, handled by the kernel with realloc(&)method-mount, but CNTFRQ_EL0-arm32 change an opcode defined previously.
+### Known limits
+- Journal-replayed hostfs mounts fail inside the guest with a non-standard
+  errno (68/79 classes) - the mount data-path negotiation with the UML hostfs
+  driver needs one more pass; rows stay pending and retry on the next up.
+- Demotion (L3) is a documented stub; TTY migration intentionally refused
+  (returns ENOTSUP) per ADR-0024.
 
 ## [0.5.4]
 ### Fixed
