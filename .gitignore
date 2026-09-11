@@ -14,3 +14,4 @@ crates/sprout-preload/csrc/libsprout-core-musl.so
 # per-run benchmark artifacts (kept on device, not published blobs)
 bench/results/
 uml/sprout-uml-agent
+.harness/
