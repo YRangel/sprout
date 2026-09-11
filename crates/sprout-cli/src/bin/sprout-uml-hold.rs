@@ -110,11 +110,13 @@ impl Ring {
 
 fn run() -> anyhow::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
-    if argv.len() != 3 {
-        anyhow::bail!("usage: sprout-uml-hold <physmem_fd> <ring.sock> (internal)");
+    if argv.len() < 3 || argv.len() > 4 {
+        anyhow::bail!("usage: sprout-uml-hold <physmem_fd> <ring.sock> [wake_wfd] (internal)");
     }
     let fdnum: i32 = argv[1].parse()?;
     let sock_path = std::path::PathBuf::from(&argv[2]);
+    // Optional ring-doorbell write end (host pipe -> guest wake IRQ).
+    let wake_wfd: i32 = argv.get(3).and_then(|s| s.parse().ok()).unwrap_or(-1);
 
     // SAFETY: fd handed over by the parent (sprout uml up) pre-exec.
     let physfd = unsafe { OwnedFd::from_raw_fd(fdnum) };
@@ -243,6 +245,11 @@ fn run() -> anyhow::Result<()> {
             std::ptr::write_volatile(ring.slot_hdr(i), FRAME_BUSY);
             // doorbell: host_seq publish is the release point
             std::ptr::write_volatile(&mut (*ring.hdr).host_seq, seq);
+            // wake the guest agent out of poll() — one byte is the bell
+            if wake_wfd >= 0 {
+                let b = [1u8; 1];
+                let _ = libc::write(wake_wfd, b.as_ptr() as *const libc::c_void, 1);
+            }
         }
 
         // wait for guest DONE

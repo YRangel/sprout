@@ -1206,6 +1206,21 @@ fn cmd_up(
     } else {
         None
     };
+    // Ring doorbell (ADR-0024 §8): host pipe, read-end = fd 4 in the
+    // guest (sprout_wake_fd=4), write-end stays for the holder. The guest
+    // kernel registers it as a fd-based IRQ; holder writes after posting
+    // a BUSY slot -> guest agent's poll() wakes instantly.
+    let wake_pipe: Option<(i32, i32)> = if shm {
+        let mut pfds = [-1i32; 2];
+        if unsafe { libc::pipe(pfds.as_mut_ptr()) } == 0 {
+            extra.push("sprout_wake_fd=4".to_string());
+            Some((pfds[0], pfds[1]))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let (bin, args) = build_cmdline(
         &uml_bin,
         &cow,
@@ -1231,6 +1246,20 @@ fn cmd_up(
         use anyhow::Context;
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
+        // A prior holder may have survived its guest (it holds no guest
+        // handle, so nothing reaps it). Its wake-doorbell pipe belongs to
+        // the DEAD boot — a new guest with a stale holder would post ring
+        // requests into a void. Kill the stale holder before spawning.
+        if let Ok(pid_s) = std::fs::read_to_string(dir.join("holder.pid")) {
+            if let Ok(pid) = pid_s.trim().parse::<i32>() {
+                unsafe { libc::kill(pid, 0) };
+                if unsafe { libc::kill(pid, 0) } == 0 {
+                    eprintln!("sprout uml: killing stale holder pid={pid} (fresh doorbell pipe)");
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
         let hold_bin = std::env::current_exe()?
             .parent()
             .map(|p| p.join("sprout-uml-hold"))
@@ -1240,15 +1269,25 @@ fn cmd_up(
             })?;
         let raw = fd.as_raw_fd();
         let ring_sock = dir.join("ring.sock");
+        let wake_wfd = wake_pipe.map(|(_, w)| w);
         let mut hc = std::process::Command::new(&hold_bin);
         hc.arg(raw.to_string()).arg(&ring_sock);
+        if let Some(w) = wake_wfd {
+            hc.arg(w.to_string());
+        }
         // SAFETY: pre_exec runs post-fork pre-exec in the child; only
-        // touches the two inherited fds (clear CLOEXEC on the memfd).
+        // touches inherited fds (clear CLOEXEC on the memfd + wake wfd).
         unsafe {
             hc.pre_exec(move || {
                 let fl = libc::fcntl(raw, libc::F_GETFD);
                 if fl >= 0 {
                     libc::fcntl(raw, libc::F_SETFD, fl & !libc::FD_CLOEXEC);
+                }
+                if let Some(w) = wake_wfd {
+                    let fl2 = libc::fcntl(w, libc::F_GETFD);
+                    if fl2 >= 0 {
+                        libc::fcntl(w, libc::F_SETFD, fl2 & !libc::FD_CLOEXEC);
+                    }
                 }
                 Ok(())
             });
@@ -1264,7 +1303,8 @@ fn cmd_up(
         std::mem::forget(hchild); // outlives the CLI, like the guest
     }
     let log = dir.join("uml.log");
-    let child = spawn_uml(&bin, &args, &log, shm_fd.as_ref())?;
+    let wake_rfd = wake_pipe.map(|(r, _)| r).unwrap_or(-1);
+    let child = spawn_uml(&bin, &args, &log, shm_fd.as_ref(), wake_rfd)?;
     std::fs::write(dir.join("pid"), child.id().to_string())?;
     std::fs::write(
         dir.join("conf"),
@@ -1375,9 +1415,12 @@ fn cmd_exec(
     };
     let (code, out, err) = {
         // Rung 3: ring.sock holder first (zero-copy shared physmem path).
+        // Healthy ring answers in ~50ms; cap the attempt at 3s so a guest
+        // whose agent lost the ring falls back to files quickly instead
+        // of blocking the caller for the full exec timeout.
         let ring_sock = dir.join("ring.sock");
         let ring_res = if ring_sock.exists() {
-            agent_exec_ring(&ring_sock, cmd, &env, &cwd, &[], timeout)
+            agent_exec_ring(&ring_sock, cmd, &env, &cwd, &[], timeout.min(Duration::from_secs(3)))
         } else {
             Err(anyhow::anyhow!("no ring"))
         };
@@ -1594,6 +1637,7 @@ pub fn spawn_uml(
     args: &[String],
     log: &std::path::Path,
     shm_fd: Option<&std::os::unix::io::OwnedFd>,
+    wake_rfd: i32,
 ) -> anyhow::Result<Child> {
     let logf = std::fs::OpenOptions::new()
         .create(true)
@@ -1662,6 +1706,21 @@ pub fn spawn_uml(
         // Keep our own copy alive for rung 3.1 (host-side mmap of guest
         // physmem). Leaked intentionally: lives until process exit.
         std::mem::forget(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(3) });
+    }
+    // Ring doorbell read-end -> guest fd 4 (sprout_wake_fd=4).
+    if wake_rfd >= 0 {
+        unsafe {
+            if wake_rfd != 4 {
+                if libc::dup2(wake_rfd, 4) < 0 {
+                    anyhow::bail!("dup2 wake rfd: {}", std::io::Error::last_os_error());
+                }
+                libc::close(wake_rfd);
+            }
+            let fl = libc::fcntl(4, libc::F_GETFD);
+            if fl >= 0 && (fl & libc::FD_CLOEXEC) != 0 {
+                libc::fcntl(4, libc::F_SETFD, fl & !libc::FD_CLOEXEC);
+            }
+        }
     }
     if std::env::var("SPROUT_UML_SPAWN_DEBUG").is_ok() {
         let dump = format!(

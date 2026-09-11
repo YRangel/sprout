@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pwd.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -138,9 +139,39 @@ static uint64_t sp_read_token(void) {
 #define RING_FRAME_DONE 2u
 #define RING_MAGIC 0x31525053u /* "SPR1" LE */
 
+static int g_ring_shm_fd = -1;
 static void *ring_map(void) {
-    int fd = open("/dev/sprout-shm", O_RDWR);
-    if (fd < 0) return NULL;
+    int fd = -1;
+    { int c = open("/dev/console", O_WRONLY); if (c >= 0) { dprintf(c, "[ring] map enter\n"); close(c); } }
+    /* devtmpfs node creation for misc devices is queued to a kernel worker
+     * and can lag the mini-profile boot by seconds — waiting is flaky, so
+     * on ENOENT we resolve the misc minor from /proc/misc and mknod a
+     * private node (idempotent, no dependency on devtmpfsd scheduling). */
+    for (int i = 0; i < 300 && fd < 0; i++) {
+        fd = open("/dev/sprout-shm", O_RDWR);
+        if (fd >= 0) break;
+        if (errno == ENOENT) {
+            int minor = -1;
+            FILE *m = fopen("/proc/misc", "r");
+            if (m) {
+                char name[128];
+                int mn;
+                while (fscanf(m, "%d %127s", &mn, name) == 2) {
+                    if (strcmp(name, "sprout-shm") == 0) { minor = mn; break; }
+                }
+                fclose(m);
+            }
+            if (minor >= 0) {
+                mknod("/dev/sprout-shm", S_IFCHR | 0600, makedev(10, minor));
+                continue; /* retry open immediately */
+            }
+        }
+        usleep(100 * 1000);
+    }
+    if (fd < 0) {
+        int c = open("/dev/console", O_WRONLY); if (c >= 0) { dprintf(c, "[ring] map gave up errno=%d\n", errno); close(c); }
+        return NULL;
+    }
     /* UML strips mem=/rw=/ncpus=... from /proc/cmdline (only unknown
      * args survive), so we cannot parse the RAM size from there; and
      * /proc/meminfo MemTotal is short by the kernel reserve. The
@@ -158,12 +189,16 @@ static void *ring_map(void) {
     void *r = mmap(NULL, RING_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED,
                    fd, off);
     if (r == MAP_FAILED) {
+        int e = errno;
         int c = open("/dev/console", O_WRONLY);
-        if (c >= 0) { dprintf(c, "[ring] mmap off=0x%llx errno=%d\n", off, errno); close(c); }
+        if (c >= 0) { dprintf(c, "[ring] mmap off=0x%llx errno=%d\n", off, e); close(c); }
+        FILE *df = fopen("/run/sprout/agent-debug.log", "a");
+        if (df) { fprintf(df, "ring: mmap off=0x%llx FAILED errno=%d\n", off, e); fclose(df); }
         close(fd);
         return NULL;
     }
-    close(fd);
+    /* keep fd open: ring_loop poll()s it for the host doorbell IRQ */
+    g_ring_shm_fd = fd;
     return r;
 }
 
@@ -863,9 +898,8 @@ static void ring_loop(void) {
     ring_log("loop enter", -1);
     uint8_t *base = ring_map();
     if (!base) {
-        ring_log("map FAILED errno", errno);
         FILE *df = fopen("/run/sprout/agent-debug.log", "a");
-        if (df) { fprintf(df, "ring: no /dev/sprout-shm, transport disabled\n"); fclose(df); }
+        if (df) { fprintf(df, "ring: no /dev/sprout-shm (open errno=%d), transport disabled\n", errno); fclose(df); }
         return;
     }
     uint32_t *hdr32 = (uint32_t *)base;
@@ -883,7 +917,7 @@ static void ring_loop(void) {
     }
     ring_log("attached magic ok", -1);
     uint32_t last_seen = 0;
-    int idle_us = 1000;
+    int idle_ms = 1;
     for (;;) {
         uint32_t host_seq = __atomic_load_n(&hdr32[2], __ATOMIC_ACQUIRE);
         if (host_seq != last_seen) {
@@ -894,14 +928,27 @@ static void ring_loop(void) {
                 uint8_t *hdr = base + RING_HDR_PAGE + i * RING_SLOT_HDR;
                 if (ring_rd32(hdr) == RING_FRAME_BUSY) {
                     ring_handle_slot(base, i);
-                    idle_us = 1000; /* hot */
+                    idle_ms = 1; /* hot */
                 }
             }
             last_seen = host_seq;
             continue;
         }
-        if (idle_us < 4000) idle_us *= 2;
-        usleep((useconds_t)idle_us);
+        /* doorbell-driven idle: poll the shm fd (host pipe IRQ rings the
+         * bell); fall back to a bounded timeout as safety. Drain the
+         * pending counter on EPOLLIN. */
+        if (g_ring_shm_fd >= 0) {
+            struct pollfd pfd = { .fd = g_ring_shm_fd, .events = POLLIN };
+            int r = poll(&pfd, 1, idle_ms);
+            if (r > 0 && (pfd.revents & POLLIN)) {
+                uint64_t tmp[2];
+                if (read(g_ring_shm_fd, tmp, sizeof tmp) == (ssize_t)sizeof tmp && tmp[1] > 0)
+                    idle_ms = 1;
+            }
+        } else {
+            usleep((useconds_t)idle_ms * 1000);
+        }
+        if (idle_ms < 64) idle_ms *= 2;
     }
 }
 
