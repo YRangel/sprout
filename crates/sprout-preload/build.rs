@@ -27,7 +27,11 @@ fn main() {
     for f in [
         "csrc/sprout_preload.c",
         "csrc/sprout_preload.h",
+        "csrc/sprout_shadow.c",
+        "csrc/sprout_shadow.h",
+        "csrc/sprout_shadow_owner.c",
         "csrc/tests/test_translate.c",
+        "csrc/tests/test_shadow.c",
     ] {
         println!("cargo:rerun-if-changed={f}");
     }
@@ -43,11 +47,27 @@ fn main() {
         .arg("-o")
         .arg(&test_bin)
         .arg("csrc/tests/test_translate.c")
-        .arg("csrc/sprout_preload.c");
+        .arg("csrc/sprout_preload.c")
+        .arg("csrc/sprout_shadow.c");
     run(test_cmd, "translate unit tests");
     println!(
         "cargo:rustc-env=SPROUT_TRANSLATE_TEST_BIN={}",
         test_bin.display()
+    );
+
+    let shadow_test_bin = out_dir.join("sp_shadow_test");
+    let mut shadow_cmd = cc_tool.to_command();
+    compiler_flags(&mut shadow_cmd);
+    shadow_cmd
+        .arg("-o")
+        .arg(&shadow_test_bin)
+        .arg("csrc/tests/test_shadow.c")
+        .arg("csrc/sprout_shadow.c")
+        .arg("csrc/sprout_shadow_owner.c");
+    run(shadow_cmd, "shadow unit tests");
+    println!(
+        "cargo:rustc-env=SPROUT_SHADOW_TEST_BIN={}",
+        shadow_test_bin.display()
     );
 
     // --- 2. the shipping artifact: libsprout-core.so (glibc hosts only) ---
@@ -81,6 +101,7 @@ fn main() {
         .arg("-o")
         .arg(&so_path)
         .arg("csrc/sprout_preload.c")
+        .arg("csrc/sprout_shadow.c")
         .arg("-ldl");
     run(so_cmd, "libsprout-core.so");
 

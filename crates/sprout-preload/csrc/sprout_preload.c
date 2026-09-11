@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #endif
 #include "sprout_preload.h"
+#include "sprout_shadow.h"
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -805,6 +806,59 @@ static __thread char t_xf_dir[SP_PATH_MAX];
 static __thread char t_xf_tmp[SP_PATH_MAX];
 static __thread char t_xf_lnk[SP_PATH_MAX];
 static __thread char t_xf_back[SP_PATH_MAX];
+
+/* ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ ADR-0024 L0 */
+/* Shadow mount table: a small memfd created by the SUPEVISOR session
+ * (`sprout uml run`/holder) and inherited read-only by every fast-lane
+ * process via SPROUT_SHADOW_FD. All reads here are mmap + integer math —
+ * no syscalls, no locks, no allocations. Fail-open by design: any CRC,
+ * seqlock or heartbeat inconsistency means treat as "no entries".      */
+static int              g_shadow_fd = -1;
+static int              g_shadow_tried;
+static sp_shadow_snap_t g_shadow_snap;
+
+static void sp_shadow_init_once(void) {
+    if (g_shadow_tried) return;
+    g_shadow_tried = 1;
+    {
+        const char *sf = getenv("SPROUT_SHADOW_FILE");
+        if (sf && *sf) {
+            int fd = open(sf, O_RDONLY);
+            if (fd >= 0) {
+                if (sp_shadow_attach(fd, &g_shadow_snap) == 0) {
+                    g_shadow_fd = fd;
+                    goto out;
+                }
+                close(fd);
+            }
+        }
+    }
+    {
+        const char *e = getenv("SPROUT_SHADOW_FD");
+        if (!e) goto out;
+        char *end = NULL;
+        long fd = strtol(e, &end, 10);
+        if (end && *end && fd >= 3 && fd < 4096 &&
+            sp_shadow_attach((int)fd, &g_shadow_snap) == 0)
+            g_shadow_fd = (int)fd;
+    }
+out:
+    if (getenv("SPROUT_DEBUG"))
+        fprintf(stderr, "[sprout-shadow] init fd=%d attach=%s\n",
+                g_shadow_fd, g_shadow_fd >= 0 ? "ok" : "FAIL");
+}
+
+/* Rewrite a guest path through live BIND_MOUNT entries. Produces a
+ * guest-namespace path on success — NOT a host path; normal
+ * sp_translate_f() continues from the result. No shadow table, no
+ * matches, or torn generation all return -1 (fast-abort).            */
+static int sp_shadow_rewrite(const char *path, char dst[SP_PATH_MAX]) {
+    sp_shadow_init_once();
+    if (g_shadow_fd < 0) return -1;
+    if (!sp_shadow_live(&g_shadow_snap)) return -1;
+    return sp_shadow_lookup_bind(&g_shadow_snap, path, dst, SP_PATH_MAX);
+}
+
 /* -Wreturn-local-addr false-positive: every return path carries either
  * caller storage (path/buf) or `buf`; `joined` only flows into buf via
  * memcpy. GCC's points-to for the array params can't prove that. */
@@ -814,6 +868,15 @@ static __thread char t_xf_back[SP_PATH_MAX];
 #endif
 static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int follow_final) {
     if (!path) { errno = EFAULT; return NULL; }
+
+    /* ++++++++++++++++++ ADR-0024 layer-0: shadow dynamic-mount rewrite. */
+    /* Only meaningful when the supervisor actualy has mounts on the     */
+    /* table. We do it BEFORE cwd joining: BIND_MOUNT entries are absolute */
+    /* guest paths only (mount(2) only takes absolutes or expands itself).*/
+    char shadow_buf[SP_PATH_MAX];
+    if (path[0] == '/' && sp_shadow_rewrite(path, shadow_buf) == 0)
+        path = shadow_buf;
+
     /* Relative paths: hang onto the real cwd in HOST view, then run the
      * normal absolute translation (apk's db-write mix of absolute charm +
      * relative journal journaling across mixed cwd changes lands at the
