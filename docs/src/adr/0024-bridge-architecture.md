@@ -3,8 +3,9 @@
 ## Status
 
 Implemented in 0.6.0: layers L0-L2 and the session-owner/journal plumbing
-landed and gate-tested; L3 (demotion) ships as a documented stub; the guest
-hostfs-mount replay path is wired but has one known defect (see 0.6.0 notes).
+landed and gate-tested; L3 (demotion) ships as a documented stub. 0.6.1:
+the guest hostfs-mount replay path is fixed end-to-end and journal mounts
+are durable (see CHANGELOG 0.6.1 for the six root causes).
 
 ## Context
 
@@ -378,7 +379,16 @@ Android SELinux) then `SPROUT_SHADOW_FD` (pidfd_getfd-fetched fd). The
 kernel-side wake doorbell (write/poll/ioctl on `/dev/sprout-shm`) is in the
 sprout-arm64 kernel fork, pending a kernel rebuild.
 
-**Known defect (0.6.0):** guest-side hostfs mounts replayed through the
-agent fail with a non-standard errno (observed 68/79 classes); the journal
-correctly keeps the row pending for the next up. Root cause is the hostfs
-mount data-path negotiation, tracked for 0.6.1.
+**Resolved in 0.6.1:** the hostfs-mount replay defect is fixed end-to-end
+(journal bind -> down -> up -> guest mount visible with host content).
+Six stacked root causes: (1) mount data must be share-relative (fsconfig-era
+hostfs appends monolithic data to the `hostfs=` boot root); (2) a ring
+socketpair echo bug returned the request as the response; (3) mount(2) could
+wedge the single-threaded ring server (now fork+waitpid); (4) the response
+capture loop never saw EOF (sv[1] now closed post-handler); (5) destination
+confinement rejected guest mountpoints (kernel `hostfs=` already confines
+the host path); (6) the CLI misparsed the holder's `[u32 total_len]` frame
+wrapper as the status byte (phantom EIO=5). Journal semantics also changed:
+mount rows are durable (re-applied every boot, consumed only by unbind),
+the holder seeds the shadow table from journal rows at start, and re-bind
+is replace semantics. See CHANGELOG 0.6.1.

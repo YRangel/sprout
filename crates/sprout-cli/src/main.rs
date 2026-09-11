@@ -772,7 +772,10 @@ fn run() -> Result<u8, Error> {
 
     /* Force the actual pre_exec: sprout-super spawns the guest loader with
      * pre_exec that dup2s this fd into the child, CLOEXEC cleared.        */
-    if let Some(fd) = plan.env.iter().position(|(k, _)| k == "SPROUT_SHADOW_FD")
+    if let Some(fd) = plan
+        .env
+        .iter()
+        .position(|(k, _)| k == "SPROUT_SHADOW_FD")
         .map(|i| plan.env[i].1.clone())
     {
         let fd: i32 = fd.parse().unwrap_or(-1);
@@ -850,7 +853,10 @@ fn run() -> Result<u8, Error> {
     }
     /* Force the actual pre_exec: sprout-super spawns the guest loader with
      * pre_exec that dup2s this fd into the child, CLOEXEC cleared.        */
-    if let Some(fd) = plan.env.iter().position(|(k, _)| k == "SPROUT_SHADOW_FD")
+    if let Some(fd) = plan
+        .env
+        .iter()
+        .position(|(k, _)| k == "SPROUT_SHADOW_FD")
         .map(|i| plan.env[i].1.clone())
     {
         let fd: i32 = fd.parse().unwrap_or(-1);

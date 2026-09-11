@@ -21,19 +21,19 @@
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::io::{FromRawFd, OwnedFd};
-use std::sync::atomic::{fence, Ordering};
-use std::time::{Duration, Instant};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{fence, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
-#[path = "../session_owner.rs"]
-mod session_owner;
 #[path = "../journal.rs"]
 mod journal;
-use session_owner::{Shadow, acquire_lock, write_state};
+#[path = "../session_owner.rs"]
+mod session_owner;
 use journal::Journal;
+use session_owner::{acquire_lock, write_state, Shadow};
 
 static ctl_journal: std::sync::OnceLock<Journal> = std::sync::OnceLock::new();
 
@@ -181,9 +181,33 @@ fn run() -> anyhow::Result<()> {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     let _lock = acquire_lock(&uml_dir)?;
-    let shadow = Arc::new(Mutex::new(Shadow::create_file(&uml_dir, session_owner::DEFAULT_CAP)?));
-    write_state(&uml_dir, shadow.lock().unwrap().as_raw_fd())?;
+    let shadow = Arc::new(Mutex::new(Shadow::create_file(
+        &uml_dir,
+        session_owner::DEFAULT_CAP,
+    )?));
     let _ = ctl_journal.set(Journal::open(&uml_dir));
+    /* Seed the shadow table from durable journal mount rows: binds are
+     * persistent state, re-applied to the guest on every `up`, so the L0
+     * table must survive holder restarts too. Row shape:
+     * args = [shadow_src, dst, fstype, flags, hostsrc]. */
+    if let Some(j) = ctl_journal.get() {
+        if let Ok(rows) = j.pending() {
+            let mut sh = shadow.lock().unwrap();
+            let mut seeded = 0usize;
+            for r in &rows {
+                if r.op == "mount" && r.args.len() >= 2 {
+                    if sh.add_bind(&r.args[1], &r.args[0]).is_ok() {
+                        seeded += 1;
+                    }
+                }
+            }
+            if seeded > 0 {
+                sh.commit();
+                eprintln!("sprout-uml-hold: seeded {seeded} shadow binds from journal");
+            }
+        }
+    }
+    write_state(&uml_dir, shadow.lock().unwrap().as_raw_fd())?;
 
     let hb_shadow = Arc::clone(&shadow);
     let hb_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -305,49 +329,63 @@ fn ctl_handle(s: &mut UnixStream, shadow: &Arc<Mutex<Shadow>>) -> std::io::Resul
                 {
                     let mut sh = shadow.lock().unwrap();
                     match sh.add_bind(dst, src) {
-                        Ok(i) => { sh.commit(); writeln!(s2, "ok {i}")?; }
+                        Ok(i) => {
+                            sh.commit();
+                            writeln!(s2, "ok {i}")?;
+                        }
                         Err(e) => writeln!(s2, "err {e}")?,
                     }
                 }
-                /* Journal the intent — replay handles guest-side mount on
-                 * the next `sprout uml up` (T9). Logged AFTER the shadow
-                 * commit so a crash between them replays a noop anyway.  */
+                /* Journal the bind as DURABLE state — replayed on every
+                 * `sprout uml up` (the guest mount table is per-boot), and
+                 * consumed only by a matching unbind. Logged AFTER the shadow
+                 * commit so a crash between them replays a noop anyway.
+                 * JOURNAL args shape (replay + holder seeding understand):
+                 *   arg[0]=shadow src (guest path for the L0 table; "none"
+                 *          if empty — replay passes "none" as the decorative
+                 *          hostfs mount source)
+                 *   arg[1]=dst       (guest mount point)
+                 *   arg[2]=fstype
+                 *   arg[3]=flags     (int64)
+                 *   arg[4]=data      (hostfs path: RELATIVE to the share dir)
+                 */
+                let hostsrc_abs: String = {
+                    let hs = parts.next().unwrap_or("");
+                    hs.into() // relative — replay maps
+                };
                 if let Some(j) = ctl_journal.get() {
-                    /* JOURNAL args shape (replay understands):
-                     *   arg[0]=src       (empty => "none")
-                     *   arg[1]=dst       (guest mount point)
-                     *   arg[2]=fstype
-                     *   arg[3]=flags     (int64)
-                     *   arg[4]=data      (hostfs path: RELATIVE to the
-                     *                     share dir, or ABSOLUTE path in the
-                     *                     guest's hostfs view like
-                     *                     "/run/sprout/share/..." which we
-                     *                     pass through unchanged)         
-                     */
-                    let hostsrc_abs = {
-                        let hs = parts.next().unwrap_or("");
-                        if hs.is_empty() { "".into() }
-                        else if hs.starts_with('/') { hs.into() }
-                        else { hs.into() }  // relative — replay maps
-                    };
-                    let _ = j.append(&journal::Row {
-                        intent: true,
-                        op: "mount".into(),
-                        args: vec![
-                            if src.is_empty() { "none".into() } else { src.into() },
-                            dst.into(),
-                            "hostfs".into(),
-                            "0".into(),
-                            hostsrc_abs,
-                        ],
-                    });
+                    if hostsrc_abs.is_empty() {
+                        /* pure L0 shadow bind — no guest-side mount wanted
+                         * (a row with empty data would mount the hostfs
+                         * ROOT at dst). */
+                    } else {
+                        /* re-bind = replace: drop any prior row for this dst */
+                        let _ = j.drop_mount_by_dst(dst);
+                        let _ = j.append(&journal::Row {
+                            intent: true,
+                            op: "mount".into(),
+                            args: vec![
+                                if src.is_empty() {
+                                    "none".into()
+                                } else {
+                                    src.into()
+                                },
+                                dst.into(),
+                                "hostfs".into(),
+                                "0".into(),
+                                hostsrc_abs,
+                            ],
+                        });
+                    }
                 }
             }
             "unbind" => {
                 let dst = parts.next().unwrap_or("");
                 let mut sh = shadow.lock().unwrap();
-                let idx = sh.list_binds()
-                    .iter().position(|(d, _, _)| d == dst)
+                let idx = sh
+                    .list_binds()
+                    .iter()
+                    .position(|(d, _, _)| d == dst)
                     .map(|i| i as u32);
                 if let Some(i) = idx {
                     sh.mark_state(i, session_owner::S_REMOVED)?;
@@ -357,6 +395,10 @@ fn ctl_handle(s: &mut UnixStream, shadow: &Arc<Mutex<Shadow>>) -> std::io::Resul
                     writeln!(s2, "err not found")?;
                 }
                 if let Some(j) = ctl_journal.get() {
+                    /* consume the durable mount row, then journal the
+                     * one-shot umount intent (applied no-op on next boot's
+                     * fresh guest, or live if the guest is running). */
+                    let _ = j.drop_mount_by_dst(dst);
                     let _ = j.append(&journal::Row {
                         intent: true,
                         op: "umount".into(),
@@ -379,7 +421,7 @@ fn ctl_handle(s: &mut UnixStream, shadow: &Arc<Mutex<Shadow>>) -> std::io::Resul
                 writeln!(s2, "ok")?;
             }
             "ping" => writeln!(s2, "ok")?,
-            _      => writeln!(s2, "err unknown op")?,
+            _ => writeln!(s2, "err unknown op")?,
         }
     }
     Ok(())

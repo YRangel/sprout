@@ -322,15 +322,23 @@ fn agent_bridge_op_ring(
     conn.write_all(&body)?;
     conn.flush()?;
     conn.set_read_timeout(Some(timeout))?;
-    let mut hdr = [0u8; 5];
-    conn.read_exact(&mut hdr)
+    /* Wire shape (holder transport): [u32 total_len][agent frame], where the
+     * agent frame itself is [u8 status][u32 payload_len][payload]. Read the
+     * outer frame first, then parse the agent frame from inside it. */
+    let mut lb = [0u8; 4];
+    conn.read_exact(&mut lb)
         .context("ring: no bridge-op reply")?;
-    let plen = u32::from_le_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
-    if plen > 0 {
-        let mut pay = vec![0u8; plen];
-        let _ = conn.read_exact(&mut pay);
+    let total = u32::from_le_bytes(lb) as usize;
+    if total < 5 || total > (1 << 20) {
+        anyhow::bail!("ring: malformed bridge-op reply (len {total})");
     }
-    Ok(hdr[0])
+    let mut frame = vec![0u8; total];
+    conn.read_exact(&mut frame)
+        .context("ring: truncated bridge-op reply")?;
+    let status = frame[0];
+    let plen = u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+    let _ = plen; // payload already consumed inside `frame`
+    Ok(status)
 }
 
 /// Replay the intent journal into a freshly booted guest (T9). Best-effort:
@@ -362,18 +370,23 @@ fn journal_replay(dir: &std::path::Path) {
         return;
     }
     let token = token.unwrap();
+    /* the ring must actually ANSWER before we fire mount ops at it: the
+     * guest agent's ring_loop attaches a moment after the files transport
+     * goes live, and a bridge op posted earlier wedges the holder for its
+     * full 60s timeout. Probe with PING first. */
+    if !ring_ping(&ring, Duration::from_secs(3)) {
+        eprintln!("sprout: journal replay skipped (ring not answering yet) — will retry next up");
+        return;
+    }
     let mut applied = 0usize;
+    let mut consumed = 0usize;
     let mut failed = 0usize;
     for row in &pending {
         match row.op.as_str() {
             "mount" if row.args.len() >= 2 => {
                 let (src, dst) = (row.args[0].clone(), row.args[1].clone());
                 let fstype = row.args.get(2).cloned().unwrap_or_default();
-                let mflags: u64 = row
-                    .args
-                    .get(3)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+                let mflags: u64 = row.args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
                 let data = row.args.get(4).cloned().unwrap_or_default();
                 let mdata = hostfs_to_guest(dir, &data).unwrap_or_default();
                 let _ = agent_exec_files(
@@ -388,23 +401,33 @@ fn journal_replay(dir: &std::path::Path) {
                     &[],
                     Duration::from_secs(10),
                 );
-                let st = agent_bridge_op_ring(
-                    &ring,
-                    token,
-                    0,
-                    &src,
-                    &dst,
-                    &fstype,
-                    mflags,
-                    &mdata,
-                    Duration::from_secs(10),
-                );
+                let mut st = Err(anyhow::anyhow!("not attempted"));
+                for attempt in 0..3u32 {
+                    if attempt > 0 {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    st = agent_bridge_op_ring(
+                        &ring,
+                        token,
+                        0,
+                        "none", // mount source is decorative for hostfs
+                        &dst,
+                        &fstype,
+                        mflags,
+                        &mdata,
+                        Duration::from_secs(10),
+                    );
+                    if matches!(st, Ok(0) | Ok(16) | Ok(17)) {
+                        break;
+                    }
+                }
                 match st {
                     Ok(0) | Ok(16) | Ok(17) | Ok(68) => {
-                        // 0=ok; EBUSY/EALREADY/EADDRINUSE = already mounted
-                        // (idempotent retry across holds; at/near mount
-                        // collision, the table row state is "done")
-                        let _ = j.confirm("mount", &row.args);
+                        // 0=ok; EBUSY/EALREADY/EADDRINUSE = already mounted.
+                        // Mount rows are DURABLE state: they stay in the
+                        // journal and are re-applied on every boot (the
+                        // guest mount table is per-boot). Only an unbind
+                        // consumes them.
                         applied += 1;
                     }
                     Ok(e) => {
@@ -432,9 +455,12 @@ fn journal_replay(dir: &std::path::Path) {
                 );
                 match st {
                     Ok(0) | Ok(2) | Ok(22) => {
-                        // 0=ok; ENOENT/EINVAL = already unmounted
+                        // 0=ok; ENOENT/EINVAL = already unmounted. Consume
+                        // the one-shot umount row AND the durable mount row
+                        // for this dst (if any survived).
                         let _ = j.confirm("umount", &row.args);
-                        applied += 1;
+                        let _ = j.drop_mount_by_dst(&dst);
+                        consumed += 1;
                     }
                     Ok(e) => {
                         eprintln!("sprout: replay umount {dst}: errno {e}");
@@ -451,10 +477,7 @@ fn journal_replay(dir: &std::path::Path) {
             }
         }
     }
-    println!(
-        "sprout: journal replay: {applied} applied, {failed} failed ({} pending)",
-        pending.len()
-    );
+    println!("sprout: journal replay: {applied} mounts live, {consumed} consumed, {failed} failed");
 }
 
 fn read_token(dir: &std::path::Path) -> Option<u64> {
@@ -466,16 +489,52 @@ fn read_token(dir: &std::path::Path) -> Option<u64> {
     u64::from_str_radix(s, 16).ok()
 }
 
-/// hostfs wire convention: paths are of the form "hostfs/<x>" where "<x>"
-/// is the name of a dir under the host mount-point root. Wire replication
-/// maps it to the GUEST-visible point /run/sprout/<x>, creates the dir
-/// in the guest hostfs if needed.
-fn hostfs_to_guest(dir: &std::path::Path, wire_path: &str) -> Option<String> {
-    if wire_path.is_empty() || wire_path.starts_with("/run/sprout") {
-        return Some(wire_path.into());
+/// ring health probe: PING (op 0x00) needs no auth and echoes 1 byte.
+fn ring_ping(ring_sock: &std::path::Path, timeout: Duration) -> bool {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let Ok(mut conn) = UnixStream::connect(ring_sock) else {
+        return false;
+    };
+    let body = [0u8; 1];
+    if conn
+        .write_all(&(body.len() as u32).to_le_bytes())
+        .and_then(|_| conn.write_all(&body))
+        .and_then(|_| conn.flush())
+        .is_err()
+    {
+        return false;
     }
-    let mut rest = wire_path.strip_prefix("hostfs/").unwrap_or(wire_path).trim_start_matches('/').to_string();
-    Some(format!("/run/sprout/{rest}"))
+    let _ = conn.set_read_timeout(Some(timeout));
+    let mut hdr = [0u8; 4];
+    if conn.read_exact(&mut hdr).is_err() {
+        return false;
+    }
+    let n = u32::from_le_bytes(hdr) as usize;
+    if n == 0 || n > 4096 {
+        return false;
+    }
+    let mut pay = [0u8; 4096];
+    conn.read_exact(&mut pay[..n]).is_ok() && pay[0] == 0
+}
+
+/// hostfs wire convention: the journal's mount `data` field is relative
+/// to the hostfs ROOT (the boot-time hostfs= dir, mounted at /run/sprout
+/// in the guest). hostfs_parse_monolithic appends data verbatim to that
+/// root, so "/x" means <hostfs-root>/x. Any of these ctl shapes map to it:
+///   "hostfs/x", "/run/sprout/x", "/x", "x"  ->  "/x"
+fn hostfs_to_guest(_dir: &std::path::Path, wire_path: &str) -> Option<String> {
+    if wire_path.is_empty() {
+        return Some(String::new());
+    }
+    let mut p = wire_path;
+    if let Some(r) = p.strip_prefix("hostfs/") {
+        p = r;
+    }
+    if let Some(r) = p.strip_prefix("/run/sprout") {
+        p = r;
+    }
+    Some(format!("/{}", p.trim_start_matches('/')))
 }
 
 /// Host-side hostfs path for the agent bridge: the hostfs mount planted at
@@ -483,7 +542,9 @@ fn hostfs_to_guest(dir: &std::path::Path, wire_path: &str) -> Option<String> {
 fn hostfs_share(dir: &std::path::Path) -> Option<String> {
     let s = std::fs::read_to_string(dir.join("hostfs-share")).ok()?;
     let s = s.trim();
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
     Some(s.to_string())
 }
 
@@ -526,8 +587,7 @@ fn provision_token(
     // One-shot per up() — use the files transport unconditionally (ring
     // framing on the mini profile has a scheduled-for-fix quirk, and this
     // path is never hot).
-    let res = agent_exec_files(share, &cmd, &[], "/", &[], Duration::from_secs(10))
-        .map(|_| ());
+    let res = agent_exec_files(share, &cmd, &[], "/", &[], Duration::from_secs(10)).map(|_| ());
     if let Err(e) = res {
         eprintln!("sprout: token provisioning failed: {e:#}");
         let _ = std::fs::remove_file(dir.join("token"));
@@ -1420,7 +1480,14 @@ fn cmd_exec(
         // of blocking the caller for the full exec timeout.
         let ring_sock = dir.join("ring.sock");
         let ring_res = if ring_sock.exists() {
-            agent_exec_ring(&ring_sock, cmd, &env, &cwd, &[], timeout.min(Duration::from_secs(3)))
+            agent_exec_ring(
+                &ring_sock,
+                cmd,
+                &env,
+                &cwd,
+                &[],
+                timeout.min(Duration::from_secs(3)),
+            )
         } else {
             Err(anyhow::anyhow!("no ring"))
         };

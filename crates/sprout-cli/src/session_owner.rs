@@ -53,9 +53,8 @@ impl Shadow {
         if (HDR_SIZE + cap as usize * ENTRY_SIZE) >= MAP_SIZE / 2 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cap too large"));
         }
-        let fd = unsafe {
-            libc::syscall(libc::SYS_memfd_create, b"sprout-shadow\0".as_ptr(), 0u32)
-        };
+        let fd =
+            unsafe { libc::syscall(libc::SYS_memfd_create, b"sprout-shadow\0".as_ptr(), 0u32) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -100,14 +99,21 @@ impl Shadow {
             return Err(io::Error::last_os_error());
         }
         let map = map as *mut u8;
-        let sh = Shadow { fd, map, strtab_len: 0 };
+        let sh = Shadow {
+            fd,
+            map,
+            strtab_len: 0,
+        };
         unsafe {
             sh.w64(HDR_MAGIC, MAGIC);
             sh.w64(HDR_GEN, 1); // odd: not yet published
             sh.w64(HDR_HEARTBEAT, mono_ns());
             sh.w32(HDR_COUNT, 0);
             sh.w64(HDR_CAP, cap as u64);
-            sh.w64(HDR_STRTAB_OFF, (HDR_SIZE + cap as usize * ENTRY_SIZE) as u64);
+            sh.w64(
+                HDR_STRTAB_OFF,
+                (HDR_SIZE + cap as usize * ENTRY_SIZE) as u64,
+            );
             sh.w64(HDR_STRTAB_LEN, 0);
         }
         Ok(sh)
@@ -128,6 +134,9 @@ impl Shadow {
     unsafe fn r64(&self, off: usize) -> u64 {
         std::ptr::read_volatile(self.map.add(off) as *const u64)
     }
+    unsafe fn r8(&self, off: usize) -> u8 {
+        std::ptr::read_volatile(self.map.add(off))
+    }
     unsafe fn r32(&self, off: usize) -> u32 {
         std::ptr::read_volatile(self.map.add(off) as *const u32)
     }
@@ -145,7 +154,25 @@ impl Shadow {
     /// `commit()` to publish.
     pub fn add_bind(&mut self, dst: &str, src: &str) -> io::Result<u32> {
         if !dst.starts_with('/') || !src.starts_with('/') {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "paths must be absolute"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "paths must be absolute",
+            ));
+        }
+        /* replace semantics: tombstone any live entry for the same dst, so
+         * re-binds don't leave duplicate (shadowing) rows behind. */
+        for i in 0..self.count() {
+            let e = HDR_SIZE + i as usize * ENTRY_SIZE;
+            let (t, s) = unsafe { (self.r8(e), self.r8(e + 1)) };
+            if t != T_BIND || s != S_VALID {
+                continue;
+            }
+            let (doff, dlen) = unsafe { (self.r32(e + 12) as usize, self.r32(e + 16) as usize) };
+            let base = self.strtab_base();
+            let cur = unsafe { std::slice::from_raw_parts(self.map.add(base + doff), dlen) };
+            if cur == dst.as_bytes() {
+                unsafe { self.w8(e + 1, S_REMOVED) };
+            }
         }
         let count = self.count();
         let cap = unsafe { self.r64(HDR_CAP) } as u32;

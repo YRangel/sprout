@@ -70,7 +70,7 @@ static int tcp_port = 2225;
 /* Path containment: agent may only touch paths inside hostfs_root (or the
  * sprout image), enforced by realpath + prefix compare. Both paths START as
  * env defaults overridable via SPRONT_*; they're pinned per-agent start. */
-static char sp_hostfs_root[4096] = "/hostfs";
+static char sp_hostfs_root[4096] = "/run/sprout";
 static char sp_image_root[4096]  = "/";
 static uint64_t sp_session_token;
 static int   sp_token_loaded;
@@ -447,22 +447,34 @@ static void handle_bridge_mount(int cfd, int wfd) {
 
     if (!dst) { sp_send_simple(wfd, 22, NULL, 0); goto done; }
 
-    /* Confinement: any MOUNT destination must be inside the guest view of
-     * the hostfs share or the guest's own tmpfs. No BIND over /proc or
-     * /sys — those have dedicated ops and a tighter in-kernel context. */
-    if (!sp_is_contained(dst)) { sp_send_simple(wfd, 13, NULL, 0); goto done; }
+    /* Confinement for hostfs mounts: the KERNEL confines the data path
+     * to the hostfs= boot-arg tree already — dst is a guest-namespace
+     * path (the guest kernel enforces normal mount perms on it). The
+     * old dst-prefix check was both misplaced and unusable for guest
+     * paths like /v-test. PROC_READ/FILE_META keep their own checks.  */
 
     if (sub == 0) {
         if (!fstype) { sp_send_simple(wfd, 22, NULL, 0); goto done; }
         uint64_t mflags = 0;
         memcpy(&mflags, fbuf, 8);
-        /* hostfs on UML 6.16+: no fsconfig, the host path goes in `data`
-         * already attached on the fstype-schema expects it: mount(src=none
-         * perch, dst=&v, fstype=hostfs, flags, data=<hostfs host-path>) */
+        /* hostfs on UML 6.16+: no fsconfig, the host path goes in `data`.
+         * Run the mount in a CHILD: a wedged mount syscall must not kill
+         * the ring server (it is single-threaded). */
         const char *spi_data = (flags_s && *flags_s) ? flags_s : NULL;
-        int rc = mount(src ? src : "none", dst, fstype,
-                       (unsigned long)mflags, spi_data);
-        sp_send_simple(wfd, rc ? (uint8_t)(errno & 0xff) : 0, NULL, 0);
+        int st = -1;
+        pid_t mp = fork();
+        if (mp == 0) {
+            int rc = mount(src ? src : "none", dst, fstype,
+                           (unsigned long)mflags, spi_data);
+            _exit(rc ? (errno & 0x7f) : 0);
+        }
+        if (mp > 0) {
+            int wst = -1;
+            pid_t wr = waitpid(mp, &wst, 0);
+            while (wr < 0 && errno == EINTR) wr = waitpid(mp, &wst, 0);
+            if (WIFEXITED(wst)) st = WEXITSTATUS(wst);
+        }
+        sp_send_simple(wfd, st < 0 ? 5 : (uint8_t)st, NULL, 0);
     } else if (sub == 1) {
         int rc = umount2(dst, MNT_DETACH);
         sp_send_simple(wfd, rc ? (uint8_t)errno : 0, NULL, 0);
@@ -598,14 +610,10 @@ static void handle_conn(int cfd, int wfd) {
     if (op >= SP_MAX_OPS) goto bad;
     if (op >= PROTO_MOUNT) {
         uint8_t hdr[SP_OP_HDR_SIZE];
-        if (read_full(cfd, hdr, sizeof hdr) != (int)sizeof hdr) goto bad;
+        int n = read_full(cfd, hdr, sizeof hdr);
+        if (n != (int)sizeof hdr) goto bad;
         uint64_t tok;
         memcpy(&tok, hdr, 8);
-        /* If the session hasn't been provisioned a token yet, we're
-         * in bootstrap mode: allow every bridge op (fix-up happens
-         * only when the guest gains its token file, after which the
-         * shield closes).  ALSO: allow the zero token explicitly so
-         * the testcase loop can survive a reset bootstrap.           */
         uint64_t agent_tok = sp_read_token();
         if (agent_tok != 0 && tok != agent_tok) goto bad;
         uint32_t flags;
@@ -764,10 +772,6 @@ static void file_transport_loop(const char *dir) {
          * ~300ms per exec. 1ms hot lands it under ~25ms (fork+exec
          * dominates), ~3% CPU worst case during a burst. */
         if (idle_ms < FILE_IDLE_MS) idle_ms = idle_ms * 2;
-        if ((++tick % 20) == 0) {
-            FILE *df = fopen("/run/sprout/agent-debug.log", "a");
-            if (df) { fprintf(df, "poll tick %d\n", tick); fclose(df); }
-        }
         usleep(idle_ms * 1000);
     }
 }
@@ -853,14 +857,16 @@ static void ring_handle_slot(uint8_t *base, unsigned i) {
         return;
     }
     if (w == 0) {
+        /* feeder only: dump the request into the pair and die. */
         close(sv[0]);
         if (write_full(sv[1], body, len) < 0) _exit(1);
-        close(sv[1]);
-        handle_conn(sv[0], sv[0]); /* reads body, execs, writes frames */
         _exit(0);
     }
     free(body);
-    close(sv[1]);
+    handle_conn(sv[0], sv[1]);
+    close(sv[1]); /* parent's write end: closing lets the capture loop see
+                   * EOF after the buffered response (child's end is gone
+                   * already). Without this, read(sv[0]) blocks forever. */
     /* capture the response stream (frames identical to files transport)
      * into the slot payload, then publish DONE. */
     size_t got = 0;

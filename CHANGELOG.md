@@ -1,6 +1,49 @@
 # Changelog
 
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
+## [0.6.1]
+
+### Fixed - journal replay of guest hostfs mounts works end-to-end
+Six independent defects stacked into "replay fails":
+- **hostfs mount data semantics** (was errno 79/ELIBACC): with UML's 6.16+
+  fsconfig-era hostfs, mount(2) monolithic data is appended verbatim to the
+  `hostfs=` boot-arg root, so the data string must be the share-dir-relative
+  path (`/x`), not a guest-visible path. `hostfs_to_guest()` normalises all
+  four spellings (`hostfs/x`, `/run/sprout/x`, `/x`, `x`) to that form.
+- **ring echo**: `ring_handle_slot()` fed the request into a socketpair but
+  had the feeder child close both ends and call `handle_conn` on the dead
+  fd; the parent's capture loop then read its own request back as the
+  "response". Restructured: feeder child only writes the request and exits;
+  parent runs `handle_conn(sv[0], sv[1])`.
+- **mount wedge**: a hung mount(2) killed the single-threaded ring server
+  (PING died with it). Mount now runs in a fork+waitpid child.
+- **capture-loop EOF**: the parent held sv[1] open after `handle_conn`
+  returned, so the response capture loop never saw EOF and blocked forever.
+  sv[1] is closed immediately after the handler returns.
+- **misplaced confinement**: the bridge rejected guest mount destinations
+  outside the hostfs share. Destination confinement removed for the mount
+  subop (the kernel-side `hostfs=` boot arg already confines the host data
+  path); PROC_READ/FILE_META keep their checks.
+- **CLI reply framing** (phantom "errno 5"): the holder wraps agent frames in
+  `[u32 total_len]`; the CLI read the total-length low byte as the status,
+  so every successful mount reported EIO=5. The CLI now parses the outer
+  frame, then the inner `[u8 status][u32 len][payload]`.
+
+### Changed - journal mounts are durable state, not one-shot intents
+- Mount rows stay in the journal and are re-applied on **every** `sprout uml
+  up` (the guest mount table is per-boot); only `unbind` consumes them
+  (`drop_mount_by_dst`). Umount rows remain one-shot and consume the matching
+  mount row.
+- The session-owner holder **seeds the shadow table from journal mount rows
+  at start**, so L0 shadow binds survive holder restarts/reboots.
+- Re-bind of an existing dst is replace semantics: old shadow entry
+  tombstoned, old journal row dropped.
+- `bind` without a hostsrc is a pure L0 shadow bind - no guest-mount row is
+  journaled (an empty data string would mount the hostfs root at dst).
+- Replay is gated on a ring PING probe (the agent's ring loop attaches a
+  moment after the files transport goes live) and retries each mount 3x with
+  500 ms backoff.
+
 ## [0.6.0]
 
 ### Added - ADR-0024 bridge architecture (four-layer ladder)

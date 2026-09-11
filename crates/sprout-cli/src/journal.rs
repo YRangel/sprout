@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub struct Row {
     pub intent: bool,
-    pub op: String,           // mount|umount|proc-read|...
+    pub op: String, // mount|umount|proc-read|...
     pub args: Vec<String>,
 }
 
@@ -33,7 +33,9 @@ pub struct Journal {
 
 impl Journal {
     pub fn open(dir: &Path) -> Self {
-        Self { path: dir.join("journal.log") }
+        Self {
+            path: dir.join("journal.log"),
+        }
     }
 
     pub fn append(&self, r: &Row) -> std::io::Result<()> {
@@ -58,9 +60,13 @@ impl Journal {
         let s = std::fs::read_to_string(&self.path).unwrap_or_default();
         let mut out = Vec::new();
         for line in s.lines() {
-            if line.is_empty() || !line.starts_with("I\t") { continue; }
+            if line.is_empty() || !line.starts_with("I\t") {
+                continue;
+            }
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 2 { continue; }
+            if parts.len() < 2 {
+                continue;
+            }
             out.push(Row {
                 intent: true,
                 op: parts[1].to_string(),
@@ -79,12 +85,35 @@ impl Journal {
         for line in s.lines() {
             if !done && !line.is_empty() && line.starts_with("I\t") {
                 let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() >= 2 && parts[1] == op &&
-                   parts[2..].iter().zip(args.iter()).all(|(a, b)| a == b)
-                   && parts.len() - 2 == args.len()
-                { done = true; continue; } // drop
+                if parts.len() >= 2
+                    && parts[1] == op
+                    && parts[2..].iter().zip(args.iter()).all(|(a, b)| a == b)
+                    && parts.len() - 2 == args.len()
+                {
+                    done = true;
+                    continue;
+                } // drop
             }
-            out.push_str(line); out.push('\n');
+            out.push_str(line);
+            out.push('\n');
+        }
+        std::fs::write(&self.path, out)
+    }
+
+    /// Remove ALL mount rows whose dst (args[1]) matches — bind replace
+    /// semantics and unbind consumption both need this.
+    pub fn drop_mount_by_dst(&self, dst: &str) -> std::io::Result<()> {
+        let s = std::fs::read_to_string(&self.path).unwrap_or_default();
+        let mut out = String::new();
+        for line in s.lines() {
+            if !line.is_empty() && line.starts_with("I\t") {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() >= 3 && parts[1] == "mount" && parts[3] == dst {
+                    continue; // drop
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
         }
         std::fs::write(&self.path, out)
     }
@@ -93,9 +122,14 @@ impl Journal {
         let s = std::fs::read_to_string(&self.path).unwrap_or_default();
         let mut out = String::new();
         for line in s.lines() {
-            if line.is_empty() { continue; }
-            if line.starts_with("I\t") { continue; }   // drop intents
-            out.push_str(line); out.push('\n');
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with("I\t") {
+                continue;
+            } // drop intents
+            out.push_str(line);
+            out.push('\n');
         }
         std::fs::write(&self.path, out)
     }
