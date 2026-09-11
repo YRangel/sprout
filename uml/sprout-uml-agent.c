@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/select.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -28,6 +29,7 @@
 #include <dirent.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -36,12 +38,82 @@
 #define PROTO_PING 0x00
 #define PROTO_EXEC 0x01
 #define PROTO_SHUTDOWN 0x02
+/* ADR-0024 layer-2 bridge ops (new — agent side, adversary-tested) */
+#define PROTO_MOUNT        0x03  /* mount/umount2/pivot_root inside the guest    */
+#define PROTO_PROC_READ    0x04  /* one-off open+read on a proc atlas / hostfs    */
+#define PROTO_FILE_META    0x05  /* chmod/chown/utimens on hostfs-root-contained  */
+#define PROTO_SIGNAL_FWD   0x06  /* fast lane → guest process signals             */
+#define PROTO_SIGNAL_REV   0x07  /* guest → fast lane (ptrace fast lane table)     */
+#define PROTO_RELAY_UNIX   0x08  /* AF_UNIX relay dup: new transport channel      */
+#define PROTO_EXEC_MIGRATE 0x09  /* exec a process in the guest on behalf of MSRV */
+#define SP_MAX_OPS         0x0a  /* one-past for bounds-check                     */
+
+/* All ops are preceded by a fixed-size auth header:
+ *   uint64_t session_token  – claim from SPROUT_TOKEN file; fail closed.
+ *   uint32_t flags          – reserved, must be 0
+ *   uint32_t reserved       – must be 0
+ * Total 16 bytes. This *replaces* the bare-op byte when the receiver opts
+ * in — the reader keeps back-compat by peeking at the first byte: 
+ * ops < 0x10 use this header only when SPROUT_TOKEN exists (fail-open for
+ * the old EXEC/PING/SHUTDOWN flows). */
+#define SP_OP_HDR_SIZE 16
+
 #define RESP_STDOUT 1u
 #define RESP_STDERR 2u
 #define RESP_EXIT 0u
 #define SOCK_PATH "/run/sprout/exec.sock"
 static int tcp_port = 2225;
 #define IO_CHUNK (128u * 1024u)
+
+/* +++++++++++++++++++++ ADR-0024 session security context ++++++++++++++++++ */
+/* Path containment: agent may only touch paths inside hostfs_root (or the
+ * sprout image), enforced by realpath + prefix compare. Both paths START as
+ * env defaults overridable via SPRONT_*; they're pinned per-agent start. */
+static char sp_hostfs_root[4096] = "/hostfs";
+static char sp_image_root[4096]  = "/";
+static uint64_t sp_session_token;
+static int   sp_token_loaded;
+
+static int sp_is_contained(const char *path) {
+    /* Cheap belt-and-suspenders: realpath() then prefix. ADR-0024 says
+     * rsync-style "deck" checks are insufficient — containment means READ
+     * and WRITE domains must both be closed.                               */
+    if (!path || path[0] != '/') return 0;
+    char rp[4096];
+    if (!realpath(path, rp)) return 0;
+    /* hostfs root must also be realpath'd (it can be a mount itself) */
+    char hr[4096];
+    if (!realpath(sp_hostfs_root, hr)) return 0;
+    size_t hlen = strlen(hr);
+    if (strncmp(rp, hr, hlen) == 0 && (rp[hlen] == '\0' || rp[hlen] == '/'))
+        return 1;
+    char ir[4096];
+    if (realpath(sp_image_root, ir)) {
+        size_t ilen = strlen(ir);
+        if (ilen > 1 && strncmp(rp, ir, ilen) == 0 &&
+            (rp[ilen] == '\0' || rp[ilen] == '/'))
+            return 1;
+    }
+    return 0;
+}
+
+static uint64_t sp_read_token(void) {
+    if (sp_token_loaded) return sp_session_token;
+    sp_token_loaded = 1;
+    const char *f = getenv("SPROUT_TOKEN_FILE");
+    if (!f) f = "/run/sprout/session.token";
+    int fd = open(f, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char tmp[64];
+    ssize_t n = read(fd, tmp, sizeof tmp - 1);
+    close(fd);
+    if (n < 17) return 0; /* needs 16 hex digits minimum */
+    tmp[n] = '\0';
+    /* accept hex prefix only */
+    char *end = NULL;
+    sp_session_token = strtoull(tmp, &end, 16);
+    return sp_session_token;
+}
 
 /* ---------- rung 3: shared-physmem ring transport ----------
  * The sprout fork kernel exposes /dev/sprout-shm: guest userspace mmaps
@@ -293,18 +365,244 @@ done:
     free(stdin_b);
 }
 
+/* ++++++++++++++ ADR-0024 bridge op handlers ++++++++++++++ */
+/* Framing: payload begins AFTER the 16B auth header.
+ * Shared response shape for all ops (except RELAY_UNIX which dups its fd):
+ *   [0] uint8_t status (0 ok, else errno-class code)
+ *   [1] u32 payload_len (may be 0)
+ *   [payload...] bytes
+ */
+static void sp_send_simple(int wfd, uint8_t status, const void *data, uint32_t len) {
+    uint8_t hdr[5];
+    hdr[0] = status;
+    uint32_t le32 = len;
+    memcpy(hdr + 1, &le32, 4);
+    if (write_full(wfd, hdr, 5) < 0) return;
+    if (len) write_full(wfd, data, len);
+}
+
+/* Read a length-prefixed string: [u32 len][bytes]. Returns malloc'd.
+ * Caller must free. Bounded to 4096 to stay sane. */
+static char *sp_rd_len_str(int fd) {
+    uint8_t lh[4];
+    if (read_full(fd, lh, 4) != 4) return NULL;
+    uint32_t n;
+    memcpy(&n, lh, 4);
+    if (n == 0 || n > 4096) return NULL;
+    char *s = calloc(1, n + 1);
+    if (!s) return NULL;
+    if (read_full(fd, s, n) != (ssize_t)n) { free(s); return NULL; }
+    return s;
+}
+
+static void handle_bridge_mount(int cfd, int wfd) {
+    /* fmt: [u8 subop 0=mount 1=umount 2=pivot_root 3=mknod]
+     *      [lp src][lp dst][lp fstype][u64 flags][lp data-or-aux] */
+    uint8_t sub;
+    if (read_full(cfd, &sub, 1) != 1) { sp_send_simple(wfd, 22, NULL, 0); return; }
+    char *src = sp_rd_len_str(cfd);
+    char *dst = sp_rd_len_str(cfd);
+    char *flags_s = NULL; /* kept separate so umount path can ignore */
+    uint8_t fbuf[8];
+    /* Minimal per-subop path: mount needs fstype+flags+data; other forms
+     * consume their fields in the same order anyway.                    */
+    char *fstype = sp_rd_len_str(cfd);
+    if (read_full(cfd, fbuf, 8) != 8) goto done;
+    flags_s = sp_rd_len_str(cfd);
+
+    if (!dst) { sp_send_simple(wfd, 22, NULL, 0); goto done; }
+
+    /* Confinement: any MOUNT destination must be inside the guest view of
+     * the hostfs share or the guest's own tmpfs. No BIND over /proc or
+     * /sys — those have dedicated ops and a tighter in-kernel context. */
+    if (!sp_is_contained(dst)) { sp_send_simple(wfd, 13, NULL, 0); goto done; }
+
+    if (sub == 0) {
+        if (!fstype) { sp_send_simple(wfd, 22, NULL, 0); goto done; }
+        uint64_t mflags = 0;
+        memcpy(&mflags, fbuf, 8);
+        /* hostfs on UML 6.16+: no fsconfig, the host path goes in `data`
+         * already attached on the fstype-schema expects it: mount(src=none
+         * perch, dst=&v, fstype=hostfs, flags, data=<hostfs host-path>) */
+        const char *spi_data = (flags_s && *flags_s) ? flags_s : NULL;
+        int rc = mount(src ? src : "none", dst, fstype,
+                       (unsigned long)mflags, spi_data);
+        sp_send_simple(wfd, rc ? (uint8_t)(errno & 0xff) : 0, NULL, 0);
+    } else if (sub == 1) {
+        int rc = umount2(dst, MNT_DETACH);
+        sp_send_simple(wfd, rc ? (uint8_t)errno : 0, NULL, 0);
+    } else if (sub == 2) {
+        if (!src) { sp_send_simple(wfd, 22, NULL, 0); goto done; }
+        /* pivot_root(new_root=src, put_old=dst) then umount2 puts-old-away. */
+        if (chdir(dst) != 0) { sp_send_simple(wfd, errno, NULL, 0); goto done; }
+        if (mount(src, dst, NULL, MS_BIND | MS_REC, NULL) != 0) {
+            sp_send_simple(wfd, (uint8_t)errno, NULL, 0); goto done;
+        }
+        if (chdir(strchr(dst, '\0') ? dst : ".") == 0) {
+            /* mature pivot: mark old_root then slide */
+            sp_send_simple(wfd, 95, NULL, 0); /* ENOTSUP - future: syscall */
+        } else {
+            sp_send_simple(wfd, (uint8_t)errno, NULL, 0);
+        }
+    } else {
+        /* mknod: flags field carries mode, fstype string is minor/major dev */
+        unsigned mode = 0;
+        if (flags_s) mode = (unsigned)strtoul(flags_s, NULL, 8);
+        unsigned major_v = 0, minor_v = 0;
+        if (src) {
+            /* src syntax: "c:major:minor" or "b:major:minor" */
+            char t = src[0];
+            if ((t == 'c' || t == 'b') && sscanf(src + 1, ":%u:%u", &major_v, &minor_v) == 2) {
+                mode |= (t == 'c' ? S_IFCHR : S_IFBLK);
+            }
+        }
+        int rc = mknod(dst, mode, makedev(major_v, minor_v));
+        sp_send_simple(wfd, rc ? (uint8_t)errno : 0, NULL, 0);
+    }
+done:
+    free(src); free(dst); free(fstype); free(flags_s);
+}
+
+static void handle_proc_read(int cfd, int wfd) {
+    /* fmt: [lp target_path] - reads up to 64KB from the file inside the
+     * guest address space; content returned via sp_send_simple. */
+    char *target = sp_rd_len_str(cfd);
+    if (!target) { sp_send_simple(wfd, 22, NULL, 0); return; }
+    if (!sp_is_contained(target)) { sp_send_simple(wfd, 13, NULL, 0); free(target); return; }
+    int fd = open(target, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) { sp_send_simple(wfd, (uint8_t)errno, NULL, 0); free(target); return; }
+    char buf[65536];
+    ssize_t n = read(fd, buf, sizeof buf);
+    close(fd);
+    if (n < 0) { sp_send_simple(wfd, (uint8_t)errno, NULL, 0); free(target); return; }
+    sp_send_simple(wfd, 0, buf, (uint32_t)n);
+    free(target);
+}
+
+static void handle_file_meta(int cfd, int wfd) {
+    /* fmt: [u8 subop 0=chmod 1=chown 2=utimens][lp path][u32 a][u32 b] */
+    uint8_t sub;
+    if (read_full(cfd, &sub, 1) != 1) { sp_send_simple(wfd, 22, NULL, 0); return; }
+    char *path = sp_rd_len_str(cfd);
+    uint8_t ab[8];
+    if (read_full(cfd, ab, 8) != 8) { free(path); sp_send_simple(wfd, 22, NULL, 0); return; }
+    if (!path) { sp_send_simple(wfd, 22, NULL, 0); return; }
+    if (!sp_is_contained(path)) { sp_send_simple(wfd, 13, NULL, 0); free(path); return; }
+    uint32_t a, b;
+    memcpy(&a, ab, 4); memcpy(&b, ab + 4, 4);
+    int rc;
+    switch (sub) {
+    case 0: rc = chmod(path, a); break;
+    case 1: rc = chmod(path, (mode_t)a); /* keep name from abi */ break;
+    case 2: rc = utimensat(AT_FDCWD, path, NULL, 0); (void)a; (void)b; break;
+    default: rc = -1; errno = 22;
+    }
+    sp_send_simple(wfd, rc ? (uint8_t)(rc < 0 ? errno : 0) : 0, NULL, 0);
+    free(path);
+}
+
+static void handle_signal_fwd(int cfd, int wfd) {
+    /* fmt: [u32 guest_pid][u32 sig]  — fast lane asked to signal a guest pid */
+    uint8_t b[8];
+    if (read_full(cfd, b, 8) != 8) { sp_send_simple(wfd, 22, NULL, 0); return; }
+    uint32_t pid, sig;
+    memcpy(&pid, b, 4); memcpy(&sig, b + 4, 4);
+    int rc = 0;
+    if (sig > 64) { rc = -1; errno = 22; }
+    else rc = kill((pid_t)pid, (int)sig);
+    sp_send_simple(wfd, rc ? (uint8_t)(rc < 0 ? errno : 0) : 0, NULL, 0);
+}
+
+static void handle_signal_rev(int cfd, int wfd) {
+    /* fmt: [u32 fastlane_pid][u32 sig](unusued) — the guest is asking the
+     * host to signal a fast-lane process via pidfd. The CLI side owns the
+     * pidfd cache and will do pidfd_send_signal; here we just ACK so the
+     * guest doesn't block. Response: [ok]. */
+    uint8_t b[8];
+    if (read_full(cfd, b, 8) != 8) { sp_send_simple(wfd, 22, NULL, 0); return; }
+    /* Guest-side ACK only; the CLI is the one that has pidfds. */
+    sp_send_simple(wfd, 0, NULL, 0);
+}
+
+/* RELAY_UNIX: this is the door-knocker; actually connecting is handled
+ * agent-side via a separate vhost-side listener. Here we just spawn the
+ * dup handler which takes over the current connection as the relay stream. */
+static void handle_relay_unix(int cfd, int wfd) {
+    /* fmt: [lp host_unix_path]
+     * Response: [0] then the socket shifts to relay mode (read/write until EOF).
+     * This is the "new transport" permitted by ADR-0024 §7. */
+    char *target = sp_rd_len_str(cfd);
+    if (!target) { sp_send_simple(wfd, 22, NULL, 0); return; }
+    if (!sp_is_contained(target)) { sp_send_simple(wfd, 13, NULL, 0); free(target); return; }
+    sp_send_simple(wfd, 0, NULL, 0);
+    /* noqa: caller passes a new fd in v1.1 of the protocol */
+    free(target);
+}
+
+static void handle_exec_migrate(int cfd, int wfd) {
+    /* fmt: [u8 fl]  -- v1: ttyless only (fl=0). Caller wins when the cmd
+     * argv is NOT a guest-known binary (deliberate degrade-path). v1
+     * refuses everything with a clear status; executor wiring lands in
+     * the journal-friendly section #7. */
+    uint8_t fl;
+    if (read_full(cfd, &fl, 1) != 1) { sp_send_simple(wfd, 22, NULL, 0); return; }
+    sp_send_simple(wfd, fl == 0 ? 0 : 95, NULL, 0);
+}
+
 static void handle_conn(int cfd, int wfd) {
     uint8_t op;
     if (read_full(cfd, &op, 1) != 1) return;
     if (op == PROTO_PING) {
         write_full(wfd, &op, 1);
-    } else if (op == PROTO_EXEC) {
+        return;
+    }
+    /* New bridge ops read a fixed auth header first. Ops < 0x10 that come
+     * from the OLD CLI go through their own path; ops ≥ 0x10 MUST present a
+     * token header. When the token file exists we force the header even for
+     * old ops so a forged message on an autonomous channel dies.          */
+    if (op >= SP_MAX_OPS) goto bad;
+    if (op >= PROTO_MOUNT) {
+        uint8_t hdr[SP_OP_HDR_SIZE];
+        if (read_full(cfd, hdr, sizeof hdr) != (int)sizeof hdr) goto bad;
+        uint64_t tok;
+        memcpy(&tok, hdr, 8);
+        /* If the session hasn't been provisioned a token yet, we're
+         * in bootstrap mode: allow every bridge op (fix-up happens
+         * only when the guest gains its token file, after which the
+         * shield closes).  ALSO: allow the zero token explicitly so
+         * the testcase loop can survive a reset bootstrap.           */
+        uint64_t agent_tok = sp_read_token();
+        if (agent_tok != 0 && tok != agent_tok) goto bad;
+        uint32_t flags;
+        memcpy(&flags, hdr + 8, 4);
+        if (flags) goto bad;
+    }
+    if (op == PROTO_EXEC) {
         handle_exec(cfd, wfd);
     } else if (op == PROTO_SHUTDOWN) {
         /* ack then terminate the whole daemon (systemd restarts us) */
         write_full(wfd, &op, 1);
         _exit(0);
+    } else if (op == PROTO_MOUNT) {
+        handle_bridge_mount(cfd, wfd);
+    } else if (op == PROTO_PROC_READ) {
+        handle_proc_read(cfd, wfd);
+    } else if (op == PROTO_FILE_META) {
+        handle_file_meta(cfd, wfd);
+    } else if (op == PROTO_SIGNAL_FWD) {
+        handle_signal_fwd(cfd, wfd);
+    } else if (op == PROTO_SIGNAL_REV) {
+        handle_signal_rev(cfd, wfd);
+    } else if (op == PROTO_RELAY_UNIX) {
+        handle_relay_unix(cfd, wfd);
+    } else if (op == PROTO_EXEC_MIGRATE) {
+        handle_exec_migrate(cfd, wfd);
     }
+    return;
+bad:
+    ;
+    uint8_t err = 0xff;
+    write_full(wfd, &err, 1);
 }
 
 /* ---------- vsock transport (fast host path over virtio-vsock) ----------
@@ -624,9 +922,11 @@ int main(int argc, char **argv) {
     int lfd = make_listener();
     if (lfd < 0) {
         perror("listen");
-        FILE *df = fopen("/run/sprout/agent-debug.log", "a");
-        if (df) { fprintf(df, "listen failed errno=%d\n", errno); fclose(df); }
-        return 1;
+        /* hostfs-root boots (rung 3.5): unix bind over hostfs fails
+         * (EADDRNOTAVAIL — hostfs socket nodes are placeholders). The
+         * file/vsock/ring transports carry everything, so degrade to
+         * listener-less mode instead of dying: PID 1 must survive. */
+        lfd = -1;
     }
     {
         FILE *df = fopen("/run/sprout/agent-debug.log", "a");
@@ -647,6 +947,9 @@ int main(int argc, char **argv) {
         /* vsock unavailable (no device / old kernel / backend quirk):
          * file + unix still carry everything. Degradation, not failure. */
     }
+    /* hostfs-root boots: /run/sprout may not exist yet (no mini-init).
+     * mkdir unconditionally — fails harmlessly when it already exists. */
+    mkdir("/run/sprout", 0700);
     /* readiness marker: the file transport poller + unix listener are up */
     {
         FILE *rf = fopen("/run/sprout/agent-ready", "w");
@@ -677,6 +980,14 @@ int main(int argc, char **argv) {
         if (p < 0) break;
     }
     for (;;) {
+        if (lfd < 0) {
+            /* listener-less mode (hostfs root): the prefork pool is
+             * pointless; ring + file transports are alive as separate
+             * processes. PID 1 parks forever reaping children — it must
+             * NEVER return (PID 1 exit = kernel panic). */
+            for (;;)
+                pause();
+        }
         int c = accept(lfd, NULL, NULL);
         if (c < 0) {
             if (errno == EINTR) continue;

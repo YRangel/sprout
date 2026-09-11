@@ -3092,6 +3092,32 @@ int main(int argc, char **argv) {
     unsetenv("LD_LIBRARY_PATH");
     unsetenv("LINKER");
 
+    /* Shadow fd (ADR-0024): if the caller's env advertised a memfd-backed
+     * shadow table, adopt it into the supervised child's fd table so the
+     * preload can mmap it. */
+    const char *shadow_fd_s = getenv("SPROUT_SHADOW_FD");
+    if (shadow_fd_s && *shadow_fd_s) {
+        int sfd = atoi(shadow_fd_s);
+        if (sfd >= 3) {
+            /* force into the low range so downstream tools (which scan
+             * 0..255) see it.  dup2 if a tool evicted it.            */
+            int flags = fcntl(sfd, F_GETFL);
+            if (flags >= 0) {
+                if (sfd > 32) {
+                    int nfd = fcntl(sfd, F_DUPFD, 4);
+                    if (nfd >= 0) {
+                        close(sfd);
+                        sfd = nfd;
+                    }
+                    char buf[16];
+                    snprintf(buf, sizeof buf, "%d", sfd);
+                    setenv("SPROUT_SHADOW_FD", buf, 1);
+                }
+                int of = fcntl(sfd, F_GETFD);
+                if (of >= 0) fcntl(sfd, F_SETFD, of & ~FD_CLOEXEC);
+            }
+        }
+    }
     /* Guest-specific: if SPROUT_GUEST_PRELOAD is set, that value (only) is
      * what the guest child will see as LD_PRELOAD. This lets the sprout CLI
      * decouple supervisor-binary linking from guest-library linking. */

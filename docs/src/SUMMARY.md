@@ -46,6 +46,7 @@
 - [0021: FEX-Emu SysV IPC via in-source shim](./adr/0021-fex-sysvipc-in-source-shim.md)
 - [0022: sprout upkg — in-Rust SELinux-aware tar extractor](./adr/0022-upkg-subcommand-selinux-extract.md)
 - [0023: UML sidecar (real guest kernel next to the fast lane)](./adr/0023-uml-sidecar.md)
+- [0024: Per-syscall guest bridge — the four-layer execution ladder](./adr/0024-bridge-architecture.md)
 
 # Operations
 
