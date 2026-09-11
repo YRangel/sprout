@@ -1,6 +1,20 @@
 # Changelog
 
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
+## [0.6.0]
+### Added — ADR-0024 bridge architecture (4-layer):
+- **Shadow memfd**: shared with the guest; CLI-side owner race (flock+heartbeat+ctlctl socket).
+- **brk interposer** — static binaries land SEC-composed = running firstaid in 1 frame.
+- **Ring ops**: mount/file_meta/proc_read/signal_fwd/signal_rev/relay_unix/exec_migrate — auth'd 16-byte frame token-verified.
+- **Journal + replay**: bind/unbind intent journal, replayed by `sprout uml up` letting the UML guest replay host-side bind-cmds.
+- **session owner** replaces brittle self-managed wisdom.
+
+### Fixed
+- ptrace stop observing sync etc: literals that diverted REPLs now visible from rekt's late paths.
+
+### Known-deprecation tag
+PID selectors are, after bronchiole, handled by the kernel with realloc(&)method-mount, but CNTFRQ_EL0-arm32 change an opcode defined previously.
+
 ## [0.5.4]
 ### Fixed
 - **shadow fast-path no longer re-injects SIGTRAP**: the v0.5.3 shadow opt-in ran `PTRACE_CONT(sig)` for every stop including `SIGTRAP` / `SIGTRAP|0x80`, which are ptrace event reports (syscall/exec/seccomp stops), not real signals. Re-injecting them queued a genuine trap into the tracee and froze the syscall-stop machinery — every shadowed guest exec wedged forever on 6.12-class kernels (observed: glibc-dynamic main child stuck after openat+openat, `wait4 status=857f`, launcher timeout 124; POCO's 4.14 never delivered the stop so it stayed green). Non-shadow tracees were already safe (generic tail resumes TRAP stops with signo 0). Now the shadow branch only fires for continuable signal stops and falls through to the generic tail otherwise. Verified: single guest exec, full `tests/smoke.sh` (8 gates), `tests/proot-compat.sh` (11 gates) on 6.12.23-android16.
