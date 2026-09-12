@@ -352,6 +352,20 @@ static void handle_exec(int cfd, int wfd) {
     (void)tmo;
     (void)flags;
 
+    /* ADR-0025 D5: hostfs never revalidates host-side changes. Each exec
+     * is the moment NEW host content (a binary the host just built, files
+     * the host just dropped) must be visible — drop the guest's CLEAN
+     * pagecache (level 1: reclaimable only) so hostfs re-reads from the
+     * host. ext4-backing re-reads hit the HOST page cache, so this is
+     * cheap. SPROUT_GUEST_FLUSH=0 disables. */
+    {
+        const char *gf = getenv("SPROUT_GUEST_FLUSH");
+        if (!gf || gf[0] != '0') {
+            int d = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC);
+            if (d >= 0) { (void)!write(d, "1\n", 2); close(d); }
+        }
+    }
+
     int in_p[2] = {-1, -1}, out_p[2] = {-1, -1}, err_p[2] = {-1, -1};
     if (pipe(in_p) < 0 || pipe(out_p) < 0 || pipe(err_p) < 0) goto bad2;
 
