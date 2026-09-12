@@ -55,7 +55,13 @@ struct RingHeader {
     version: u32,
     host_seq: u32,
     guest_seq: u32,
-    _pad: [u32; 8],
+    /* ADR-0025 D2: session token lives in the ring header — a pure
+     * capability: only processes that can map the memfd (holder, kernel,
+     * guest agent) can read it. No file provisioning, no bootstrap window. */
+    token: u64,
+    /* ADR-0025 D3: holder heartbeat for the guest's dead-man switch. */
+    heartbeat: u32,
+    _pad: [u32; 5],
 }
 
 fn main() {
@@ -108,6 +114,42 @@ impl Ring {
     }
 }
 
+fn load_or_create_token(dir: &std::path::Path) -> u64 {
+    if let Ok(s) = std::fs::read_to_string(dir.join("token")) {
+        if let Ok(t) = u64::from_str_radix(s.trim(), 16) {
+            if t != 0 {
+                return t;
+            }
+        }
+    }
+    let mut b = [0u8; 8];
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom").expect("urandom");
+    f.read_exact(&mut b).expect("urandom read");
+    let t = u64::from_le_bytes(b) | 1; // never 0 (0 = bootstrap fail-open)
+    let _ = std::fs::write(dir.join("token"), format!("{t:016x}\n"));
+    t
+}
+
+/// SO_PEERCRED gate: only same-uid peers may speak to our sockets
+/// (ring.sock, shadow.ctl). Termux is single-uid, but a compromised or
+/// confused sibling process must not issue bridge ops or mutate binds.
+fn peer_uid_ok(conn: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as u32;
+    let rc = unsafe {
+        libc::getsockopt(
+            conn.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    rc == 0 && cred.uid == unsafe { libc::getuid() }
+}
+
 fn run() -> anyhow::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 3 || argv.len() > 4 {
@@ -115,6 +157,10 @@ fn run() -> anyhow::Result<()> {
     }
     let fdnum: i32 = argv[1].parse()?;
     let sock_path = std::path::PathBuf::from(&argv[2]);
+    let uml_dir = sock_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
     // Optional ring-doorbell write end (host pipe -> guest wake IRQ).
     let wake_wfd: i32 = argv.get(3).and_then(|s| s.parse().ok()).unwrap_or(-1);
 
@@ -156,6 +202,10 @@ fn run() -> anyhow::Result<()> {
     // region could be stale after a crash-reboot cycle), then publish the
     // header. The agent spin-waits for the magic, so this is the
     // handoff: after magic appears the agent never rewrites the header.
+    /* ADR-0025 D2: the holder is the single writer of the session token.
+     * Load the durable one (or mint + persist) BEFORE the agent can boot:
+     * the guest reads it from the ring header, never from a file. */
+    let token = load_or_create_token(&uml_dir);
     unsafe {
         std::ptr::write_bytes(ring.base, 0, RING_BYTES);
         fence(Ordering::Release);
@@ -163,12 +213,26 @@ fn run() -> anyhow::Result<()> {
             ring.hdr,
             RingHeader {
                 magic: HDR_MAGIC,
-                version: 1,
+                version: 2,
                 host_seq: 0,
                 guest_seq: 0,
-                _pad: [0; 8],
+                token,
+                heartbeat: 0,
+                _pad: [0; 5],
             },
         );
+    }
+    /* ADR-0025 D3: dead-man heartbeat the guest agent watches. */
+    {
+        let hdr_usize = ring.hdr as usize;
+        thread::spawn(move || loop {
+            unsafe {
+                let h = hdr_usize as *mut RingHeader;
+                let cur = std::ptr::read_volatile(&(*h).heartbeat);
+                std::ptr::write_volatile(&mut (*h).heartbeat, cur.wrapping_add(1));
+            }
+            thread::sleep(Duration::from_millis(250));
+        });
     }
 
     // Serve socket. Remove stale socket from a crashed previous holder.
@@ -176,10 +240,6 @@ fn run() -> anyhow::Result<()> {
     let listener = UnixListener::bind(&sock_path)?;
 
     // --- Session owner (ADR-0024 §5) ---
-    let uml_dir = sock_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
     let _lock = acquire_lock(&uml_dir)?;
     let shadow = Arc::new(Mutex::new(Shadow::create_file(
         &uml_dir,
@@ -228,6 +288,10 @@ fn run() -> anyhow::Result<()> {
         for conn in ctl_listener.incoming() {
             match conn {
                 Ok(mut c) => {
+                    if !peer_uid_ok(&c) {
+                        eprintln!("sprout-uml-hold: shadow.ctl rejected foreign-uid peer");
+                        continue;
+                    }
                     let _ = ctl_handle(&mut c, &ctl_shadow);
                 }
                 Err(_) => continue,
@@ -240,6 +304,10 @@ fn run() -> anyhow::Result<()> {
             Ok(c) => c,
             Err(_) => continue,
         };
+        if !peer_uid_ok(&conn) {
+            eprintln!("sprout-uml-hold: ring.sock rejected foreign-uid peer");
+            continue;
+        }
         // one request per connection (same shape as the files transport:
         // req file = one body, resp = one stream)
         let mut lenb = [0u8; 4];

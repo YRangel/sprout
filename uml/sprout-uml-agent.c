@@ -98,9 +98,23 @@ static int sp_is_contained(const char *path) {
     return 0;
 }
 
+static uint64_t sp_session_token;
+static int   sp_token_loaded;
+static uint8_t *g_ring_base;   /* set by ring_loop after ring_map */
+
 static uint64_t sp_read_token(void) {
-    if (sp_token_loaded) return sp_session_token;
+    /* cache only a REAL token: a bootstrap 0 must be retried (the ring
+     * header may appear after the first bridge op). */
+    if (sp_token_loaded && sp_session_token) return sp_session_token;
     sp_token_loaded = 1;
+    /* authoritative source (ADR-0025 D2): the ring header — a pure shm
+     * capability: only processes that can map the memfd can read it. */
+    if (g_ring_base) {
+        uint64_t t;
+        memcpy(&t, g_ring_base + 16, 8);
+        if (t) { sp_session_token = t; return t; }
+    }
+    /* fallback: provisioned file (socket-transport guests without ring) */
     const char *f = getenv("SPROUT_TOKEN_FILE");
     if (!f) f = "/run/sprout/session.token";
     int fd = open(f, O_RDONLY | O_CLOEXEC);
@@ -108,7 +122,7 @@ static uint64_t sp_read_token(void) {
     char tmp[64];
     ssize_t n = read(fd, tmp, sizeof tmp - 1);
     close(fd);
-    if (n < 17) return 0; /* needs 16 hex digits minimum */
+    if (n < 16) return 0; /* 16 hex digits minimum (newline optional) */
     tmp[n] = '\0';
     /* accept hex prefix only */
     char *end = NULL;
@@ -643,9 +657,9 @@ static void handle_conn(int cfd, int wfd) {
     }
     return;
 bad:
-    ;
-    uint8_t err = 0xff;
-    write_full(wfd, &err, 1);
+    /* well-formed reject: a bare byte would desync the response stream
+     * (the ring capture frames by length). */
+    sp_send_simple(wfd, 0xff, NULL, 0);
 }
 
 /* ---------- vsock transport (fast host path over virtio-vsock) ----------
@@ -838,12 +852,14 @@ static void ring_handle_slot(uint8_t *base, unsigned i) {
     }
 
     /* Serve the request through the regular socket handler: a helper
-     * child feeds the body into a socketpair and runs handle_conn,
-     * whose response stream we capture into the SAME slot (reuse the
-     * payload area for the reply — host has stopped touching it after
-     * seeing BUSY->DONE with the same seq it wrote). */
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+     * child feeds the body into a request socketpair and runs
+     * handle_conn, whose response stream we capture from a SECOND,
+     * independent pair — one bidirectional pair would let unconsumed
+     * request bytes (e.g. an auth-rejected frame's tail) pollute the
+     * captured response stream. */
+    int rq[2], rp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, rq) < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, rp) < 0) {
         free(body);
         ring_wr32(hdr, RING_FRAME_DONE);
         __atomic_store_n(&hdr32[3], seq, __ATOMIC_RELEASE);
@@ -851,28 +867,28 @@ static void ring_handle_slot(uint8_t *base, unsigned i) {
     }
     pid_t w = fork();
     if (w < 0) {
-        close(sv[0]); close(sv[1]); free(body);
+        close(rq[0]); close(rq[1]); close(rp[0]); close(rp[1]); free(body);
         ring_wr32(hdr, RING_FRAME_DONE);
         __atomic_store_n(&hdr32[3], seq, __ATOMIC_RELEASE);
         return;
     }
     if (w == 0) {
-        /* feeder only: dump the request into the pair and die. */
-        close(sv[0]);
-        if (write_full(sv[1], body, len) < 0) _exit(1);
+        /* feeder only: dump the request into the request pair and die. */
+        close(rq[0]); close(rp[0]); close(rp[1]);
+        if (write_full(rq[1], body, len) < 0) _exit(1);
         _exit(0);
     }
     free(body);
-    handle_conn(sv[0], sv[1]);
-    close(sv[1]); /* parent's write end: closing lets the capture loop see
-                   * EOF after the buffered response (child's end is gone
-                   * already). Without this, read(sv[0]) blocks forever. */
+    close(rq[1]);                  /* feeder owns the request-write end */
+    handle_conn(rq[0], rp[1]);   /* reads request, writes response */
+    close(rq[0]);
+    close(rp[1]);                  /* EOF so the capture loop terminates */
     /* capture the response stream (frames identical to files transport)
      * into the slot payload, then publish DONE. */
     size_t got = 0;
     for (;;) {
         if (got == RING_MAX_FRAME) break;
-        ssize_t r = read(sv[0], pay + got, RING_MAX_FRAME - got);
+        ssize_t r = read(rp[0], pay + got, RING_MAX_FRAME - got);
         if (r < 0) {
             if (errno == EINTR) continue;
             break;
@@ -880,7 +896,7 @@ static void ring_handle_slot(uint8_t *base, unsigned i) {
         if (r == 0) break;
         got += (size_t)r;
     }
-    close(sv[0]);
+    close(rp[0]);
     int st = 0;
     while (waitpid(w, &st, 0) < 0 && errno == EINTR) {}
 
@@ -903,6 +919,7 @@ static void ring_log(const char *msg, int n) {
 static void ring_loop(void) {
     ring_log("loop enter", -1);
     uint8_t *base = ring_map();
+    g_ring_base = base;
     if (!base) {
         FILE *df = fopen("/run/sprout/agent-debug.log", "a");
         if (df) { fprintf(df, "ring: no /dev/sprout-shm (open errno=%d), transport disabled\n", errno); fclose(df); }
