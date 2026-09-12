@@ -20,6 +20,10 @@
 - [Path translation](./architecture/translation.md)
 - [Threat model](./architecture/threat-model.md)
 
+# Research
+
+- [2026-09: architecture limitations & remediation](./research/2026-09-architecture-limitations.md)
+
 # Decisions (ADRs)
 
 - [Template](./adr/template.md)
