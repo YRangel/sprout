@@ -1,0 +1,276 @@
+diff --git a/Makefile b/Makefile
+index f6c87b1..253ae53 100644
+--- a/Makefile
++++ b/Makefile
+@@ -27,8 +27,9 @@ FORTIFY_FLAG := -D_FORTIFY_SOURCE=2
+ endif
+ 
+ BASE_CPPFLAGS := -D_XOPEN_SOURCE=700 -D_GNU_SOURCE $(FORTIFY_FLAG)
+-BASE_CPPFLAGS += -DPAGE_SIZE=$(shell getconf PAGE_SIZE)
++BASE_CPPFLAGS += -DPAGE_SIZE=$(shell getconf PAGE_SIZE 2>/dev/null || echo 4096)
+ BASE_CPPFLAGS += -DVERSION=\"$(VERSION)\"
++BASE_CPPFLAGS += -include $(CURDIR)/bionic-compat.h
+ 
+ BASE_CFLAGS := -std=c11 -pie -fPIE -O2
+ BASE_CFLAGS += -pedantic -Wall -Wextra -Wno-format-zero-length -Wformat-security
+diff --git a/checksum.c b/checksum.c
+index 7c62e42..7f93426 100644
+--- a/checksum.c
++++ b/checksum.c
+@@ -54,6 +54,9 @@
+ #include <stdint.h>
+ 
+ #include <linux/udp.h>
++#ifdef __ANDROID__
++#include <netinet/udp.h>	/* bionic: struct udphdr lives here (linux/udp.h has __kernel_udphdr) */
++#endif
+ #include <linux/icmpv6.h>
+ 
+ #include "util.h"
+diff --git a/conf.c b/conf.c
+index ea0f4bc..5f23990 100644
+--- a/conf.c
++++ b/conf.c
+@@ -1923,7 +1923,13 @@ void conf(struct ctx *c, int argc, char **argv)
+ 
+ 	conf_open_files(c);	/* Before any possible setuid() / setgid() */
+ 
++#ifdef __ANDROID__
++	/* untrusted_app is already maximally unprivileged and CLONE_NEWUSER
++	 * is denied (EINVAL): the self-isolation userns buys nothing. */
++	isolate_user(c, uid, gid, false, userns);
++#else
+ 	isolate_user(c, uid, gid, !netns_only, userns);
++#endif
+ 
+ 	if (c->no_icmp)
+ 		c->no_ndp = 1;
+diff --git a/ip.h b/ip.h
+index aab9b86..86c9c2b 100644
+--- a/ip.h
++++ b/ip.h
+@@ -64,6 +64,7 @@
+ 		.daddr		= IN6ADDR_ANY_INIT,			\
+ 	}
+ 
++#ifndef __ANDROID__
+ struct ipv6hdr {
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wpedantic"
+@@ -98,6 +99,8 @@ struct ipv6_opt_hdr {
+  * @ip6h:	Pointer to IPv6 header, updated
+  * @flow:	Set @ip6h flow label to the low 20 bits of this integer
+  */
++#endif /* !__ANDROID__: bionic's <linux/ipv6.h> (via netinet/ip6.h)
++ * already provides struct ipv6hdr + ipv6_opt_hdr with identical layout. */
+ static inline void ip6_set_flow_lbl(struct ipv6hdr *ip6h, uint32_t flow)
+ {
+ 	ip6h->flow_lbl[0] = (flow >> 16) & 0xf;
+diff --git a/isolation.c b/isolation.c
+index a00475f..b5258a2 100644
+--- a/isolation.c
++++ b/isolation.c
+@@ -385,11 +385,17 @@ void isolate_user(const struct ctx *c, uid_t uid, gid_t gid, bool use_userns,
+ 	uint64_t ns_caps = 0;
+ 
+ 	/* First set our UID & GID in the original namespace */
++#ifndef __ANDROID__
+ 	if (setgroups(0, NULL)) {
+ 		/* If we don't have CAP_SETGID, this will EPERM */
+ 		if (errno != EPERM)
+ 			die_perror("Can't drop supplementary groups");
+ 	}
++#else
++	/* Android: setgroups(159) is seccomp-TRAPped for untrusted_app —
++	 * CALLING it is SIGSYS death (no EPERM to catch). We're already an
++	 * unprivileged app with no supplementary groups to drop. */
++#endif
+ 
+ 	/* If we're going to use a pre-existing userns (either named, or with
+ 	 * --netns-only the current one), we need to switch to drop root first.
+@@ -397,11 +403,21 @@ void isolate_user(const struct ctx *c, uid_t uid, gid_t gid, bool use_userns,
+ 	 * dropping root, because we don't our userns to be owned by nobody.
+ 	 */
+ 	if (*userns || !use_userns) {
++#ifdef __ANDROID__
++		/* Android traps set*id UNCONDITIONALLY (even no-op same-id
++		 * calls) — and an app can never change ids anyway: skip. */
++		if (gid != getgid() && setgid(gid) != 0)
++			die_perror("Can't set GID to %u", gid);
++
++		if (uid != getuid() && setuid(uid) != 0)
++			die_perror("Can't set UID to %u", uid);
++#else
+ 		if (setgid(gid) != 0)
+ 			die_perror("Can't set GID to %u", gid);
+ 
+ 		if (setuid(uid) != 0)
+ 			die_perror("Can't set UID to %u", uid);
++#endif
+ 	}
+ 
+ 	if (*userns) { /* If given a userns, join it */
+@@ -486,11 +502,18 @@ int isolate_prefork(const struct ctx *c)
+ 	if (!c->foreground || c->mode != MODE_PASTA)
+ 		flags |= CLONE_NEWPID;
+ 
++#ifndef __ANDROID__
+ 	if (unshare(flags)) {
+ 		err_perror("Failed to detach isolating namespaces");
+ 		return -errno;
+ 	}
++#else
++	/* Android untrusted_app has no CAP_SYS_ADMIN in ANY reachable
++	 * namespace: unshare() can never succeed. Namespaces isolate from
++	 * the HOST — same-uid here, so the sandbox value is nil anyway. */
++#endif
+ 
++#ifndef __ANDROID__
+ 	if (mount("", "/", "", MS_UNBINDABLE | MS_REC, NULL)) {
+ 		err_perror("Failed to remount /");
+ 		return -errno;
+@@ -524,6 +547,15 @@ int isolate_prefork(const struct ctx *c)
+ 			return -errno;
+ 		}
+ 	}
++#else
++	/* Android: mount(2) is seccomp-TRAPped for untrusted_app — calling
++	 * it is SIGSYS death, and there is no mount namespace to pivot in
++	 * anyway (see the unshare gate above). */
++	if (chdir(TMPDIR)) {
++		err_perror("Failed to change directory into TMPDIR");
++		return -errno;
++	}
++#endif
+ 
+ 	/* Now that initialization is more-or-less complete, we can
+ 	 * drop further capabilities
+diff --git a/netlink.c b/netlink.c
+index 225b666..56776de 100644
+--- a/netlink.c
++++ b/netlink.c
+@@ -114,6 +114,15 @@ void nl_sock_init(const struct ctx *c, bool ns)
+ 	return;
+ 
+ fail:
++#ifdef __ANDROID__
++	/* Android SELinux denies bind(AF_NETLINK) to untrusted_app. The data
++	 * plane (guest TCP/UDP terminated in host userspace sockets, local
++	 * ARP answers, guest DHCP) needs NO netlink — only host config
++	 * DISCOVERY does. Degrade: manual -i/-a/-m/-g config still works. */
++	warn("netlink unavailable (Android SELinux): host auto-discovery off; use -i/-a/-m/-g/--dns");
++	nl_sock = -1;
++	return;
++#endif
+ 	die("Failed to get netlink socket");
+ }
+ 
+@@ -141,9 +150,15 @@ static uint32_t nl_send(int s, void *req, uint16_t type,
+ 	nh->nlmsg_pid = 0;
+ 
+ 	n = send(s, req, len, 0);
+-	if (n < 0)
++	if (n < 0) {
++#ifdef __ANDROID__
++		/* Android: netlink may be entirely unavailable (SELinux): every
++		 * caller has a manual-config or degrade path; never die on it. */
++		return -errno;
++#else
+ 		die_perror("netlink: Failed to send()");
+-	else if (n < len)
++#endif
++	} else if (n < len)
+ 		die("netlink: Short send (%zd of %zd bytes)", n, len);
+ 
+ 	return nh->nlmsg_seq;
+@@ -162,6 +177,10 @@ static uint32_t nl_send(int s, void *req, uint16_t type,
+  */
+ static int nl_status(const struct nlmsghdr *nh, ssize_t n, uint32_t seq)
+ {
++#ifdef __ANDROID__
++	if (n <= 0)
++		return 0;	/* no netlink: pretend DONE (callers degrade) */
++#endif
+ 	assert(NLMSG_OK(nh, n));
+ 
+ 	if (nh->nlmsg_seq != seq)
+@@ -197,8 +216,15 @@ static struct nlmsghdr *nl_next(int s, char *buf, struct nlmsghdr *nh, ssize_t *
+ 	}
+ 
+ 	*n = recv(s, buf, NLBUFSIZ, 0);
+-	if (*n < 0)
++	if (*n < 0) {
++#ifdef __ANDROID__
++		/* no netlink on Android: report end-of-stream, callers degrade */
++		*n = 0;
++		return NULL;
++#else
+ 		die_perror("netlink: Failed to recv()");
++#endif
++	}
+ 
+ 	nh = (struct nlmsghdr *)buf;
+ 	if (!NLMSG_OK(nh, *n))
+diff --git a/passt.h b/passt.h
+index 51ccd4f..82a0b2d 100644
+--- a/passt.h
++++ b/passt.h
+@@ -46,6 +46,13 @@ extern char *epoll_type_str[];
+ 	                                    epoll_type_str[(n)] : "?")
+ 
+ #include <resolv.h>	/* For MAXNS below */
++/* bionic's <resolv.h> lacks MAXNS/MAXDNSRCH (glibc-isms). */
++#ifndef MAXNS
++#define MAXNS 3
++#endif
++#ifndef MAXDNSRCH
++#define MAXDNSRCH 6
++#endif
+ 
+ /**
+  * struct fqdn - Representation of fully-qualified domain name
+diff --git a/tcp.c b/tcp.c
+index 3b78d2e..14c2d00 100644
+--- a/tcp.c
++++ b/tcp.c
+@@ -327,8 +327,8 @@
+  */
+ #define OPTLEN_MAX (((1UL << 4) - 1 - 5) * 4UL)
+ 
+-#ifndef __USE_MISC
+-/* From Linux UAPI, missing in netinet/tcp.h provided by musl */
++#if !defined(__USE_MISC) && !defined(__ANDROID__)
++/* From Linux UAPI, missing in netinet/tcp.h provided by musl (bionic HAS it) */
+ struct tcp_repair_opt {
+ 	__u32	opt_code;
+ 	__u32	opt_val;
+@@ -764,7 +764,7 @@ static void tcp_rtt_dst_check(const struct tcp_tap_conn *conn,
+ 	for (i = 0; i < LOW_RTT_TABLE_SIZE; i++) {
+ 		if (inany_equals(&tapside->oaddr, low_rtt_dst + i))
+ 			return;
+-		if (hole == -1 && IN6_IS_ADDR_UNSPECIFIED(low_rtt_dst + i))
++		if (hole == -1 && inany_is_unspecified6(low_rtt_dst + i))
+ 			hole = i;
+ 	}
+ 
+diff --git a/util.c b/util.c
+index c02aea9..cd9d737 100644
+--- a/util.c
++++ b/util.c
+@@ -389,8 +389,15 @@ bool ns_is_init(void)
+ 	bool ret = true;
+ 	int fd;
+ 
+-	if ((fd = open("/proc/self/uid_map", O_RDONLY | O_CLOEXEC)) < 0)
++	if ((fd = open("/proc/self/uid_map", O_RDONLY | O_CLOEXEC)) < 0) {
++#ifdef __ANDROID__
++		/* Android GKI builds without CONFIG_USER_NS: uid_map simply
++		 * doesn't exist — and there IS no other namespace to be in. */
++		if (errno == ENOENT)
++			return true;
++#endif
+ 		die_perror("Can't determine if we're in init namespace");
++	}
+ 
+ 	if (read(fd, buf, sizeof(root_uid_map)) != sizeof(root_uid_map) - 1 ||
+ 	    strncmp(buf, root_uid_map, sizeof(root_uid_map)))

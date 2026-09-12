@@ -103,3 +103,5 @@ CONFIG_VIRTIO_VSOCKETS_COMMON=y
 # + virtiofsd on the host. hostfs stays for the agent share dir.
 CONFIG_FUSE_FS=y
 CONFIG_VIRTIO_FS=y
+# passt networking (ADR-0025 D6): virtio-net driver for the guest
+CONFIG_VIRTIO_NET=y

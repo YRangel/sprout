@@ -1270,6 +1270,67 @@ fn cmd_up(
     // binary resolvability: SPROUT_UML_VIRTIOFSD, then sibling of argv[0],
     // then PATH. When absent: no device, no daemon, hostfs still works.
     let vfs_sock = dir.join("virtiofs.sock");
+    // passt networking (ADR-0025 D6): rootless NAT for the guest over
+    // vhost-user. Same discovery contract: SPROUT_UML_PASST → sibling → PATH.
+    let net_sock = dir.join("net.sock");
+    {
+        let net_bin = std::env::var("SPROUT_UML_PASST").ok().map(PathBuf::from)
+            .filter(|p| p.is_file())
+            .or_else(|| {
+                std::env::current_exe().ok()
+                    .and_then(|e| e.parent().map(|p| p.join("passt")))
+                    .filter(|p| p.is_file())
+            })
+            .or_else(|| {
+                std::env::var_os("PATH").and_then(|path| {
+                    std::env::split_paths(&path)
+                        .map(|d| d.join("passt"))
+                        .find(|p| p.is_file())
+                })
+            });
+        if let Some(net_bin) = net_bin {
+            let net_live = net_sock.exists()
+                && std::fs::read_to_string(dir.join("passt.pid"))
+                    .ok()
+                    .and_then(|p| p.trim().parse::<i32>().ok())
+                    .map(|pid| unsafe { libc::kill(pid, 0) } == 0)
+                    .unwrap_or(false);
+            if !net_live {
+                let _ = std::fs::remove_file(&net_sock);
+                let _ = std::fs::remove_file(dir.join("net.sock.repair"));
+                let logf = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("passt.log"))?;
+                /* qemu-user-net conventions; passt NATs through host
+                 * sockets so the guest's address is arbitrary. DNS: the
+                 * guest should use the real resolvers directly (passt
+                 * forwards), so pass them through. */
+                let child = std::process::Command::new(&net_bin)
+                    .args([
+                        "--vhost-user",
+                        "-s", &net_sock.to_string_lossy(),
+                        "-a", "10.0.2.15",
+                        "-m", "24",
+                        "-g", "10.0.2.2",
+                        "--dns", "8.8.8.8",
+                        "--dns", "1.1.1.1",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(logf)
+                    .spawn()?;
+                std::fs::write(dir.join("passt.pid"), child.id().to_string())?;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline && !net_sock.exists() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            if net_sock.exists() {
+                extra.push(format!("virtio_uml.device={}:1", net_sock.display()));
+            }
+        }
+    }
     {
         let daemon_bin = std::env::var("SPROUT_UML_VIRTIOFSD").ok().map(PathBuf::from)
             .filter(|p| p.is_file())
@@ -1510,6 +1571,17 @@ fn cmd_up(
                             Err(e) => eprintln!("sprout: virtiofs auto-mount: {e:#}"),
                         }
                     }
+                }
+                /* passt: static guest net config (the guest's address is
+                 * arbitrary — passt NATs to host sockets). DNS points at
+                 * the real resolvers (passt forwards them). */
+                if net_sock.exists() {
+                    let _ = agent_exec_files(
+                        &share,
+                        &["/bin/sh".to_string(), "-c".to_string(),
+                          "ip link set eth0 up && ip addr add 10.0.2.15/24 dev eth0 2>/dev/null; ip route replace default via 10.0.2.2; printf 'nameserver 8.8.8.8\\nnameserver 1.1.1.1\\n' > /etc/resolv.conf".to_string()],
+                        &[], "/", &[], Duration::from_secs(15),
+                    );
                 }
                 return Ok(0);
             }
