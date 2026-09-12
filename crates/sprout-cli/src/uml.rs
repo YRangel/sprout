@@ -1033,6 +1033,33 @@ pub fn uml_main(args: &[std::ffi::OsString]) -> anyhow::Result<u8> {
             }
             cmd_exec(&id, &cmd, &env_extra, timeout)
         }
+        "pty" => {
+            let mut id = "default".to_string();
+            let mut i = 1;
+            while i < argv.len() {
+                match argv[i].as_str() {
+                    "--id" => {
+                        i += 1;
+                        id = argv
+                            .get(i)
+                            .ok_or_else(|| anyhow!("--id needs a name"))?
+                            .clone();
+                    }
+                    "--" => {
+                        i += 1;
+                        break;
+                    }
+                    f if f.starts_with('-') => bail!("unknown uml pty flag: {f}"),
+                    _ => break,
+                }
+                i += 1;
+            }
+            let cmd: Vec<String> = argv[i..].iter().cloned().collect();
+            if cmd.is_empty() {
+                bail!("usage: sprout uml pty [--id N] [--] CMD [ARGS...]");
+            }
+            cmd_pty(&id, &cmd)
+        }
         "down" => {
             let mut id = "default".to_string();
             let mut i = 1;
@@ -1729,6 +1756,246 @@ fn poweroff_files(dir: &std::path::Path) -> bool {
         }
     }
     false
+}
+
+// PTY channel layout — MUST match uml/sprout-uml-agent.c (PTY broker).
+const PTY_OFF: usize = 1 << 20;
+const PTY_MAGIC: u32 = 0x31595450;
+const PTY_ST_FREE: u32 = 0;
+const PTY_ST_REQ: u32 = 1;
+const PTY_ST_RUN: u32 = 2;
+const PTY_ST_EXIT: u32 = 3;
+const PTY_CAP: u32 = 32768;
+const PTY_OUT_HD: usize = 64;
+const PTY_OUT_DATA: usize = 128;
+const PTY_IN_HD: usize = 33024 + 64;
+const PTY_IN_DATA: usize = 33024 + 128;
+const PTY_REQ: usize = 66176;
+const PTY_REQ_MAX: usize = 8192;
+
+struct PtyChan {
+    base: *mut u8,
+}
+impl PtyChan {
+    unsafe fn ld(&self, off: usize) -> u32 {
+        std::ptr::read_volatile(self.base.add(off) as *const u32)
+    }
+    unsafe fn st(&self, off: usize, v: u32) {
+        std::ptr::write_volatile(self.base.add(off) as *mut u32, v);
+    }
+    unsafe fn write_circ(&self, hd: usize, data: usize, buf: &[u8]) -> usize {
+        let head = self.ld(hd);
+        let tail = self.ld(hd + 4);
+        let avail = PTY_CAP.wrapping_sub(head.wrapping_sub(tail));
+        let n = (buf.len() as u32).min(avail) as usize;
+        for (i, &b) in buf.iter().take(n).enumerate() {
+            std::ptr::write_volatile(
+                self.base.add(data + ((head.wrapping_add(i as u32)) & (PTY_CAP - 1)) as usize),
+                b,
+            );
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        self.st(hd, head.wrapping_add(n as u32));
+        n
+    }
+    unsafe fn read_circ(&self, hd: usize, data: usize, buf: &mut [u8]) -> usize {
+        let head = self.ld(hd);
+        let tail = self.ld(hd + 4);
+        let avail = head.wrapping_sub(tail);
+        let n = (buf.len() as u32).min(avail) as usize;
+        for (i, b) in buf.iter_mut().take(n).enumerate() {
+            *b = std::ptr::read_volatile(
+                self.base.add(data + ((tail.wrapping_add(i as u32)) & (PTY_CAP - 1)) as usize),
+            );
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        self.st(hd + 4, tail.wrapping_add(n as u32));
+        n
+    }
+}
+
+struct TtyGuard {
+    fd: i32,
+    saved: Option<libc::termios>,
+}
+impl TtyGuard {
+    fn raw(fd: i32) -> Self {
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut t) == 0 {
+                let saved = t;
+                let mut raw = t;
+                raw.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+                raw.c_oflag &= !libc::OPOST;
+                raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
+                raw.c_cc[libc::VMIN] = 1;
+                raw.c_cc[libc::VTIME] = 0;
+                let _ = libc::tcsetattr(fd, libc::TCSANOW, &raw);
+                TtyGuard { fd, saved: Some(saved) }
+            } else {
+                TtyGuard { fd, saved: None }
+            }
+        }
+    }
+}
+impl Drop for TtyGuard {
+    fn drop(&mut self) {
+        if let Some(t) = &self.saved {
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, t) };
+        }
+    }
+}
+
+/// `sprout uml pty`: run a command inside the guest under a REAL guest-kernel
+/// pty, relaying the terminal over the shared-physmem channel (the first
+/// relay broker — see ADR-0025). Interactive shells/editors/apt work.
+fn cmd_pty(id: &str, cmd: &[String]) -> anyhow::Result<u8> {
+    use anyhow::{anyhow, bail, Context};
+    let dir = uml_dir(id);
+    let holder_pid: i32 = std::fs::read_to_string(dir.join("holder.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| anyhow!("no live holder for guest '{id}' (sprout uml up --shm first)"))?;
+    /* physfd = holder argv[1]; adopt it via pidfd (SELinux-safe). */
+    let cl = std::fs::read(format!("/proc/{holder_pid}/cmdline"))?;
+    let mut fields = cl.split(|&b| b == 0);
+    let _name = fields.next();
+    let physfd: i32 = fields
+        .next()
+        .and_then(|f| std::str::from_utf8(f).ok())
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow!("holder cmdline has no physmem fd"))?;
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, holder_pid, 0) } as i32;
+    if pidfd < 0 {
+        bail!("pidfd_open: {}", std::io::Error::last_os_error());
+    }
+    let mfd = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd, physfd, 0) } as i32;
+    if mfd < 0 {
+        bail!("pidfd_getfd: {}", std::io::Error::last_os_error());
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(mfd, &mut st) } < 0 {
+        bail!("fstat physmem fd failed");
+    }
+    let size = st.st_size as usize;
+    let ring_bytes = 2usize << 20;
+    if size < ring_bytes {
+        bail!("physmem too small for ring");
+    }
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            ring_bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            mfd,
+            (size - ring_bytes) as i64,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        bail!("mmap ring: {}", std::io::Error::last_os_error());
+    }
+    let chan = PtyChan { base: unsafe { (map as *mut u8).add(PTY_OFF) } };
+    unsafe {
+        if chan.ld(0) != PTY_MAGIC && chan.ld(0) != 0 {
+            bail!("PTY channel magic mismatch — agent broker absent?");
+        }
+        if chan.ld(4) != PTY_ST_FREE {
+            bail!("PTY channel busy (state {}); one pty at a time for now", chan.ld(4));
+        }
+        /* request blob: [u32 argc][lp argv x argc][lp cwd][u16 rows][u16 cols]
+         * (write the length words as BYTES: string lengths aren't aligned,
+         * and Rust's runtime UB check panics on misaligned u32 stores) */
+        let req = chan.base.add(PTY_REQ);
+        let mut off = 0usize;
+        let put_u32 = |req: *mut u8, off: usize, v: u32| {
+            std::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), req.add(off), 4);
+        };
+        put_u32(req, off, cmd.len() as u32);
+        off += 4;
+        for a in cmd {
+            let b = a.as_bytes();
+            put_u32(req, off, b.len() as u32);
+            off += 4;
+            std::ptr::copy_nonoverlapping(b.as_ptr(), req.add(off), b.len());
+            off += b.len();
+        }
+        put_u32(req, off, 1u32);
+        off += 4;
+        *req.add(off) = b'/';
+        off += 1;
+        let (mut rows, mut cols) = (24u16, 80u16);
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0 {
+            rows = ws.ws_row;
+            cols = ws.ws_col;
+        }
+        std::ptr::copy_nonoverlapping(rows.to_le_bytes().as_ptr(), req.add(off), 2);
+        std::ptr::copy_nonoverlapping(cols.to_le_bytes().as_ptr(), req.add(off + 2), 2);
+        if off + 4 > PTY_REQ_MAX {
+            bail!("pty request too large");
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        chan.st(4, PTY_ST_REQ);
+        /* wait RUNNING */
+        let t0 = Instant::now();
+        while chan.ld(4) == PTY_ST_REQ {
+            if t0.elapsed() > Duration::from_secs(10) {
+                chan.st(4, PTY_ST_FREE);
+                bail!("pty broker did not pick up the request (agent alive?)");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if chan.ld(4) != PTY_ST_RUN {
+            let code = chan.ld(12) as i32;
+            chan.st(4, PTY_ST_FREE);
+            bail!("pty spawn failed (code {code})");
+        }
+        /* pump: stdin -> in circle, out circle -> stdout, until EXIT */
+        let _guard = TtyGuard::raw(0);
+        let mut out = std::io::stdout().lock();
+        use std::io::Write;
+        let mut buf = [0u8; 4096];
+        loop {
+            let state = chan.ld(4);
+            /* drain output */
+            loop {
+                let n = chan.read_circ(PTY_OUT_HD, PTY_OUT_DATA, &mut buf);
+                if n == 0 {
+                    break;
+                }
+                let _ = out.write_all(&buf[..n]);
+                let _ = out.flush();
+            }
+            if state == PTY_ST_EXIT {
+                break;
+            }
+            /* stdin -> in circle */
+            let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+            let pr = libc::poll(&mut pfd, 1, 5);
+            if pr > 0 && (pfd.revents & libc::POLLIN) != 0 {
+                let r = libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+                if r > 0 {
+                    let mut done = 0usize;
+                    while done < r as usize {
+                        let n = chan.write_circ(PTY_IN_HD, PTY_IN_DATA, &buf[done..r as usize]);
+                        if n == 0 {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        done += n;
+                    }
+                } else if r == 0 {
+                    /* host stdin closed: half-close by leaving state; the
+                     * child will see EOF when the broker's master closes */
+                }
+            }
+        }
+        let code = chan.ld(12) as i32;
+        chan.st(4, PTY_ST_FREE);
+        libc::munmap(map, ring_bytes);
+        Ok((code & 0xff) as u8)
+    }
 }
 
 fn cmd_down(id: &str) -> anyhow::Result<u8> {

@@ -130,6 +130,177 @@ static uint64_t sp_read_token(void) {
     return sp_session_token;
 }
 
+static void *ring_map(void);
+
+/* ---------- PTY broker (ADR-0025: first relay broker) ----------
+ * A fast-lane process that needs a REAL guest-kernel terminal gets one:
+ * the host writes an exec request into the PTY channel (carved inside
+ * the ring window at ring_base+1MiB — the window is 2MiB, the request
+ * ring uses <500KB) and streams bytes over two SPSC circular buffers in
+ * shared physmem. We own a real guest pty master and pump both ways.
+ * Layout (must match crates/sprout-cli/src/uml.rs pty channel):
+ *   +0    u32 magic PTY1 | +4 u32 state | +8 u16 rows u16 cols
+ *   +12   i32 exit_code  | +16 u32 flags
+ *   +64   out circle (agent→host): head@+64 tail@+68, data@+128 [32KB]
+ *   +33088 in circle (host→agent): head@+33088 tail@+33092, data@+33152 [32KB]
+ *   +66176 request blob [8KB]: [u32 argc][lp argv x argc][lp cwd]      */
+#define PTY_OFF        (1u << 20)
+#define PTY_MAGIC      0x31595450u /* 'PTY1' LE */
+#define PTY_ST_FREE    0u
+#define PTY_ST_REQ     1u
+#define PTY_ST_RUN     2u
+#define PTY_ST_EXIT    3u
+#define PTY_CAP        32768u
+#define PTY_OUT_HD     64u
+#define PTY_OUT_DATA   128u
+#define PTY_IN_HD      (33024u + 64u)
+#define PTY_IN_DATA    (33024u + 128u)
+#define PTY_REQ        66176u
+#define PTY_REQ_MAX    8192u
+
+static uint8_t *pty_base;
+static inline uint32_t pty_ld32(uint32_t off) {
+    uint32_t v; __atomic_load((uint32_t *)(pty_base + off), &v, __ATOMIC_ACQUIRE); return v;
+}
+static inline void pty_st32(uint32_t off, uint32_t v) {
+    __atomic_store((uint32_t *)(pty_base + off), &v, __ATOMIC_RELEASE);
+}
+/* circle write: returns bytes written (0 when full) */
+static size_t pty_write_circ(uint32_t hd_off, uint32_t data_off, const uint8_t *buf, size_t n) {
+    uint32_t head = pty_ld32(hd_off), tail = pty_ld32(hd_off + 4);
+    uint32_t avail = PTY_CAP - (head - tail);
+    if ((uint32_t)n > avail) n = avail;
+    for (size_t i = 0; i < n; i++)
+        pty_base[data_off + ((head + i) & (PTY_CAP - 1))] = buf[i];
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    pty_st32(hd_off, head + n);
+    return n;
+}
+/* circle read: returns bytes read (0 when empty) */
+static size_t pty_read_circ(uint32_t hd_off, uint32_t data_off, uint8_t *buf, size_t n) {
+    uint32_t head = pty_ld32(hd_off), tail = pty_ld32(hd_off + 4);
+    uint32_t avail = head - tail;
+    if ((uint32_t)n > avail) n = avail;
+    for (size_t i = 0; i < n; i++)
+        buf[i] = pty_base[data_off + ((tail + i) & (PTY_CAP - 1))];
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    pty_st32(hd_off + 4, tail + n);
+    return n;
+}
+
+static char *pty_rd_lp(const uint8_t **p, const uint8_t *end) {
+    if (*p + 4 > end) return NULL;
+    uint32_t n; memcpy(&n, *p, 4); *p += 4;
+    if (n == 0 || n > 4096 || *p + n > end) return NULL;
+    char *s = calloc(1, n + 1);
+    if (!s) return NULL;
+    memcpy(s, *p, n); *p += n;
+    return s;
+}
+
+static void pty_broker(void) {
+    uint8_t *base = ring_map();
+    if (!base) return;
+    pty_base = base + PTY_OFF;
+    if (pty_ld32(0) != PTY_MAGIC) pty_st32(0, PTY_MAGIC);
+    if (pty_ld32(4) != PTY_ST_FREE) pty_st32(4, PTY_ST_FREE);
+    /* the broker needs devpts: mount it ourselves (mini profile has no
+     * systemd/fstab to do it). */
+    mkdir("/dev/pts", 0755);
+    mount("devpts", "/dev/pts", "devpts", 0, "gid=5,mode=620,ptmxmode=666");
+    /* some kernels also want a /dev/ptmx link (legacyless devpts) */
+    if (access("/dev/ptmx", F_OK) < 0) {
+        int m = open("/dev/ptmx", O_RDWR | O_CLOEXEC);
+        if (m < 0) {
+            /* create the node manually: char 5:2 */
+            mknod("/dev/ptmx", S_IFCHR | 0666, makedev(5, 2));
+        } else close(m);
+    }
+    for (;;) {
+        /* wait for a request */
+        while (pty_ld32(4) == PTY_ST_FREE) usleep(2000);
+        if (pty_ld32(4) != PTY_ST_REQ) { usleep(2000); continue; }
+        const uint8_t *p = pty_base + PTY_REQ, *end = p + PTY_REQ_MAX;
+        uint32_t argc = 0;
+        memcpy(&argc, p, 4); p += 4;
+        if (argc == 0 || argc > 64) { pty_st32(12, -22); pty_st32(4, PTY_ST_EXIT); continue; }
+        char *argv[65]; memset(argv, 0, sizeof argv);
+        uint32_t i;
+        for (i = 0; i < argc && (argv[i] = pty_rd_lp(&p, end)); i++) {}
+        char *cwd = pty_rd_lp(&p, end);
+        if (i != argc || !cwd) { pty_st32(12, -22); pty_st32(4, PTY_ST_EXIT); continue; }
+        uint16_t rows, cols;
+        if (p + 4 <= end) { memcpy(&rows, p, 2); memcpy(&cols, p + 2, 2); }
+        else { rows = 24; cols = 80; }
+
+        int master = posix_openpt(O_RDWR | O_CLOEXEC | O_NOCTTY);
+        if (master < 0 || grantpt(master) < 0 || unlockpt(master) < 0) {
+            if (master >= 0) close(master);
+            pty_st32(12, -errno); pty_st32(4, PTY_ST_EXIT); continue;
+        }
+        struct winsize ws = { rows, cols, 0, 0 };
+        ioctl(master, TIOCSWINSZ, &ws);
+        int slave = open(ptsname(master), O_RDWR | O_NOCTTY);
+        if (slave < 0) { close(master); pty_st32(12, -errno); pty_st32(4, PTY_ST_EXIT); continue; }
+
+        pid_t c = fork();
+        if (c == 0) {
+            setsid();
+            dup2(slave, 0); dup2(slave, 1); dup2(slave, 2);
+            ioctl(0, TIOCSCTTY, 0);
+            if (slave > 2) close(slave);
+            close(master);
+            chdir(cwd);
+            execvp(argv[0], argv);
+            _exit(127);
+        }
+        close(slave);
+        if (c < 0) { close(master); pty_st32(12, -errno); pty_st32(4, PTY_ST_EXIT); continue; }
+        pty_st32(4, PTY_ST_RUN);
+
+        /* pump: master <-> out circle, in circle -> master, until child dies */
+        uint8_t buf[4096];
+        int status = 0, dead = 0;
+        while (!dead || pty_ld32(PTY_OUT_HD) != pty_ld32(PTY_OUT_HD + 4)) {
+            if (!dead) {
+                pid_t w = waitpid(c, &status, WNOHANG);
+                if (w == c) dead = 1;
+            }
+            struct pollfd pfd = { master, POLLIN, 0 };
+            int pr = poll(&pfd, 1, 5);
+            if (pr > 0 && (pfd.revents & POLLIN)) {
+                ssize_t r = read(master, buf, sizeof buf);
+                if (r > 0) {
+                    size_t off = 0;
+                    while (off < (size_t)r) {
+                        size_t wn = pty_write_circ(PTY_OUT_HD, PTY_OUT_DATA, buf + off, r - off);
+                        if (!wn) { usleep(1000); continue; }
+                        off += wn;
+                    }
+                } else if (r == 0) { dead = 1; }
+            }
+            /* in circle -> master */
+            for (;;) {
+                size_t rn = pty_read_circ(PTY_IN_HD, PTY_IN_DATA, buf, sizeof buf);
+                if (!rn) break;
+                ssize_t wr = write(master, buf, rn);
+                if (wr < 0) break;
+            }
+        }
+        if (!dead) waitpid(c, &status, 0);
+        close(master);
+        int rc = WIFEXITED(status) ? WEXITSTATUS(status)
+             : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+        pty_st32(12, (uint32_t)rc);
+        pty_st32(4, PTY_ST_EXIT);
+        for (i = 0; i < argc; i++) free(argv[i]);
+        free(cwd);
+        /* linger EXIT state briefly so the host reads the code, then FREE */
+        usleep(200 * 1000);
+        if (pty_ld32(4) == PTY_ST_EXIT) pty_st32(4, PTY_ST_FREE);
+    }
+}
+
 /* ---------- rung 3: shared-physmem ring transport ----------
  * The sprout fork kernel exposes /dev/sprout-shm: guest userspace mmaps
  * the shared physmem window (backed by the host launcher's memfd via
@@ -1088,6 +1259,15 @@ int main(int argc, char **argv) {
         pid_t r = fork();
         if (r == 0) {
             ring_loop();
+            _exit(0);
+        }
+    }
+    /* PTY broker: real guest terminals for fast-lane processes, over the
+     * shared-physmem channel. No-op when the ring device is absent. */
+    {
+        pid_t b = fork();
+        if (b == 0) {
+            pty_broker();
             _exit(0);
         }
     }
