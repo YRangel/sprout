@@ -3,6 +3,15 @@
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 ## [Unreleased]
 
+### Added - `sprout uml pty`: real guest terminals (first relay broker)
+- `sprout uml pty [--id N] -- CMD` runs CMD inside the guest under a REAL
+  guest-kernel pty (devpts, setsid+TIOCSCTTY), streaming the terminal over
+  two SPSC circular buffers carved in the shared-physmem ring window
+  (ring_base+1MiB). Interactive sessions work: tty echo semantics,
+  os.isatty(0)=True, winsize from TIOCGWINSZ, exit codes propagate.
+  The guest agent gains a dedicated pty_broker process; devpts is
+  auto-mounted when the boot profile lacks it.
+
 ### Added - passt: rootless guest networking (ADR-0025 D6)
 - `sprout uml up` discovers `passt` ($SPROUT_UML_PASST → sibling → PATH),
   spawns it `--vhost-user` on <uml-dir>/net.sock (guest 10.0.2.15/24, gw
