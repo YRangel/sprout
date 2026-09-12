@@ -1,5 +1,25 @@
 # Benchmarks
 
+### 2026-09-12 — virtio-fs vs hostfs + notify-statics receipts (ADR-0025)
+
+Guest IO, 50 MiB dd (phone1, 6.12.23-android16, UML arm64 sidecar):
+
+| path | read | write | coherence |
+|---|---|---|---|
+| **virtio-fs** (virtiofsd, cache=auto) | **610 MB/s** | **346 MB/s** | BOTH ways (FUSE invalidation + writeback) |
+| hostfs | 487 MB/s | 298 MB/s | guest→host only; host→guest STALE forever |
+
+- virtio-fs beats hostfs on raw throughput AND fixes the coherence class.
+- mmap read+write over virtio-fs verified working, writeback host-visible.
+- statics lane (`bench/run-statics.sh`): sprout notify-statics 26 ms vs
+  proot 277 ms static→dynamic python3 (**10.65×**); ptrace-lane 27 ms.
+- uml exec (files transport, with per-exec clean-cache flush): 62-66 ms
+  (median of 5, first 100 ms) — inside the old 40-90 ms envelope, i.e.
+  the ADR-0025 D5 flush costs nothing measurable.
+- passt networking (rootless NAT): ping gw 4.9 ms, ping 1.1.1.1 37-51 ms,
+  DNS resolution + HTTP 200 (138 KiB Release file) verified.
+- dead-man switch: kill -9 holder → guest syncs + powers off at 31 s.
+
 ### 2026-08-22 — comprehensive suite (`bench/run-all.sh`)
 
 Full-suite workspace: one command, one `summary.md` + `machine-info.md`
