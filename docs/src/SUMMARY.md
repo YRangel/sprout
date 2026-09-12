@@ -19,6 +19,7 @@
 - [Interception model](./architecture/interception.md)
 - [Path translation](./architecture/translation.md)
 - [Threat model](./architecture/threat-model.md)
+- [Android syscall policy map](./architecture/android-syscall-policy.md)
 
 # Research
 

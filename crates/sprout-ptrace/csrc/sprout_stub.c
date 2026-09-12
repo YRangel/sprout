@@ -348,6 +348,21 @@ static unsigned long load_guest(const char *path, unsigned long *phdr_out)
 #define UC_PC_OFF 440
 #define SI_SYSCALL_OFF 24
 
+/* seccomp-TRAP frame pc convention VARIES by kernel: some point AT the
+ * trapped svc (re-execution semantics; the #74 notes, Android 16 of
+ * 2026-08), others ALREADY point past it (6.12.23-android16 observed
+ * 2026-09-11: pc+=4 skipped the next instruction — the following svc ran
+ * with a stale x8, trapped as the WRONG nr, cascaded to SIGBUS pc=0x32).
+ * Detect by reading the instruction word: svc #0 = 0xd4000001. */
+#define SP_SVC0 0xd4000001u
+static void stub_frame_skip_svc(u64 *uc)
+{
+    u32 *pc = (u32 *)(unsigned long)uc[UC_PC_OFF / 8];
+    if (*pc == SP_SVC0)
+        uc[UC_PC_OFF / 8] += 4;   /* pc AT the svc: step over it */
+    /* else: pc already past the svc — advancing would eat the NEXT insn */
+}
+
 /* glibc table: set_robust_list, rseq */
 static const long g_glibc_ok[] = { 99, 293 };
 /* musl table: faccessat, set*id family, setgroups */
@@ -363,6 +378,18 @@ static const long g_musl_ok[] = { 48, 143, 144, 145, 146, 147, 148, 149, 150, 15
 static const long g_enosys[] = {
     202, 425, 426, 427,
     186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197,
+};
+/* glibc set*id family: EPERM is the truth (musl forges success instead,
+ * see g_musl_ok). Mirrors SP_EMULATE_GLIBC_EPERM in sprout_ptrace.c. */
+static const long g_glibc_setid[] = {
+    143, 144, 145, 146, 149, 151, 152, 159,
+};
+/* privilege/mount class: Android TRAPs these for untrusted_app (full map
+ * 2026-09-11). EPERM is the honest rootless answer; callers survive it
+ * (busybox mount, hostname(1), dpkg postinsts). Mirrors SP_EMULATE_BASE. */
+static const long g_eperm[] = {
+    39, 40, 41, 51, 58, 89, 104, 105, 106, 116, 142, 161, 162, 170, 171,
+    224, 225, 273,
 };
 
 static int stub_is_ok(long nr, const long *tbl, int n)
@@ -390,8 +417,12 @@ static void stub_sigsys_handler(int sig __attribute__((unused)),
                                (int)(sizeof(g_glibc_ok) / sizeof(g_glibc_ok[0])));
     if (!ok && nr == 202 /*accept*/) {
         /* ANDROID TRAPs legacy accept(2), accepts accept4: rewrite the
-         * interrupted frame (x8=242, x3=flags=0) and DON'T advance pc —
-         * sigreturn re-executes the same svc, now as accept4(fd,addr,len,0). */
+         * interrupted frame (x8=242, x3=flags=0) so the svc re-executes
+         * as accept4(fd,addr,len,0). pc must point AT the svc for the
+         * re-execution: rewind it when the frame came in past-svc form. */
+        u32 *pcp = (u32 *)(unsigned long)uc[UC_PC_OFF / 8];
+        if (*pcp != SP_SVC0)
+            uc[UC_PC_OFF / 8] -= 4;
         uc[UC_X8_OFF / 8] = 242;
         uc[UC_X3_OFF / 8] = 0;
         return;
@@ -399,19 +430,44 @@ static void stub_sigsys_handler(int sig __attribute__((unused)),
     if (!ok) {
         if (stub_is_ok(nr, g_enosys, (int)(sizeof(g_enosys) / sizeof(g_enosys[0])))) {
             uc[UC_X0_OFF / 8] = (u64)-38; /* -ENOSYS */
-            uc[UC_PC_OFF / 8] += 4;
+            stub_frame_skip_svc(uc);
             return;
         }
-        char db[48];
+        if (stub_is_ok(nr, g_eperm, (int)(sizeof(g_eperm) / sizeof(g_eperm[0])))) {
+            uc[UC_X0_OFF / 8] = (u64)-13; /* -EPERM */
+            stub_frame_skip_svc(uc);
+            return;
+        }
+        if (!musl && stub_is_ok(nr, g_glibc_setid, (int)(sizeof(g_glibc_setid) / sizeof(g_glibc_setid[0])))) {
+            uc[UC_X0_OFF / 8] = (u64)-13; /* -EPERM: the truth for glibc */
+            stub_frame_skip_svc(uc);
+            return;
+        }
+        char db[64];
         db[0]='s'; db[1]='g'; db[2]='s'; db[3]='y'; db[4]='s'; db[5]='-'; db[6]='n'; db[7]='r'; db[8]='='; int n=9;
         long m2 = nr;
         if (m2 < 0) { db[n++]='-'; m2=-m2; }
         char rdc[12]; int m=0; long t=m2;
         do { rdc[m++]=(char)('0'+t%10); t/=10; } while (t);
         while (m>0) db[n++]=rdc[--m];
+        /* si_code @ siginfo+8, si_arch @ +28: name the signal's source so
+         * SECCOMP(1) traps separate from stray SIGSYS. */
+        const char *cd = " code="; for (const char *c = cd; *c; c++) db[n++]=*c;
+        long cdv = (long)(i32)info[8 / 4];
+        if (cdv < 0) { db[n++]='-'; cdv=-cdv; }
+        char cdb[12]; int cm=0; long ct=cdv;
+        do { cdb[cm++]=(char)('0'+ct%10); ct/=10; } while (ct);
+        while (cm>0) db[n++]=cdb[--cm];
+        const char *ar = " arch="; for (const char *c = ar; *c; c++) db[n++]=*c;
+        n = stub_hex(db, n, (u32)info[28 / 4]);
         db[n++]='\n';
         (void)sc3(SYS_write, 2, (long)db, n);
-        return; /* let default action kill: honest */
+        /* honest ENOSYS, not death-by-re-execution: on past-svc kernels
+         * there IS no re-execution to rely on, and an unadvanced frame
+         * resumes with garbage x0 (observed: getpid returning a pointer). */
+        uc[UC_X0_OFF / 8] = (u64)-38;
+        stub_frame_skip_svc(uc);
+        return;
     }
     if (stub_crashdump()) {
         static volatile long cd_n;
@@ -445,7 +501,7 @@ static void stub_sigsys_handler(int sig __attribute__((unused)),
         }
     }
     uc[UC_X0_OFF / 8] = 0;          /* fake success */
-    uc[UC_PC_OFF / 8] += 4;         /* step over the svc */
+    stub_frame_skip_svc(uc);        /* step over the svc (kernel-variant safe) */
 }
 
 extern void stub_restorer(void);

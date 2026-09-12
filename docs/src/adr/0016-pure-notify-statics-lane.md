@@ -2,6 +2,22 @@
 
 ## Status
 
+**Amended 2026-09-11:** two field fixes on kernel 6.12.23-android16.
+(1) seccomp-TRAP frames on this kernel arrive with pc ALREADY PAST the
+svc — the #74 `pc+=4` skipped the NEXT instruction and cascaded (two
+EMUs for one syscall, SIGBUS at pc=0x32). `stub_frame_skip_svc()` now
+detects the convention by reading the instruction word; the accept
+pivot rewinds instead. (2) untabled trapped nrs now forge -ENOSYS (+
+one-line diagnostic) instead of relying on death-by-re-execution, which
+on past-svc kernels returned garbage register content. Plus: mount-class
+(-EPERM) and glibc set*id (-EPERM) tables added from the full policy
+map in `architecture/android-syscall-policy.md`; build.rs now mirrors
+sprout-super/sprout-stub into the profile dir (a Sep-7 stale supervisor
+had silently shadowed the fresh one, dropping this lane to legacy
+ptrace for all dev-loop runs).
+
+
+
 **Accepted, default ON (2026-08-12-L, #74 closed):** the stub lane is
 the statics default again; `SPROUT_NOTIFY_STATICS=0` remains as the
 legacy-lane escape hatch.

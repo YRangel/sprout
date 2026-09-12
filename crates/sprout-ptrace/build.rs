@@ -91,6 +91,34 @@ fn main() {
 
     println!("cargo:rustc-env=SPROOT_PTRACE_EXE={}", exe.display());
     println!("cargo:rustc-env=SPROUT_STUB_EXE={}", stub.display());
+
+    /* Dev-loop staleness fix: runtime discovery prefers a sibling of
+     * argv[0], so a leftover target/debug/sprout-super from an OLD build
+     * silently wins over the fresh OUT_DIR artifacts (observed 2026-09-11:
+     * a Sep-7 supervisor ran for days, and the missing sprout-stub sibling
+     * dropped the notify-statics default lane to legacy ptrace). Mirror
+     * both artifacts into the profile dir (OUT_DIR/../../..) on every
+     * build so the sibling path is always the current build. */
+    if let Some(profile_dir) = out_dir.ancestors().nth(3) {
+        for art in [&exe, &stub] {
+            let dst = profile_dir.join(art.file_name().unwrap());
+            let stale = std::fs::metadata(&dst)
+                .and_then(|d| d.modified())
+                .map(|dm| {
+                    std::fs::metadata(art)
+                        .and_then(|s| s.modified())
+                        .map(|sm| sm > dm)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(true);
+            if stale {
+                let tmp = dst.with_extension("new");
+                if std::fs::copy(art, &tmp).is_ok() {
+                    let _ = std::fs::rename(&tmp, &dst);
+                }
+            }
+        }
+    }
 }
 
 /// Compile a minimal freestanding blob with the candidate -Wl flag and

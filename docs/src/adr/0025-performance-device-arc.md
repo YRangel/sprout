@@ -40,21 +40,21 @@ Deep research (web + local kernel tree + live probes) changed the map:
 
 ## Decision
 
-### D1. Supervisor: PTRACE_SYSCALL → PTRACE_SYSEMU (perf flagship)
+### D1. Supervisor: PTRACE_SYSCALL stays; SYSEMU evaluated and REJECTED
 
-The ptrace supervisor intercepts at syscall ENTRY only, with the syscall
-cancelled — one stop per syscall instead of two. Syscalls whose RESULT we
-must observe (openat fd returns, getcwd, readlink) are executed under
-PTRACE_SYSCALL selectively and the tracee is returned to SYSEMU
-immediately after. Fallback: if SYSEMU is rejected at runtime (older host
-kernels), keep today's PTRACE_SYSCALL path (runtime probe, no config).
-
-Expected: ~2× fewer stops on the fallback lane. Hard wall that remains:
-no syscall filtering without seccomp (proven dead on this host), so every
-syscall still costs one stop. This is the platform ceiling.
-
-Correction recorded: demotion-to-guest is a SEMANTICS fix, not a speed
-fix — UML pays the same SYSEMU stop per guest syscall.
+Probed 2026-09-11 (PTRACE_SYSEMU works on this host, arm64 ≥5.3):
+SYSEMU cancels the pending syscall and **cannot interleave with
+execution** — `PTRACE_SYSCALL`-continue from a SYSEMU stop does NOT
+execute the pending syscall (probed: cancelled exit_group falls off into
+a SIGILL loop). SYSEMU is only viable for emulate-everything kernels
+(UML's model, stub pages included) — not for a translate-and-execute
+supervisor. The 2-stop floor for executed syscalls is the platform
+truth, and it does NOT matter: the DEFAULT statics lane is the
+notify-stub lane (ADR-0016, measured 4.0× vs ptrace on syscall-dense
+loads), ptrace is the legacy fallback. The REAL perf lever found this
+cycle: **seccomp user-notify works on this host** (prctl/seccomp(2)/
+NEW_LISTENER/ADDFD all allowed — an older probe note claiming EPERM was
+wrong; corrected in the policy map doc).
 
 ### D2. Bridge auth: token as ring-header capability
 

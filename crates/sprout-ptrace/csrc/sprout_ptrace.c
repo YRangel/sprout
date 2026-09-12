@@ -149,6 +149,33 @@ static const sp_emul_rule SP_EMULATE_BASE[] = {
     { 183, -38 },  /* mq_timedreceive*/
     { 184, -38 },  /* mq_notify      */
     { 185, -38 },  /* mq_getsetattr  */
+    { 217, -38 },  /* add_key    — keyring: never available to apps */
+    { 218, -38 },  /* request_key */
+    { 219, -38 },  /* keyctl     */
+    { 42,  -38 },  /* nfsservctl — dead nr */
+    /* privilege/mount class: Android TRAPs these for untrusted_app (full
+     * policy map 2026-09-11, docs/src/architecture/android-syscall-policy.md).
+     * -EPERM is the honest rootless answer: callers (busybox mount,
+     * hostname(1), dpkg postinsts) report "permission denied" and SURVIVE,
+     * where a forwarded SIGSYS killed the whole guest before. */
+    { 39,  -13 },  /* umount2    */
+    { 40,  -13 },  /* mount      */
+    { 41,  -13 },  /* pivot_root */
+    { 51,  -13 },  /* chroot     */
+    { 58,  -13 },  /* vhangup    */
+    { 89,  -13 },  /* acct       */
+    { 104, -13 },  /* kexec_load */
+    { 105, -13 },  /* init_module   */
+    { 106, -13 },  /* delete_module */
+    { 116, -13 },  /* syslog     */
+    { 142, -13 },  /* reboot     */
+    { 161, -13 },  /* sethostname   */
+    { 162, -13 },  /* setdomainname */
+    { 170, -13 },  /* settimeofday  */
+    { 171, -13 },  /* adjtimex      */
+    { 224, -13 },  /* swapon     */
+    { 225, -13 },  /* swapoff    */
+    { 273, -13 },  /* finit_module */
     { 272, -38 },  /* kcmp — seccomp-killed for android app domains; glibc
                     * only probes it opportunistically (dirent dedup), so
                     * -ENOSYS is the honest fallback */
@@ -225,6 +252,13 @@ static const sp_emul_rule SP_EMULATE_BASE[] = {
     { 151, -1 },   /* setresgid */
     { 152, -1 },   /* setfsgid */
 };
+/* glibc-only EPERM extras: Android TRAPs the set*id family; musl forges
+ * SUCCESS (its extra table, checked AFTER base), glibc must see EPERM —
+ * a guest that legitimately changes IDs is entitled to the truth. */
+static const long SP_EMULATE_GLIBC_EPERM[] = {
+    143, 144, 145, 146, 149, 151, 152, 159,
+};
+
 /* Musl extra: faccessat init-poll + Android-blocked set*id family — the
  * "already at minimal privilege" truth of a rootless sandbox. Applied at
  * signal-stop level for musl-flavored tracees (kind 3, dynamic -of-musl),
@@ -3575,6 +3609,11 @@ int main(int argc, char **argv) {
                 if (!emulated && use_musl_extra) {
                     for (size_t i = 0; i < sizeof(SP_EMULATE_MUSL_EXTRA)/sizeof(*SP_EMULATE_MUSL_EXTRA); i++) {
                         if ((long)r.regs[8] == SP_EMULATE_MUSL_EXTRA[i]) { emulated = 1; emul_ret = 0; break; }
+                    }
+                }
+                if (!emulated && !use_musl_extra) {
+                    for (size_t i = 0; i < sizeof(SP_EMULATE_GLIBC_EPERM)/sizeof(*SP_EMULATE_GLIBC_EPERM); i++) {
+                        if ((long)r.regs[8] == SP_EMULATE_GLIBC_EPERM[i]) { emulated = 1; emul_ret = -13 /*-EPERM*/; break; }
                     }
                 }
                 /* fakeroot parity with proot: under -0 an identity or

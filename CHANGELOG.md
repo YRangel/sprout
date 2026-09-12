@@ -3,6 +3,33 @@
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 ## [0.6.1]
 
+### Fixed - stub lane + supervisor correctness (field-found on 6.12.23-android16)
+- **sprout-stub frame corruption**: seccomp-TRAP frames on this kernel
+  arrive with pc ALREADY PAST the trapped svc; the #74-era `pc+=4`
+  skipped the next instruction, cascading to re-traps with stale x8 and
+  SIGBUS at pc=0x32. The stub now detects the convention per frame
+  (svc-word check) and advances/rewinds accordingly; the accept(202)
+  pivot rewinds a past-svc pc so the rewritten svc re-executes.
+- **unknown trapped nrs**: forge -ENOSYS + one-line diagnostic instead
+  of relying on death-by-re-execution (which returned garbage registers
+  on past-svc kernels). openat2/umount2 callers now fall back cleanly.
+- **mount/privilege class** (umount2/mount/pivot_root/chroot/syslog/
+  reboot/set*time/swapon/module-load...): forge -EPERM in both lanes —
+  guests report "permission denied" and survive instead of dying SIGSYS.
+- **glibc set*id family**: forge -EPERM (the truth) while musl keeps
+  its fake-success; previously a glibc static calling setuid died SIGSYS.
+- **dev-loop staleness**: build.rs mirrors sprout-super/sprout-stub into
+  the profile dir every build. A Sep-7 stale sprout-super in target/debug
+  had been silently preferred by sibling discovery — dropping ALL dev-loop
+  runs to the legacy ptrace lane (notify-statics default invisible).
+- **SYSEMU evaluated and rejected** (ADR-0025 D1): works on this host
+  but cannot interleave with syscall execution (probed) — unusable for a
+  translate-and-execute supervisor. Documented in the ADR + policy map.
+- **policy map**: docs/src/architecture/android-syscall-policy.md — full
+  raw-scan of Android's baseline trap set (0-460), incl. the corrections:
+  seccomp user-notify/ADDFD/prctl ALL WORK on this host; nr 39 is
+  umount2 not getpid (arm64!); statx/openat2 arg-conditional traps.
+
 ### Fixed - journal replay of guest hostfs mounts works end-to-end
 Six independent defects stacked into "replay fails":
 - **hostfs mount data semantics** (was errno 79/ELIBACC): with UML's 6.16+
