@@ -3,6 +3,18 @@
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 ## [Unreleased]
 
+### Added - passt: rootless guest networking (ADR-0025 D6)
+- `sprout uml up` discovers `passt` ($SPROUT_UML_PASST → sibling → PATH),
+  spawns it `--vhost-user` on <uml-dir>/net.sock (guest 10.0.2.15/24, gw
+  10.0.2.2, DNS passthrough to 8.8.8.8+1.1.1.1), attaches
+  `virtio_uml.device=<sock>:1`, and configures eth0+route+resolv.conf in
+  the guest after boot — REAL internet in the guest, verified: ICMP ping,
+  UDP DNS, TCP HTTP 200. Unlocks docker-in-guest, X11-over-TCP to
+  termux-x11, virgl vtest over TCP.
+- scripts/build-passt.sh + patches/passt-android.patch (bionic guards,
+  netlink/userns/setid/namespace degradations for untrusted_app).
+- kernel: CONFIG_VIRTIO_NET=y added to the fragment.
+
 ### Added - virtio-fs: coherent host filesystem for the guest (ADR-0025 D5)
 - `sprout uml up` now auto-discovers a `virtiofsd` binary
   ($SPROUT_UML_VIRTIOFSD → sibling of the sprout binary → PATH), spawns
