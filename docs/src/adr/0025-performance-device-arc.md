@@ -2,6 +2,13 @@
 
 ## Status
 
+**Implemented 2026-09-12** (D1 evaluated-and-rejected with probe evidence;
+D2-D7 shipped): ring-header token capability + SO_PEERCRED gates;
+dead-man switch + sync timer; tombstone compaction + strict mode;
+per-exec guest cache flush; virtio-fs (virtiofsd) + passt networking
+auto-wired at `up`; live bind/unbind convergence. Receipts:
+docs/src/benchmarks.md (2026-09-12 section). Original text follows.
+
 Accepted 2026-09-11. Implementation tracking: tasks sprout#13-#21. Research
 basis: `docs/src/research/2026-09-architecture-limitations.md` (committed
 with live-probe receipts).
