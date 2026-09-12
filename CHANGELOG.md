@@ -3,6 +3,17 @@
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 ## [Unreleased]
 
+### Added - data-plane mount broker: fast-lane mount(2) brokers live
+- The LD_PRELOAD mount family (mount/umount/umount2) now brokers
+  effect-shaped mounts through the holder's ctl socket: MS_BIND and
+  source-dir mounts become shadow binds (+ guest hostfs mount when the
+  source is in the share); proc/sysfs/devtmpfs/devpts/mqueue/shm become
+  shadow binds of the same-name guest source; tmpfs/ramfs succeed
+  locally; everything else keeps the honest EPERM. The calling process
+  never crosses into UML and never notices — the effect is simply there.
+- Reader fix: shadow lookups read strtab_len live (a bind made by the
+  same process that reads it was invisible beyond the attach-time bound).
+
 ### Added - `sprout uml pty`: real guest terminals (first relay broker)
 - `sprout uml pty [--id N] -- CMD` runs CMD inside the guest under a REAL
   guest-kernel pty (devpts, setsid+TIOCSCTTY), streaming the terminal over
