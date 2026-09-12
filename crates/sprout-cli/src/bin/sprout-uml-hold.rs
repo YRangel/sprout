@@ -36,6 +36,9 @@ use journal::Journal;
 use session_owner::{acquire_lock, write_state, Shadow};
 
 static ctl_journal: std::sync::OnceLock<Journal> = std::sync::OnceLock::new();
+static ctl_token: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static ring_sock_path: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 
 const RING_BYTES: usize = 2 << 20;
 const HDR_PAGE: usize = 4096;
@@ -157,6 +160,7 @@ fn run() -> anyhow::Result<()> {
     }
     let fdnum: i32 = argv[1].parse()?;
     let sock_path = std::path::PathBuf::from(&argv[2]);
+    let _ = ring_sock_path.set(sock_path.clone());
     let uml_dir = sock_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -206,6 +210,7 @@ fn run() -> anyhow::Result<()> {
      * Load the durable one (or mint + persist) BEFORE the agent can boot:
      * the guest reads it from the ring header, never from a file. */
     let token = load_or_create_token(&uml_dir);
+    let _ = ctl_token.set(token);
     unsafe {
         std::ptr::write_bytes(ring.base, 0, RING_BYTES);
         fence(Ordering::Release);
@@ -380,6 +385,57 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// map a ctl hostsrc to the mount data form (hostfs-root-relative, "/x")
+/// — same rules as journal replay's hostfs_to_guest.
+fn hostfs_data_form(a: &str) -> String {
+    let b = a.strip_prefix("/run/sprout/").unwrap_or(a);
+    let b = b.strip_prefix("hostfs/").unwrap_or(b);
+    if b.starts_with('/') { b.to_string() } else { format!("/{b}") }
+}
+
+/// ADR-0025 D7 (live convergence): a bind/unbind while the guest RUNS
+/// applies IMMEDIATELY via a ring mount/umount op — the durable journal
+/// row stays as the boot-time replay fallback if the live op fails or
+/// the guest is down. We connect to our OWN ring.sock so the serve loop
+/// serializes slot allocation (no direct-post races).
+fn ring_bridge_op(ring_sock: &std::path::Path, subop: u8, src: &str, dst: &str, data: &str) {
+    use std::io::{Read, Write};
+    let Some(&token) = ctl_token.get() else { return };
+    let mut body = Vec::with_capacity(64);
+    body.push(0x03u8); // PROTO_MOUNT
+    body.extend_from_slice(&token.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // flags
+    body.extend_from_slice(&0u32.to_le_bytes()); // rsvd
+    body.push(subop);
+    let lp = |v: &mut Vec<u8>, b: &str| {
+        v.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        v.extend_from_slice(b.as_bytes());
+    };
+    lp(&mut body, src);
+    lp(&mut body, dst);
+    lp(&mut body, "hostfs");
+    body.extend_from_slice(&0u64.to_le_bytes()); // mflags
+    lp(&mut body, data);
+    let ring_sock = ring_sock.to_path_buf();
+    std::thread::spawn(move || {
+        let Ok(mut conn) = UnixStream::connect(&ring_sock) else { return };
+        let _ = conn.write_all(&(body.len() as u32).to_le_bytes());
+        let _ = conn.write_all(&body);
+        let _ = conn.flush();
+        let mut lb = [0u8; 4];
+        if conn.read_exact(&mut lb).is_ok() {
+            let n = u32::from_le_bytes(lb) as usize;
+            if n > 0 && n < (1 << 20) {
+                let mut f = vec![0u8; n];
+                let _ = conn.read_exact(&mut f);
+                if !f.is_empty() && f[0] != 0 {
+                    eprintln!("sprout-uml-hold: live mount op answer status={}", f[0]);
+                }
+            }
+        }
+    });
+}
+
 fn ctl_handle(s: &mut UnixStream, shadow: &Arc<Mutex<Shadow>>) -> std::io::Result<()> {
     use std::io::BufRead;
     let s2 = s.try_clone()?;
@@ -441,9 +497,14 @@ fn ctl_handle(s: &mut UnixStream, shadow: &Arc<Mutex<Shadow>>) -> std::io::Resul
                                 dst.into(),
                                 "hostfs".into(),
                                 "0".into(),
-                                hostsrc_abs,
+                                hostsrc_abs.clone(),
                             ],
                         });
+                    }
+                }
+                if !hostsrc_abs.is_empty() {
+                    if let Some(rs) = ring_sock_path.get() {
+                        ring_bridge_op(rs, 0, "none", dst, &hostfs_data_form(&hostsrc_abs));
                     }
                 }
             }
@@ -472,6 +533,9 @@ fn ctl_handle(s: &mut UnixStream, shadow: &Arc<Mutex<Shadow>>) -> std::io::Resul
                         op: "umount".into(),
                         args: vec![dst.into()],
                     });
+                }
+                if let Some(rs) = ring_sock_path.get() {
+                    ring_bridge_op(rs, 1, "", dst, "");
                 }
             }
             "dump" => {

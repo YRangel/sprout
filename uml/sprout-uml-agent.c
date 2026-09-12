@@ -489,6 +489,20 @@ static void handle_bridge_mount(int cfd, int wfd) {
          * Run the mount in a CHILD: a wedged mount syscall must not kill
          * the ring server (it is single-threaded). */
         const char *spi_data = (flags_s && *flags_s) ? flags_s : NULL;
+        /* mkdir -p the mountpoint (agent-side, so BOTH the boot-time
+         * replay and the live-push paths get it): ENOENT here used to
+         * silently eat live binds. */
+        {
+            char mp[512];
+            size_t dl = strlen(dst);
+            if (dl < sizeof mp) {
+                memcpy(mp, dst, dl + 1);
+                for (char *p = mp + 1; *p; p++) {
+                    if (*p == '/') { *p = 0; mkdir(mp, 0755); *p = '/'; }
+                }
+                mkdir(mp, 0755);
+            }
+        }
         int st = -1;
         pid_t mp = fork();
         if (mp == 0) {
