@@ -1266,6 +1266,74 @@ fn cmd_up(
     } else {
         None
     };
+    // virtio-fs (ADR-0025 D5): coherent host-fs for the guest. Opt-in by
+    // binary resolvability: SPROUT_UML_VIRTIOFSD, then sibling of argv[0],
+    // then PATH. When absent: no device, no daemon, hostfs still works.
+    let vfs_sock = dir.join("virtiofs.sock");
+    {
+        let daemon_bin = std::env::var("SPROUT_UML_VIRTIOFSD").ok().map(PathBuf::from)
+            .filter(|p| p.is_file())
+            .or_else(|| {
+                std::env::current_exe().ok()
+                    .and_then(|e| e.parent().map(|p| p.join("virtiofsd")))
+                    .filter(|p| p.is_file())
+            })
+            .or_else(|| {
+                std::env::var_os("PATH").and_then(|path| {
+                    std::env::split_paths(&path)
+                        .map(|d| d.join("virtiofsd"))
+                        .find(|p| p.is_file())
+                })
+            });
+        if let Some(daemon_bin) = daemon_bin {
+            let daemon_live = vfs_sock.exists()
+                && std::fs::read_to_string(dir.join("virtiofsd.pid"))
+                    .ok()
+                    .and_then(|p| p.trim().parse::<i32>().ok())
+                    .map(|pid| unsafe { libc::kill(pid, 0) } == 0)
+                    .unwrap_or(false);
+            if !daemon_live {
+                let _ = std::fs::remove_file(&vfs_sock);
+                let _ = std::fs::remove_file(dir.join("virtiofs.sock.pid"));
+                /* shared root: SPROUT_UML_VFS_ROOT or <uml-dir>/vfs-root */
+                let vfs_root = std::env::var("SPROUT_UML_VFS_ROOT").map(PathBuf::from)
+                    .unwrap_or_else(|_| dir.join("vfs-root"));
+                let _ = std::fs::create_dir_all(&vfs_root);
+                let logf = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("virtiofsd.log"))?;
+                /* --inode-file-handles=never is REQUIRED on Android:
+                 * name_to_handle_at is seccomp-TRAPped (ADR-0006); the
+                 * patched daemon answers ENOSYS but 'never' skips it
+                 * entirely. --sandbox none: no userns for untrusted_app. */
+                let child = std::process::Command::new(&daemon_bin)
+                    .args([
+                        "--socket-path", &vfs_sock.to_string_lossy(),
+                        "--shared-dir", &vfs_root.to_string_lossy(),
+                        "--sandbox", "none",
+                        "--cache", "auto",
+                        "--allow-mmap",
+                        "--tag", "sproutfs0",
+                        "--inode-file-handles=never",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(logf)
+                    .spawn()?;
+                std::fs::write(dir.join("virtiofsd.pid"), child.id().to_string())?;
+                /* the guest's virtio_uml connect at boot must find the
+                 * listener up: wait for the socket node */
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Instant::now() < deadline && !vfs_sock.exists() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            if vfs_sock.exists() {
+                extra.push(format!("virtio_uml.device={}:26", vfs_sock.display()));
+            }
+        }
+    }
     // Ring doorbell (ADR-0024 §8): host pipe, read-end = fd 4 in the
     // guest (sprout_wake_fd=4), write-end stays for the holder. The guest
     // kernel registers it as a fd-based IRQ; holder writes after posting
@@ -1421,6 +1489,28 @@ fn cmd_up(
                 );
                 provision_token(&dir, id, transport, &vhu_uds, &share);
                 journal_replay(&dir);
+                /* virtio-fs auto-mount: when the device attached this boot,
+                 * park sproutfs0 at the well-known /virtiofs so binds can
+                 * reference it without manual guest setup. Best-effort. */
+                if vfs_sock.exists() {
+                    if let Some(token) = read_token(&dir) {
+                        let ring = dir.join("ring.sock");
+                        let _ = agent_exec_files(
+                            &share,
+                            &["/bin/sh".to_string(), "-c".to_string(),
+                              "mkdir -p /virtiofs".to_string()],
+                            &[], "/", &[], Duration::from_secs(10),
+                        );
+                        match agent_bridge_op_ring(
+                            &ring, token, 0, "sproutfs0", "/virtiofs",
+                            "virtiofs", 0, "", Duration::from_secs(10),
+                        ) {
+                            Ok(0) | Ok(16) | Ok(17) => {}
+                            Ok(e) => eprintln!("sprout: virtiofs auto-mount: errno {e} (mount manually: mount -t virtiofs sproutfs0 /virtiofs)"),
+                            Err(e) => eprintln!("sprout: virtiofs auto-mount: {e:#}"),
+                        }
+                    }
+                }
                 return Ok(0);
             }
         }

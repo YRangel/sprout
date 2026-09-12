@@ -1,6 +1,26 @@
 # Changelog
 
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
+## [Unreleased]
+
+### Added - virtio-fs: coherent host filesystem for the guest (ADR-0025 D5)
+- `sprout uml up` now auto-discovers a `virtiofsd` binary
+  ($SPROUT_UML_VIRTIOFSD → sibling of the sprout binary → PATH), spawns
+  it as a vhost-user daemon serving `$SPROUT_UML_VFS_ROOT`
+  (default <uml-dir>/vfs-root) and attaches `virtio_uml.device=<sock>:26`
+  to the guest. After boot, sproutfs0 auto-mounts at /virtiofs.
+- Verified end-to-end on device: mount, reads, writes, **mmap read+write
+  (host-visible)**, and BOTH coherence directions (host→guest via FUSE
+  invalidation; guest→host via writeback). This kills the hostfs
+  stale-read class for the share root (hostfs remains for the agent dir).
+- scripts/build-virtiofsd.sh + patches/virtiofsd-android.patch: the
+  Android build recipe (bionic binding shims; seccomp optional;
+  nr_open EACCES tolerance; name_to_handle_at → ENOSYS because the raw
+  syscall is seccomp-TRAPped; preadv2/pwritev2 kernel quirks: flags==0
+  answers EOPNOTSUPP — route through preadv/pwritev; RWF_HIPRI/NOWAIT
+  stripped — f2fs rejects them).
+- New kernel config: CONFIG_FUSE_FS=y + CONFIG_VIRTIO_FS=y in
+  uml/sprout-uml.fragment (rebuilt kernel required).
 ## [0.6.1]
 
 ### Fixed - stub lane + supervisor correctness (field-found on 6.12.23-android16)

@@ -1,0 +1,387 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index a35c9e3..8a4d733 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -20,7 +20,6 @@ xen = ["vhost-user-backend/xen", "vhost/xen", "vm-memory/xen"]
+ 
+ [[bin]]
+ name = "virtiofsd"
+-required-features = ["seccomp"]
+ 
+ [dependencies]
+ bitflags = "1.2"
+diff --git a/src/limits.rs b/src/limits.rs
+index 69cc6db..d1bd488 100644
+--- a/src/limits.rs
++++ b/src/limits.rs
+@@ -10,7 +10,16 @@ const DEFAULT_NOFILE: rlim_t = 1_000_000;
+ /// Gets the maximum number of open files.
+ fn get_max_nofile() -> Result<rlim_t, String> {
+     let path = "/proc/sys/fs/nr_open";
+-    let max_str = fs::read_to_string(path).map_err(|error| format!("Reading {path}: {error:?}"))?;
++    /* Android: SELinux denies /proc/sys/fs/nr_open to untrusted_app even
++     * though the limit itself is high. Degrade to the default instead of
++     * failing the whole daemon. */
++    let max_str = match fs::read_to_string(path) {
++        Ok(s) => s,
++        Err(error) => {
++            eprintln!("virtiofsd: {path} unreadable ({error:?}); assuming default max");
++            return Ok(DEFAULT_NOFILE);
++        }
++    };
+ 
+     max_str
+         .trim()
+diff --git a/src/main.rs b/src/main.rs
+index e92a742..43fc0a6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -28,6 +28,7 @@ use virtiofsd::passthrough::{
+     PassthroughFs,
+ };
+ use virtiofsd::sandbox::{Sandbox, SandboxMode};
++#[cfg(feature = "seccomp")]
+ use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
+ use virtiofsd::util::write_pid_file;
+ use virtiofsd::vhost_user::{Error, VhostUserFsBackendBuilder, MAX_TAG_LEN};
+@@ -53,6 +54,7 @@ const INTERNAL_FD_RESERVE: u64 = MAX_MEM_SLOTS + 100;
+ 
+ type Result<T> = std::result::Result<T, Error>;
+ 
++#[cfg(feature = "seccomp")]
+ fn parse_seccomp(src: &str) -> std::result::Result<SeccompAction, &'static str> {
+     Ok(match src {
+         "none" => SeccompAction::Allow, // i.e. no seccomp
+@@ -179,6 +181,7 @@ struct Opt {
+     readonly: bool,
+ 
+     /// Action to take when seccomp finds a not allowed syscall (none, kill, log, trap)
++    #[cfg(feature = "seccomp")]
+     #[arg(long, value_parser = parse_seccomp, default_value = "kill")]
+     seccomp: SeccompAction,
+ 
+@@ -869,6 +872,7 @@ fn main() {
+     };
+ 
+     // Must happen before we start the thread pool
++    #[cfg(feature = "seccomp")]
+     match opt.seccomp {
+         SeccompAction::Allow => {}
+         _ => enable_seccomp(opt.seccomp, opt.syslog).unwrap(),
+diff --git a/src/oslib.rs b/src/oslib.rs
+index 8833855..074a78c 100644
+--- a/src/oslib.rs
++++ b/src/oslib.rs
+@@ -1,5 +1,65 @@
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
++#[cfg(target_os = "android")]
++mod bionic_shim {
++    //! bionic's libc crate lacks openat2/preadv2/pwritev2 bindings and the
++    //! RWF_* flags. The SYSCALLS exist on Android's kernels (openat2 is
++    //! seccomp-TRAPped for untrusted_app — the runtime has_openat2 probe
++    //! already falls back to openat there), only the BINDINGS are missing.
++    #[repr(C)]
++    #[derive(Default, Clone, Copy, Debug)]
++    pub struct open_how {
++        pub flags: u64,
++        pub mode: u64,
++        pub resolve: u64,
++    }
++    pub const RESOLVE_BENEATH: u64 = 0x08;
++    pub const RESOLVE_IN_ROOT: u64 = 0x10;
++    pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
++    pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
++    pub const RESOLVE_NO_XDEV: u64 = 0x01;
++    pub const RESOLVE_CACHED: u64 = 0x20;
++    pub type RwfFlags = i32;
++    pub const RWF_HIPRI: RwfFlags = 0x1;
++    pub const RWF_DSYNC: RwfFlags = 0x2;
++    pub const RWF_SYNC: RwfFlags = 0x4;
++    pub const RWF_NOWAIT: RwfFlags = 0x8;
++    pub const RWF_APPEND: RwfFlags = 0x10;
++    pub const RWF_NOAPPEND: RwfFlags = 0x20;
++    pub const RWF_ATOMIC: RwfFlags = 0x40;
++    pub const RWF_DONTCACHE: RwfFlags = 0x80;
++    /* bionic's libc.so exports neither preadv2 nor pwritev2; the syscalls
++     * themselves (arm64: 286/287) are NOT in the untrusted_app trap set.
++     * TWO host quirks measured 2026-09-11: (1) RWF_HIPRI / RWF_NOWAIT are
++     * latency hints f2fs REJECTS with EOPNOTSUPP (FUSE Read maps LOCKOWNER
++     * -> HIPRI, which made EVERY guest read fail); (2) preadv2/pwritev2
++     * with flags==0 itself answers EOPNOTSUPP on this kernel while the
++     * SAME call with RWF_DSYNC works — route flag-less calls through the
++     * plain preadv/pwritev nrs (69/70). */
++    pub unsafe fn preadv2(fd: i32, iov: *const libc::iovec, iovcnt: i32, offset: i64, flags: i32) -> isize {
++        let flags = flags & !(RWF_HIPRI | RWF_NOWAIT);
++        if flags == 0 {
++            return libc::syscall(69 /*__NR_preadv*/, fd, iov, iovcnt, offset) as isize;
++        }
++        libc::syscall(286, fd, iov, iovcnt, offset, flags) as isize
++    }
++    pub unsafe fn pwritev2(fd: i32, iov: *const libc::iovec, iovcnt: i32, offset: i64, flags: i32) -> isize {
++        let flags = flags & !(RWF_HIPRI | RWF_NOWAIT);
++        if flags == 0 {
++            return libc::syscall(70 /*__NR_pwritev*/, fd, iov, iovcnt, offset) as isize;
++        }
++        libc::syscall(287, fd, iov, iovcnt, offset, flags) as isize
++    }
++}
++#[cfg(target_os = "android")]
++use bionic_shim::{open_how, preadv2, pwritev2, RESOLVE_IN_ROOT, RESOLVE_NO_MAGICLINKS,
++                  RWF_APPEND, RWF_ATOMIC, RWF_DONTCACHE, RWF_DSYNC, RWF_HIPRI, RWF_NOAPPEND,
++                  RWF_NOWAIT, RWF_SYNC};
++#[cfg(not(target_os = "android"))]
++use libc::{open_how, preadv2, pwritev2, RESOLVE_IN_ROOT, RESOLVE_NO_MAGICLINKS,
++           RWF_APPEND, RWF_ATOMIC, RWF_DONTCACHE, RWF_DSYNC, RWF_HIPRI, RWF_NOAPPEND,
++           RWF_NOWAIT, RWF_SYNC};
++
+ use crate::soft_idmap::{HostGid, HostUid, Id};
+ use bitflags::bitflags;
+ use std::ffi::{CStr, CString};
+@@ -29,30 +89,40 @@ impl OsFacts {
+     /// This object should only be constructed using new.
+     #[must_use]
+     pub fn new() -> Self {
++        /* Android: openat2 is seccomp-TRAPped for untrusted_app on EVERY
++         * kernel (probed 2026-09-11): PROBING it by calling would SIGSYS-
++         * kill us instead of answering ENOSYS. Never probe; the openat
++         * fallback path (O_NOFOLLOW|O_CLOEXEC) is the Android answer. */
++        #[cfg(target_os = "android")]
++        return Self { has_openat2: false };
+         // Checking for `openat2()` since it first appeared in Linux 5.6.
+-        // SAFETY: all-zero byte-pattern is a valid `libc::open_how`
+-        let how: libc::open_how = unsafe { std::mem::zeroed() };
++        // SAFETY: all-zero byte-pattern is a valid `open_how`
++        #[cfg(not(target_os = "android"))]
++        let how: open_how = unsafe { std::mem::zeroed() };
++        #[cfg(not(target_os = "android"))]
+         let cwd = CString::new(".").unwrap();
+         // SAFETY: `cwd.as_ptr()` points to a valid NUL-terminated string,
+         // and the `how` pointer is a valid pointer to an `open_how` struct.
++        #[cfg(not(target_os = "android"))]
+         let fd = unsafe {
+             libc::syscall(
+                 libc::SYS_openat2,
+                 libc::AT_FDCWD,
+                 cwd.as_ptr(),
+                 std::ptr::addr_of!(how),
+-                std::mem::size_of::<libc::open_how>(),
++                std::mem::size_of::<open_how>(),
+             )
+         };
+-
++        #[cfg(not(target_os = "android"))]
+         let has_openat2 = fd >= 0;
++        #[cfg(not(target_os = "android"))]
+         if has_openat2 {
+             // SAFETY: `fd` is an open file descriptor
+             unsafe {
+                 libc::close(fd as libc::c_int);
+             }
+         }
+-
++        #[cfg(not(target_os = "android"))]
+         Self { has_openat2 }
+     }
+ }
+@@ -270,9 +340,9 @@ pub fn do_open_relative_to(
+     // let's ignore the extra bits to be compatible with `openat(2)`.
+     let mode = u64::from(mode.unwrap_or(0)) & 0o7777;
+ 
+-    // SAFETY: all-zero byte-pattern represents a valid `libc::open_how`
+-    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+-    how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
++    // SAFETY: all-zero byte-pattern represents a valid `open_how`
++    let mut how: open_how = unsafe { std::mem::zeroed() };
++    how.resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS;
+     how.flags = flags as u64;
+     how.mode = mode;
+ 
+@@ -285,7 +355,7 @@ pub fn do_open_relative_to(
+             dir.as_raw_fd(),
+             pathname.as_ptr(),
+             std::ptr::addr_of!(how),
+-            std::mem::size_of::<libc::open_how>(),
++            std::mem::size_of::<open_how>(),
+         )
+     } as RawFd)
+ }
+@@ -356,6 +426,7 @@ mod filehandle {
+         }
+     }
+ 
++    #[cfg(not(target_os = "android"))]
+     extern "C" {
+         pub fn name_to_handle_at(
+             dirfd: libc::c_int,
+@@ -364,15 +435,37 @@ mod filehandle {
+             mount_id: *mut libc::c_int,
+             flags: libc::c_int,
+         ) -> libc::c_int;
+-
+-        // Technically `file_handle` should be a `mut` pointer, but `open_by_handle_at()` is specified
+-        // not to change it, so we can declare it `const`.
+         pub fn open_by_handle_at(
+             mount_fd: libc::c_int,
+             file_handle: *const CFileHandle,
+             flags: libc::c_int,
+         ) -> libc::c_int;
+     }
++    /* Android: bionic exports neither symbol AND the raw syscalls are
++     * seccomp-TRAPped for untrusted_app (ADR-0006 class): calling them
++     * would SIGSYS-kill the daemon. Answer ENOSYS instead — virtiofsd
++     * then negotiates file-handle support OFF and serves path-based
++     * lookups, exactly the right degradation. */
++    #[cfg(target_os = "android")]
++    pub unsafe fn name_to_handle_at(
++        _dirfd: libc::c_int,
++        _pathname: *const libc::c_char,
++        _file_handle: *mut CFileHandle,
++        _mount_id: *mut libc::c_int,
++        _flags: libc::c_int,
++    ) -> libc::c_int {
++        *libc::__errno() = libc::ENOSYS;
++        -1
++    }
++    #[cfg(target_os = "android")]
++    pub unsafe fn open_by_handle_at(
++        _mount_fd: libc::c_int,
++        _file_handle: *const CFileHandle,
++        _flags: libc::c_int,
++    ) -> libc::c_int {
++        *libc::__errno() = libc::ENOSYS;
++        -1
++    }
+ }
+ pub use filehandle::CFileHandle;
+ 
+@@ -420,33 +513,33 @@ bitflags! {
+         /// High priority writes. Allows block-based filesystems to use polling of the device, which
+         /// provides lower latency, but may use additional resources. (Currently, this feature is
+         /// usable only on a file descriptor opened using the `O_DIRECT` flag.)
+-        const RWF_HIPRI = libc::RWF_HIPRI;
++        const RWF_HIPRI = RWF_HIPRI;
+ 
+         /// Provide a per-write equivalent of the `O_DSYNC` `open(2)` flag. Its effect applies
+         /// only to the data range written by the system call.
+-        const RWF_DSYNC = libc::RWF_DSYNC;
++        const RWF_DSYNC = RWF_DSYNC;
+ 
+         /// Provide a per-write equivalent of the `O_SYNC` `open(2)` flag. Its effect applies only
+         /// to the data range written by the system call.
+-        const RWF_SYNC = libc::RWF_SYNC;
++        const RWF_SYNC = RWF_SYNC;
+ 
+         /// Provide a per-write equivalent of the `O_APPEND` `open(2)` flag. Its effect applies only
+         /// to the data range written by the system call. The offset argument does not affect the
+         /// write operation; the data is always appended to the end of the file.
+         /// However, if the offset argument is -1, the current file offset is updated.
+-        const RWF_APPEND = libc::RWF_APPEND;
++        const RWF_APPEND = RWF_APPEND;
+ 
+         /// Do not honor the `O_APPEND` `open(2)` flag (since Linux 6.9).
+-        const RWF_NOAPPEND = libc::RWF_NOAPPEND;
++        const RWF_NOAPPEND = RWF_NOAPPEND;
+ 
+         /// Requires that writes to regular files in block-based filesystems be issued with
+         /// torn-write protection. Torn-write protection means that for a power or any other
+         /// hardware failure, all or none of the data from the write will be stored, but never a
+         /// mix of old and new data (since Linux 6.11).
+-        const RWF_ATOMIC = libc::RWF_ATOMIC;
++        const RWF_ATOMIC = RWF_ATOMIC;
+ 
+         /// Uncached buffered write (since Linux 6.14).
+-        const RWF_DONTCACHE = libc::RWF_DONTCACHE;
++        const RWF_DONTCACHE = RWF_DONTCACHE;
+     }
+ }
+ 
+@@ -457,18 +550,18 @@ bitflags! {
+         /// High priority read. Allows block-based filesystems to use polling of the device, which
+         /// provides lower latency, but may use additional resources. (Currently, this feature is
+         /// usable only on a file descriptor opened using the O_DIRECT flag.)
+-        const RWF_HIPRI = libc::RWF_HIPRI;
++        const RWF_HIPRI = RWF_HIPRI;
+ 
+         /// Do not wait for data which is not immediately available. If this flag is specified,
+         /// the `readv_at()` will return instantly if it would have to read data from the backing
+         /// storage or wait for a lock. If some data was successfully read, it will return the
+         /// number of bytes read. If no bytes were read, it will return -1 and set errno to
+         /// `EAGAIN`.
+-        const RWF_NOWAIT = libc::RWF_NOWAIT;
++        const RWF_NOWAIT = RWF_NOWAIT;
+ 
+         /// Uncached buffered read, any data read will be removed from the page cache upon
+         /// completion (since Linux 6.14).
+-        const RWF_DONTCACHE = libc::RWF_DONTCACHE;
++        const RWF_DONTCACHE = RWF_DONTCACHE;
+     }
+ }
+ 
+@@ -498,7 +591,7 @@ pub unsafe fn writev_at(
+     // to the iovec slice `ìovecs` of `iovcnt` elements. However, the caller
+     // must ensure that each iovec element has a valid `iov_base` pointer and `iov_len`.
+     let bytes_written = check_retval(unsafe {
+-        libc::pwritev2(
++        pwritev2(
+             fd.as_raw_fd(),
+             iovecs.as_ptr(),
+             iovecs.len() as libc::c_int,
+@@ -534,16 +627,22 @@ pub unsafe fn readv_at(
+     // SAFETY: `fd` is a valid filed descriptor, `iov` is a valid pointer
+     // to the iovec slice `ìovecs` of `iovcnt` elements. However, the caller
+     // must ensure that each iovec element has a valid `iov_base` pointer and `iov_len`.
+-    let bytes_read = check_retval(unsafe {
+-        libc::preadv2(
++    let r = unsafe {
++        preadv2(
+             fd.as_raw_fd(),
+             iovecs.as_ptr(),
+             iovecs.len() as libc::c_int,
+             offset,
+             flags.bits(),
+         )
+-    })?;
+-    Ok(bytes_read as usize)
++    };
++    if r < 0 {
++        let e = std::io::Error::last_os_error();
++        eprintln!("virtiofsd readv_at: fd={} off={} flags={:?} -> {}",
++                  fd.as_raw_fd(), offset, flags, e);
++        return Err(e);
++    }
++    Ok(r as usize)
+ }
+ 
+ pub struct PipeReader(File);
+diff --git a/src/passthrough/mod.rs b/src/passthrough/mod.rs
+index 1f0a5e9..31d827f 100644
+--- a/src/passthrough/mod.rs
++++ b/src/passthrough/mod.rs
+@@ -2750,7 +2750,13 @@ impl FileSystem for PassthroughFs {
+         let file = self.open_inode(&data, libc::O_RDONLY | libc::O_NOFOLLOW)?;
+         let raw_fd = file.as_raw_fd();
+         debug!("syncfs: inode={inode}, mount_fd={raw_fd}");
++        /* bionic's libc crate lacks syncfs(2) bindings; the syscall itself
++         * exists on Android (nr 267, not in the untrusted_app trap set). */
++        #[cfg(not(target_os = "android"))]
+         let ret = unsafe { libc::syncfs(raw_fd) };
++        #[cfg(target_os = "android")]
++        let ret = unsafe { libc::syscall(267 /*__NR_syncfs*/, raw_fd) as i32 };
++        let ret = ret as i32;
+         if ret != 0 {
+             // Thread-safe, because errno is stored in thread-local storage.
+             Err(io::Error::last_os_error())
+diff --git a/src/server.rs b/src/server.rs
+index 2f59521..f6d3a63 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -508,7 +508,7 @@ impl<F: FileSystem + Sync> Server<F> {
+         let Rename2In { newdir, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
+ 
+         let flags =
+-            flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT);
++            flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT) as u32;
+ 
+         self.do_rename(in_header, size_of::<Rename2In>(), newdir, flags, r, w)
+     }

@@ -99,3 +99,7 @@ CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
 CONFIG_VSOCKETS=y
 CONFIG_VIRTIO_VSOCKETS=y
 CONFIG_VIRTIO_VSOCKETS_COMMON=y
+# virtio-fs (ADR-0025 D5): coherent host fs for the guest via virtio_uml
+# + virtiofsd on the host. hostfs stays for the agent share dir.
+CONFIG_FUSE_FS=y
+CONFIG_VIRTIO_FS=y
