@@ -2624,6 +2624,10 @@ char *getcwd(char *buf, size_t size) {
  */
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/mount.h>
+#ifndef MS_BIND
+#define MS_BIND 4096
+#endif
 #include <stddef.h>
 #include <errno.h>
 
@@ -2722,21 +2726,111 @@ static int sv_ashmem_is_tracked(int fd) {
  * x86 emulators (FEX) try `mount()` while probing their RootFS VFS setup;
  * translate that family into a plain EPERM failure so callers fall back
  * to their no-mount code paths instead of getting reaped. */
+
+/* ADR-0024 L2/D7 — DATA-PLANE mount broker: a mount the fast lane can
+ * express as a shadow bind + guest mount is brokered live through the
+ * holder's ctl socket (single shadow writer, owns journal + live push).
+ * Effect-shaped mounts (bind, hostfs, proc/sys/dev virtuals) succeed and
+ * the process keeps going; object-shaped ones still get the honest EPERM
+ * (never a silent lie, never a SIGSYS reap). */
+static int sp_ctl_call(const char *line, char *reply, size_t rcap) {
+    const char *sf = getenv("SPROUT_SHADOW_FILE");
+    if (!sf) return -1;
+    char ctl[SP_PATH_MAX];
+    snprintf(ctl, sizeof ctl, "%s", sf);
+    char *slash = strrchr(ctl, '/');
+    if (!slash) return -1;
+    strcpy(slash + 1, "shadow.ctl");
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un u;
+    memset(&u, 0, sizeof u);
+    u.sun_family = AF_UNIX;
+    strncpy(u.sun_path, ctl, sizeof u.sun_path - 1);
+    if (connect(fd, (struct sockaddr *)&u, sizeof u) < 0) { close(fd); return -1; }
+    size_t l = strlen(line);
+    ssize_t w = write(fd, line, l);
+    if (w != (ssize_t)l) { close(fd); return -1; }
+    ssize_t n = read(fd, reply, rcap - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    reply[n] = 0;
+    return 0;
+}
+
 int mount(const char *source, const char *target, const char *fstype,
           unsigned long flags, const void *data) {
-    (void)source; (void)target; (void)fstype; (void)flags; (void)data;
+    (void)data;
+    if (!target || target[0] != '/') { errno = EINVAL; return -1; }
+
+    /* tmpfs/ramfs: a fresh empty dir IS the whole semantics — succeed
+     * like proot does, no broker needed. */
+    if (fstype && (!strcmp(fstype, "tmpfs") || !strcmp(fstype, "ramfs")))
+        return 0;
+
+    /* virtual kernel filesystems map to shadow binds of their same-name
+     * guest source (the fast lane reads the translated host one); a bind
+     * mount maps source->target directly. */
+    const char *shadow_src = NULL;
+    if (fstype && !strcmp(fstype, "proc")) shadow_src = "/proc";
+    else if (fstype && !strcmp(fstype, "sysfs")) shadow_src = "/sys";
+    else if (fstype && (!strcmp(fstype, "devtmpfs") || !strcmp(fstype, "devpts") || !strcmp(fstype, "dev"))) shadow_src = "/dev";
+    else if (fstype && !strcmp(fstype, "mqueue")) shadow_src = "/dev/mqueue";
+    else if (fstype && !strcmp(fstype, "shm")) shadow_src = "/dev/shm";
+    else if ((flags & MS_BIND) || (source && source[0] == '/')) shadow_src = source;
+
+    if (shadow_src) {
+        /* hostsrc: only when the source's HOST path lives inside the
+         * uml share dir (that is what the guest-side hostfs mount takes
+         * as data; anything else is a pure L0 shadow bind). */
+        char hostsrc[SP_PATH_MAX]; hostsrc[0] = 0;
+        char tb[SP_PATH_MAX];
+        const char *hp = sp_translate_xf(shadow_src, tb, 1);
+        const char *sf = getenv("SPROUT_SHADOW_FILE");
+        if (hp && sf) {
+            char dir[SP_PATH_MAX];
+            snprintf(dir, sizeof dir, "%s", sf);
+            char *sl = strrchr(dir, '/');
+            if (sl) *sl = 0;
+            size_t dl = strlen(dir);
+            if (strncmp(hp, dir, dl) == 0 && hp[dl] == '/' &&
+                strncmp(hp + dl + 1, "share/", 6) == 0)
+                snprintf(hostsrc, sizeof hostsrc, "%s", hp + dl + 1 + 6);
+        }
+        char line[3 * SP_PATH_MAX];
+        if (hostsrc[0]) snprintf(line, sizeof line, "bind %s %s %s\n", target, shadow_src, hostsrc);
+        else snprintf(line, sizeof line, "bind %s %s\n", target, shadow_src);
+        char reply[128];
+        if (sp_ctl_call(line, reply, sizeof reply) == 0 &&
+            strncmp(reply, "ok", 2) == 0)
+            return 0;
+        if (getenv("SPROUT_DEBUG"))
+            fprintf(stderr, "[sprout] mount broker: ctl failed (%s)",
+                    sp_ctl_call(line, reply, sizeof reply) == 0 ? reply : "no holder");
+    }
+    (void)source; (void)fstype; (void)flags;
     errno = EPERM;
     return -1;
 }
 int umount(const char *target) {
-    (void)target;
-    errno = EPERM;
+    if (!target) { errno = EINVAL; return -1; }
+    char line[SP_PATH_MAX + 16], reply[128];
+    snprintf(line, sizeof line, "unbind %s\n", target);
+    if (sp_ctl_call(line, reply, sizeof reply) == 0 &&
+        strncmp(reply, "ok", 2) == 0)
+        return 0;
+    /* real umount of a non-mount is EINVAL; keep EPERM only when the
+     * broker channel itself is absent. */
+    if (sp_ctl_call("ping\n", reply, sizeof reply) == 0) {
+        errno = EINVAL;
+    } else {
+        errno = EPERM;
+    }
     return -1;
 }
 int umount2(const char *target, int flags) {
-    (void)target; (void)flags;
-    errno = EPERM;
-    return -1;
+    (void)flags;
+    return umount(target);
 }
 /* Same Android seccomp family as mount(): swap, acct, reboot/kexec and
  * friends are SIGSYS-killed by the host filter. Give each an EPERM answer

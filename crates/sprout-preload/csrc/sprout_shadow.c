@@ -130,6 +130,11 @@ int sp_shadow_lookup_bind(const sp_shadow_snap_t *snap,
 
     /* Read-stable snapshot point: capture gen once.                        */
     _Atomic uint64_t gen = atomic_load_explicit((_Atomic uint64_t *)&h->gen, memory_order_acquire);
+    /* strtab_len must be read LIVE, not from the attach-time snapshot:
+     * binds added AFTER this process attached (e.g. a mount(2) this very
+     * process just brokered) extend the strtab — the stale bound used to
+     * make those entries invisible to us (2026-09-12 same-process bug).  */
+    const unsigned long strtab_len = (unsigned long)h->strtab_len;
 
     /* Longest prefix match across VALID BIND_MOUNT entries. */
     unsigned long best_len = 0;
@@ -140,7 +145,7 @@ int sp_shadow_lookup_bind(const sp_shadow_snap_t *snap,
     for (uint32_t i = 0; i < h->count; i++) {
         const struct sp_shadow_entry *e = &base[i];
         if (e->type != SP_SH_T_BIND || e->state != SP_SH_S_VALID) continue;
-        if (!e->dst_len || e->dst_off + e->dst_len > snap->strtab_len) continue;
+        if (!e->dst_len || e->dst_off + e->dst_len > strtab_len) continue;
         unsigned long dlen = e->dst_len;
         if (dlen < best_len) continue;
         if (strncmp(path, strtab + e->dst_off, dlen) != 0) continue;
