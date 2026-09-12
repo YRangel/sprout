@@ -941,6 +941,14 @@ static void ring_loop(void) {
     ring_log("attached magic ok", -1);
     uint32_t last_seen = 0;
     int idle_ms = 1;
+    /* ADR-0025 D3: dead-man switch + page-cache hygiene. The holder
+     * stamps hdr32[6] (byte offset 24) every 250ms; if it stops for 30s
+     * the host side is gone and the guest would otherwise be SIGKILLed
+     * with a dirty page cache (the 0.6.x EIO-class corruption source) —
+     * flush and power off cleanly instead. The 10s sync narrows the
+     * dirty window for any other abrupt-exit path. */
+    uint32_t hb_last = 0;
+    time_t hb_change = 0, last_sync = 0;
     for (;;) {
         uint32_t host_seq = __atomic_load_n(&hdr32[2], __ATOMIC_ACQUIRE);
         if (host_seq != last_seen) {
@@ -956,6 +964,18 @@ static void ring_loop(void) {
             }
             last_seen = host_seq;
             continue;
+        }
+        /* dead-man + sync bookkeeping (cheap: runs per poll wake) */
+        {
+            time_t now = time(NULL);
+            uint32_t hb = __atomic_load_n(&hdr32[6], __ATOMIC_ACQUIRE);
+            if (hb != hb_last) { hb_last = hb; hb_change = now; }
+            else if (hb_change && now - hb_change > 30) {
+                ring_log("dead-man: holder heartbeat stale, powering off", -1);
+                sync();
+                syscall(142 /*__NR_reboot*/, 0xfee1dead, 672274793, 0x4321fedc /*POWER_OFF*/);
+            }
+            if (now - last_sync >= 10) { sync(); last_sync = now; }
         }
         /* doorbell-driven idle: poll the shm fd (host pipe IRQ rings the
          * bell); fall back to a bounded timeout as safety. Drain the
