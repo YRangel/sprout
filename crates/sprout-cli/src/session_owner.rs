@@ -221,12 +221,94 @@ impl Shadow {
     /// Publish: advance gen to a new EVEN value + stamp heartbeat.
     /// Readers snap gen; if they see odd, they retry/fail open.
     pub fn commit(&mut self) {
+        /* compact when tombstones dominate: re-binds mark old entries
+         * REMOVED but count never shrank — unbounded re-bind churn would
+         * otherwise walk into the table cap (0.6.x leak). Rebuild in
+         * place under the gen bump below; readers fail-open on the odd
+         * gen window exactly like any other write. */
+        let count = self.count();
+        if count > 8 {
+            let mut removed = 0u32;
+            for i in 0..count {
+                if unsafe { self.r8(HDR_SIZE + i as usize * ENTRY_SIZE + 1) } == S_REMOVED {
+                    removed += 1;
+                }
+            }
+            if removed * 2 > count {
+                let _ = self.compact();
+            }
+        }
         unsafe {
             let g = self.r64(HDR_GEN);
             self.w64(HDR_HEARTBEAT, mono_ns());
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             self.w64(HDR_GEN, (g & !1) + 2);
         }
+    }
+
+    /// Rebuild the table with only VALID entries, repacked from slot 0.
+    fn compact(&mut self) -> io::Result<()> {
+        let count = self.count() as usize;
+        let base = self.strtab_base();
+        let mut live: Vec<(u8, Vec<u8>, Vec<u8>)> = Vec::new(); // (type, src, dst)
+        for i in 0..count {
+            let e = HDR_SIZE + i * ENTRY_SIZE;
+            let (t, s) = unsafe { (self.r8(e), self.r8(e + 1)) };
+            if s != S_VALID {
+                continue;
+            }
+            let (soff, slen) = unsafe { (self.r32(e + 4) as usize, self.r32(e + 8) as usize) };
+            let (doff, dlen) = unsafe { (self.r32(e + 12) as usize, self.r32(e + 16) as usize) };
+            let src = unsafe { std::slice::from_raw_parts(self.map.add(base + soff), slen).to_vec() };
+            let dst = unsafe { std::slice::from_raw_parts(self.map.add(base + doff), dlen).to_vec() };
+            live.push((t, src, dst));
+        }
+        /* wipe entries + strtab, then re-add each live row byte-for-byte */
+        unsafe {
+            std::ptr::write_bytes(self.map.add(HDR_SIZE), 0, MAP_SIZE - HDR_SIZE);
+            self.w32(HDR_COUNT, 0);
+            self.w64(HDR_STRTAB_LEN, 0);
+        }
+        self.strtab_len = 0;
+        for (t, src, dst) in live {
+            self.write_entry_raw(t, &src, &dst)?;
+        }
+        Ok(())
+    }
+
+    /// add_bind's body without validation/dedup: append (type, src, dst).
+    fn write_entry_raw(&mut self, t: u8, src: &[u8], dst: &[u8]) -> io::Result<u32> {
+        let count = self.count();
+        let cap = unsafe { self.r64(HDR_CAP) } as u32;
+        if count >= cap {
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "shadow full"));
+        }
+        let base = self.strtab_base();
+        let need = dst.len() + 1 + src.len() + 1;
+        if base + self.strtab_len + need > MAP_SIZE {
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "strtab full"));
+        }
+        let dst_off = self.strtab_len;
+        let src_off = dst_off + dst.len() + 1;
+        unsafe {
+            let e = HDR_SIZE + count as usize * ENTRY_SIZE;
+            self.w8(e, t);
+            self.w8(e + 1, S_VALID);
+            (self.map.add(e + 2) as *mut u16).write_volatile(0);
+            self.w32(e + 4, src_off as u32);
+            self.w32(e + 8, src.len() as u32);
+            self.w32(e + 12, dst_off as u32);
+            self.w32(e + 16, dst.len() as u32);
+            self.w32(e + 20, 0);
+            std::ptr::copy_nonoverlapping(dst.as_ptr(), self.map.add(base + dst_off), dst.len());
+            self.w8(base + dst_off + dst.len(), 0);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.map.add(base + src_off), src.len());
+            self.w8(base + src_off + src.len(), 0);
+            self.w64(HDR_STRTAB_LEN, (self.strtab_len + need) as u64);
+            self.w32(HDR_COUNT, count + 1);
+        }
+        self.strtab_len += need;
+        Ok(count)
     }
 
     /// Cheap liveness bump (no gen change).

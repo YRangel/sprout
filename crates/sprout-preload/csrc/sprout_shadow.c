@@ -23,6 +23,29 @@ static uint64_t now_mono_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+/* debug knob: SPROUT_SHADOW_STRICT=1 turns hard corruption (bad magic,
+ * bogus strtab bounds) from fail-open into a loud abort — fail-open is
+ * the right PRODUCTION default (ADR-0024) but it hides bugs in testing.
+ * Staleness (holder restart) is normal operation and never aborts. */
+static int sp_shadow_strict(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("SPROUT_SHADOW_STRICT");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+static void sp_shadow_corrupt(const char *what, unsigned long long a, unsigned long long b) {
+    if (sp_shadow_strict()) {
+        char buf[160];
+        int n = snprintf(buf, sizeof buf,
+            "[sprout-shadow] STRICT: corrupt table (%s %llx/%llx) — aborting "
+            "(unset SPROUT_SHADOW_STRICT for fail-open)\n", what, a, b);
+        if (n > 0) (void)!write(2, buf, (size_t)n);
+        abort();
+    }
+}
+
 static uint32_t crc32c(const void *data, size_t len) {
     /* CRC-32C software implementation is fine here (table ≤ 4KB). */
     static uint32_t table[256]; static int ready;
@@ -59,12 +82,14 @@ int sp_shadow_attach(int fd, sp_shadow_snap_t *snap) {
     if (h->magic != SP_SHADOW_MAGIC || h->cap == 0 || h->cap > 4096) {
         if (getenv("SPROUT_DEBUG")) fprintf(stderr, "[sprout-shadow] bad hdr magic=%llx cap=%llu\n",
             (unsigned long long)h->magic, (unsigned long long)h->cap);
+        sp_shadow_corrupt("bad-hdr", (unsigned long long)h->magic, (unsigned long long)h->cap);
         munmap(base, mapsz);
         return -1;
     }
     uint64_t end = SP_SHADOW_HDR_SIZE + SP_SHADOW_ENTRY_SIZE * h->cap + h->strtab_len;
     if (end > mapsz) {
         if (getenv("SPROUT_DEBUG")) fprintf(stderr, "[sprout-shadow] end=%llu > mapsz\n", (unsigned long long)end);
+        sp_shadow_corrupt("end>mapsz", (unsigned long long)end, (unsigned long long)mapsz);
         munmap(base, mapsz);
         return -1;
     }
