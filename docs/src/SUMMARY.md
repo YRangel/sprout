@@ -26,6 +26,8 @@
 
 # Decisions (ADRs)
 
+- [0025: performance & device arc](./adr/0025-performance-device-arc.md)
+
 - [Template](./adr/template.md)
 - [0001: language split](./adr/0001-language-split.md)
 - [0002: interception strategy](./adr/0002-interception-strategy.md)
