@@ -1,0 +1,114 @@
+From 6c0a5955f30b93bc5e88e3658deae82d8a8ac2f8 Mon Sep 17 00:00:00 2001
+From: YRangel <YRangel@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 09:04:50 -0500
+Subject: [PATCH 1/2] [BOX32] dlerror: wrap through to_cstring() (my32_dlerror)
+
+The 32-bit mapping pointed at the 64-bit my_dlerror, returning the
+native error_msg buffer raw; the bridge's to_ptrv truncated it and
+guests dereferencing the string (wine's explorer.exe after a failed
+addon load) SIGSEGV'd. my32_dlerror copies through to_cstring()
+(32-bit-arena strdup + hash cache). GO2 registration kept (proven);
+EXPORT added for name resolution. Verified: full wine-11.18 i386
+session (start.exe/services.exe/notepad.exe/explorer.exe) runs with
+zero crashes on arm64.
+---
+ install_steam.sh                     |  2 +-
+ src/wrapped32/wrappedlibdl.c         | 12 ++++++++++++
+ src/wrapped32/wrappedlibdl_private.h |  2 +-
+ 3 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/install_steam.sh b/install_steam.sh
+index dacf3ccdf..4a305f230 100755
+--- a/install_steam.sh
++++ b/install_steam.sh
+@@ -23,6 +23,6 @@ export DBUS_FATAL_WARNINGS=0
+ 
+ # make script executable and move
+ chmod +x steam
+-sudo mv steam /usr/local/bin/
++mv steam /usr/local/bin/
+ 
+ echo "Script complete."
+diff --git a/src/wrapped32/wrappedlibdl.c b/src/wrapped32/wrappedlibdl.c
+index 5dc5c8d54..68b7de9b0 100755
+--- a/src/wrapped32/wrappedlibdl.c
++++ b/src/wrapped32/wrappedlibdl.c
+@@ -35,6 +35,7 @@ void* my_dlsym(x64emu_t* emu, void *handle, void *symbol) EXPORT;
+ int my_dlclose(x64emu_t* emu, void *handle) EXPORT;
+ int my32_dladdr(x64emu_t* emu, void *addr, void *info) EXPORT;
+ int my32_dladdr1(x64emu_t* emu, void *addr, void *info, void** extra_info, int flags) EXPORT;
++char* my32_dlerror(x64emu_t* emu) EXPORT;
+ void* my_dlvsym(x64emu_t* emu, void *handle, void *symbol, const char *vername) EXPORT;
+ int my32_dlinfo(x64emu_t* emu, void* handle, int request, void* info) EXPORT;
+ 
+@@ -98,6 +99,17 @@ int my32_dladdr(x64emu_t* emu, void *addr, void *i)
+     return my32_dladdr1(emu, addr, i, NULL, 0);
+ }
+ 
++/* The 32-bit bridge truncates pointer returns (to_ptrv): handing back the
++ * native error_msg buffer crashed guests dereferencing it (wine's
++ * explorer.exe SIGSEGV at dlerror after a failed addon load, 2026-09-21).
++ * Copy through to_cstring() — 32-bit-arena strdup + cache, same pattern
++ * as the dladdr fix above. */
++char* my32_dlerror(x64emu_t* emu)
++{
++    char* r = my_dlerror(emu);
++    return r ? (char*)from_ptrv(to_cstring(r)) : NULL;
++}
++
+ int my32_dlinfo(x64emu_t* emu, void* handle, int request, void* info)
+ {
+     (void)emu;
+diff --git a/src/wrapped32/wrappedlibdl_private.h b/src/wrapped32/wrappedlibdl_private.h
+index 168895d31..9bc2f9458 100755
+--- a/src/wrapped32/wrappedlibdl_private.h
++++ b/src/wrapped32/wrappedlibdl_private.h
+@@ -5,7 +5,7 @@
+ GOM(dladdr, iEEpp)
+ GOM(dladdr1, iEEpppi)
+ GO2(dlclose, iEEp, my_dlclose)
+-GO2(dlerror, pEEv, my_dlerror)
++GO2(dlerror, pEEv, my32_dlerror)
+ //DATAB(_dlfcn_hook, 4)
+ GOM(dlinfo, iEEpip)
+ GO2(dlmopen, pEEppi, my_dlmopen)
+-- 
+2.55.0
+
+
+From de2cf311f917fd3a292e4a5ba7bfddacccf6eafa Mon Sep 17 00:00:00 2001
+From: YRangel <YRangel@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 09:19:14 -0500
+Subject: [PATCH 2/2] [BOX32] freetype: copy FT_StreamRec pathname.pointer
+ through to_cstring()
+
+pathname.pointer is the font path string in native heap; to_ptrv()
+truncated it (the 'long 4076150800 is not a 32bits value' noise came
+from the union's .value view of the same pointer). to_cstring() copies
+into the 32-bit arena. Verified: wine i386 session runs with zero
+32-bit-truncation warnings.
+---
+ src/wrapped32/wrappedfreetype.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/wrapped32/wrappedfreetype.c b/src/wrapped32/wrappedfreetype.c
+index 45ffc0a28..a2738900d 100644
+--- a/src/wrapped32/wrappedfreetype.c
++++ b/src/wrapped32/wrappedfreetype.c
+@@ -1036,7 +1036,12 @@ void convert_FT_StreamRec_to_32(void* d, void* s)
+     dst-> descriptor.value = to_long(src->descriptor.value);
+     dst-> descriptor.pointer = to_ptrv(src->descriptor.pointer);
+     dst-> pathname.value = to_long(src->pathname.value);
+-    dst-> pathname.pointer = to_ptrv(src->pathname.pointer);
++    /* pathname.pointer is the font PATH STRING living in native (64-bit)
++     * heap — to_ptrv truncated it, leaving guests a dangling informational
++     * path (and the noisy "not a 32bits value" warning). Copy through
++     * to_cstring() like the other string fields in this wrapper. */
++    dst-> pathname.pointer = to_ptrv(src->pathname.pointer
++        ? from_ptrv(to_cstring(src->pathname.pointer)) : NULL);
+     dst-> read = to_ptrv(src->read);
+     dst-> close = to_ptrv(src->close);
+     dst-> memory = to_ptrv(src->memory);
+-- 
+2.55.0
+

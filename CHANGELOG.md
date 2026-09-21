@@ -26,6 +26,21 @@ All notable changes to sprout, grouped by release version. The four-eyes rule: a
   wine64 notepad reaches GUI init (MESA-EGL) on the X server.
 - Same latent gap exists in the ptrace supervisor's exec-classification
   chase (final-component only); no reported symptom, noted for a follow-up.
+### Fixed - box32 follow-ups: dlerror + freetype pathname marshaling; symlink walk ported to all lanes
+- box64: my32_dlerror() — the 32-bit dlerror mapping returned the native
+  error buffer raw (truncated), crashing wine's explorer.exe; now copied
+  through to_cstring(). Full i386 wine session (start.exe/services.exe/
+  notepad.exe/explorer.exe) runs with zero crashes.
+- box64: FT_StreamRec pathname.pointer (font path string) now goes through
+  to_cstring() instead of to_ptrv() — kills the "not a 32bits value"
+  warning spam and the dangling informational pointer.
+- Combined patch: patches/box64-box32-pointer-marshaling.patch (box64
+  branch sprout-dladdr32-fix, commits 089eab6d7..HEAD).
+- The intermediate-absolute-symlink resolution (d280648) is now ported to
+  the remaining lanes: sprout-core guest_real() (CLI program/cwd lookup,
+  component-wise stack walk) and the ptrace supervisor's exec-classify
+  chase (failure-only). Static exec through absolute mid-path symlinks
+  verified end-to-end.
 ### Fixed - box32/wine-32 startup crash part 2: box64 dladdr patch
 - Second crash site (after the scrub): wine's loader dlopens ntdll.so, calls
   dladdr() on init_paths, then realpath(info.dli_fname) — box32's dladdr
