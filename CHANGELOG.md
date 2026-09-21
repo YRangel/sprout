@@ -3,6 +3,13 @@
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 ## [Unreleased]
 
+### Fixed - uname branding no longer breaks Debian maintainer scripts
+- The default kernel-release spoof now leads with the numeric host
+  release (`<rel>-sprout-android` instead of `Sprout-Android-<rel>`):
+  glibc's preinst parses `uname -r` numerically and aborted on the
+  branded prefix, wedging dpkg during libc upgrades (found while
+  installing the missing xfce4-panel).
+
 ### Added - data-plane mount broker: fast-lane mount(2) brokers live
 - The LD_PRELOAD mount family (mount/umount/umount2) now brokers
   effect-shaped mounts through the holder's ctl socket: MS_BIND and
