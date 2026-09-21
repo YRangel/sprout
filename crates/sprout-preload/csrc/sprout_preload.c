@@ -385,6 +385,54 @@ static const char *sp_libc_kind(void)     { const char *e = getenv("SPROUT_LIBC"
 
 __attribute__((constructor)) static void sprout_init(void) {
     sp_snapshot_chain_env();
+    /* Emulator environ scrub (box32 my32_realpath SIGSEGV, 2026-09-21):
+     * box64's 32-bit persona parses LD_PRELOAD from its OWN environ and
+     * preloads each entry into the i386 guest; our native arm64 chain
+     * (libsprout-core + libc-sanitized) cannot preload into an emulated
+     * address space, and box64's failure path feeds a native 64-bit
+     * pointer through the emulated realpath -> truncation -> SIGSEGV
+     * (wine-32 dies at startup; wine-64 unaffected: pointers fit).
+     * The interposer must STAY LOADED in the emulator process — every
+     * guest file open is re-issued natively at guest paths, translation
+     * is load-bearing — but the emulator must not SEE the chain in
+     * environ. ld.so has already loaded every entry by ctor time, so
+     * blanking LD_PRELOAD here keeps the hooks resident and hides the
+     * chain; the ctor snapshot above still feeds the exec-hook merge,
+     * so native children re-inherit the full chain as before.
+     * SPROUT_PRELOAD_SCRUB: unset = default list (box64,box32);
+     * "" = disabled; "+a,b" = defaults + extras; "a,b" = exact list.
+     * Prefix match (token "box64" also matches box64-latest), mirrored
+     * with sp_host_emu_sysvipc_shim semantics. */
+    {
+        const char *sl = getenv("SPROUT_PRELOAD_SCRUB");
+        char list[256];
+        if (!sl) memcpy(list, "box64,box32", 12);
+        else if (!*sl) list[0] = 0;
+        else if (sl[0] == '+') snprintf(list, sizeof list, "box64,box32,%s", sl + 1);
+        else snprintf(list, sizeof list, "%s", sl);
+        if (list[0]) {
+            char exe[SP_PATH_MAX];
+            ssize_t en = readlink("/proc/self/exe", exe, sizeof exe - 1);
+            if (en > 0) {
+                exe[en] = 0;
+                const char *bn = strrchr(exe, '/');
+                bn = bn ? bn + 1 : exe;
+                int match = 0;
+                const char *p = list;
+                while (*p && !match) {
+                    const char *c = strchr(p, ',');
+                    size_t tl = c ? (size_t)(c - p) : strlen(p);
+                    if (tl && strncmp(bn, p, tl) == 0) match = 1;
+                    p = c ? c + 1 : p + tl;
+                }
+                /* unsetenv, NOT setenv(""): an empty-but-PRESENT row
+                 * defeats the exec-hook's snapshot fallback (present
+                 * wins), starving native children of the chain. Absent
+                 * falls back to the snapshot (env -i survival path). */
+                if (match) unsetenv("LD_PRELOAD");
+            }
+        }
+    }
     sp_config_load(&g_cfg);
     /* --user anchor (proot -i / proot-distro --user parity): the resolved
      * guest identity is forwarded by the launcher as SPROUT_FAKE_UID/GID;

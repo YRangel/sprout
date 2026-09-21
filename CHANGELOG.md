@@ -11,6 +11,16 @@ All notable changes to sprout, grouped by release version. The four-eyes rule: a
   lanes are the supported default. All UML code, the guest agent, docs,
   and the `sprout-arm64` kernel branch stay in-tree for a future
   resumption; nothing user-facing in the fast lanes changes.
+### Fixed - box32/wine-32 SIGSEGV: emulator environ scrub (SPROUT_PRELOAD_SCRUB)
+- box64's 32-bit persona parses LD_PRELOAD from its own environ and tries to
+  preload the native arm64 chain (libsprout-core + sanitized libc) into the
+  i386 guest; its failed-preload path feeds a native 64-bit pointer to the
+  emulated realpath -> truncation -> SIGSEGV (wine-32 died at startup).
+- libsprout-core's constructor now scrubs LD_PRELOAD (unsetenv, keeping the
+  chain resident + snapshot-fed for children) when the process basename
+  matches SPROUT_PRELOAD_SCRUB: unset = default "box64,box32", "" = off,
+  "+a,b" = extend, "a,b" = exact list. Verified: wine --version (32-bit)
+  prints wine-11.18 rc=0 (was rc=139).
 ### Fixed - uname branding no longer breaks Debian maintainer scripts
 - The default kernel-release spoof now leads with the numeric host
   release (`<rel>-sprout-android` instead of `Sprout-Android-<rel>`):
