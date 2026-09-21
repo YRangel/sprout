@@ -170,22 +170,83 @@ static int path_within(const char *prefix, size_t plen, const char *path) {
  * follows them. Host-spelled targets (already rootfs-prefixed, e.g.
  * proot-distro's '$B/.l2s/...' spellings) are adopted verbatim.
  * Raw syscalls only — the interposed wrappers would recurse. */
-static void sp_resolve_links(const sp_config_t *cfg, char out[SP_PATH_MAX]) {
-    if (cfg->rootfs_len == 0) return;
+/* Component-wise intermediate-symlink resolution: an ABSOLUTE symlink in
+ * the MIDDLE of a path (wine's dosdevices/z: -> /) makes the KERNEL escape
+ * to the host root while following it, before our final-component chase
+ * ever sees the path (the full-path lstat fails on the host side first).
+ * Walk components inside the rootfs and splice targets in userspace.
+ * Invoked ONLY when the fast final chase below fails to lstat the path, so
+ * ordinary hits pay nothing; raw syscalls only (PLT wrappers would
+ * recurse). */
+static void sp_resolve_intermediate_links(const sp_config_t *cfg, char out[SP_PATH_MAX]) {
+    struct stat kb;
+    char link[SP_PATH_MAX];
+    char merged[SP_PATH_MAX];
+    for (int hops = 0; hops < 16; hops++) {
+        char *p = out + cfg->rootfs_len;
+        int spliced = 0;
+        while (1) {
+            char *slash = strchr(p + 1, '/');
+            if (slash) *slash = '\0';
+            int rc = syscall(SYS_newfstatat, AT_FDCWD, out, &kb, AT_SYMLINK_NOFOLLOW);
+            ssize_t n = -1;
+            if (rc == 0 && S_ISLNK(kb.st_mode))
+                n = syscall(SYS_readlinkat, AT_FDCWD, out, link, sizeof(link) - 1);
+            if (slash) *slash = '/';
+            if (rc != 0) return;          /* genuine miss — nothing to splice */
+            if (n > 0) {
+                if ((size_t)n >= sizeof(link)) return;
+                link[n] = '\0';
+                const char *rest = slash ? slash : "";
+                if (link[0] == '/') {
+                    if (path_within(cfg->rootfs, cfg->rootfs_len, link)) {
+                        if (snprintf(merged, sizeof merged, "%s%s", link, rest) >= (int)sizeof merged) return;
+                    } else {
+                        size_t need = cfg->rootfs_len + (size_t)n + strlen(rest) + 1;
+                        if (need > sizeof merged) return;
+                        memcpy(merged, cfg->rootfs, cfg->rootfs_len);
+                        memcpy(merged + cfg->rootfs_len, link, (size_t)n + 1);
+                        strcat(merged + cfg->rootfs_len, rest);
+                    }
+                } else {
+                    /* relative target: resolved against the link's parent dir */
+                    size_t dirlen = slash ? (size_t)(slash - out) : (size_t)(strrchr(out, '/') - out);
+                    size_t need = dirlen + 1 + (size_t)n + strlen(rest) + 1;
+                    if (need > sizeof merged) return;
+                    memcpy(merged, out, dirlen);
+                    merged[dirlen] = '/';
+                    memcpy(merged + dirlen + 1, link, (size_t)n + 1);
+                    strcat(merged + dirlen + 1, rest);
+                }
+                memcpy(out, merged, strlen(merged) + 1);
+                spliced = 1;
+                break;
+            }
+            if (!slash) return;           /* full walk, no symlink anywhere */
+            p = slash;
+        }
+        if (!spliced) return;
+    }
+}
+
+/* Final-component chase. Returns 1 when the path lstats clean and is not
+ * (or no longer) a symlink; 0 when a stat failed (miss) — the caller may
+ * then run the intermediate walk. */
+static int sp_chase_final(const sp_config_t *cfg, char out[SP_PATH_MAX]) {
     struct stat kb;
     char link[SP_PATH_MAX];
     for (int hops = 0; hops < 8; hops++) {
         if (syscall(SYS_newfstatat, AT_FDCWD, out, &kb, AT_SYMLINK_NOFOLLOW) != 0)
-            return;
-        if (!S_ISLNK(kb.st_mode)) return;
+            return 0;
+        if (!S_ISLNK(kb.st_mode)) return 1;
         ssize_t n = syscall(SYS_readlinkat, AT_FDCWD, out, link, sizeof(link) - 1);
-        if (n <= 0 || (size_t)n >= sizeof(link)) return;
+        if (n <= 0 || (size_t)n >= sizeof(link)) return 1;
         link[n] = '\0';
         if (link[0] != '/') {
             char *slash = strrchr(out, '/');
-            if (!slash) return;
+            if (!slash) return 1;
             size_t dirlen = (size_t)(slash - out) + 1;
-            if (dirlen + (size_t)n + 1 > SP_PATH_MAX) return;
+            if (dirlen + (size_t)n + 1 > SP_PATH_MAX) return 1;
             memmove(out + dirlen, link, (size_t)n + 1);
             continue;
         }
@@ -193,10 +254,23 @@ static void sp_resolve_links(const sp_config_t *cfg, char out[SP_PATH_MAX]) {
             memmove(out, link, (size_t)n + 1);
             continue;
         }
-        if (cfg->rootfs_len + (size_t)n + 1 > SP_PATH_MAX) return;
+        if (cfg->rootfs_len + (size_t)n + 1 > SP_PATH_MAX) return 1;
         memmove(out + cfg->rootfs_len, link, (size_t)n + 1);
         memcpy(out, cfg->rootfs, cfg->rootfs_len);
     }
+    return 1;
+}
+
+static void sp_resolve_links(const sp_config_t *cfg, char out[SP_PATH_MAX]) {
+    if (cfg->rootfs_len == 0) return;
+    if (sp_chase_final(cfg, out)) return;
+    /* miss: an intermediate absolute symlink may escape to the host root
+     * (wine dosdevices/z: -> /). Component-wise walk, then re-chase the
+     * final component the walk may have surfaced. Failure-only path —
+     * existing files never pay the per-component lstat cost. */
+    if (!path_within(cfg->rootfs, cfg->rootfs_len, out)) return;
+    sp_resolve_intermediate_links(cfg, out);
+    (void)sp_chase_final(cfg, out);
 }
 
 #ifdef SPROUT_INTERPOSE

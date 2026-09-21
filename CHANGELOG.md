@@ -11,6 +11,21 @@ All notable changes to sprout, grouped by release version. The four-eyes rule: a
   lanes are the supported default. All UML code, the guest agent, docs,
   and the `sprout-arm64` kernel branch stay in-tree for a future
   resumption; nothing user-facing in the fast lanes changes.
+### Fixed - intermediate absolute symlinks escape the rootfs (wine kernel32 c0000135)
+- sp_resolve_links only chased the FINAL path component; an absolute
+  symlink in the MIDDLE of a path (wine's dosdevices/z: -> /) made the
+  kernel follow it against the HOST root, so every Z:-drive access failed
+  (wine: "could not load kernel32.dll, status c0000135", and
+  "could not open working directory Z:\root\"). Affected both wine32 and
+  wine64 — arch-independent interposer bug.
+- New sp_resolve_intermediate_links(): component-wise walk that splices
+  intermediate symlink targets inside the rootfs, invoked ONLY when the
+  fast final-chase fails to lstat the path — hot paths pay nothing.
+- Verified: os.stat() through dosdevices/z: resolves (959947 bytes);
+  wineboot populates a full prefix (.wine32 267MB, .wine64 616MB);
+  wine64 notepad reaches GUI init (MESA-EGL) on the X server.
+- Same latent gap exists in the ptrace supervisor's exec-classification
+  chase (final-component only); no reported symptom, noted for a follow-up.
 ### Fixed - box32/wine-32 startup crash part 2: box64 dladdr patch
 - Second crash site (after the scrub): wine's loader dlopens ntdll.so, calls
   dladdr() on init_paths, then realpath(info.dli_fname) — box32's dladdr
