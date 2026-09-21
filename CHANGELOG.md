@@ -11,6 +11,20 @@ All notable changes to sprout, grouped by release version. The four-eyes rule: a
   lanes are the supported default. All UML code, the guest agent, docs,
   and the `sprout-arm64` kernel branch stay in-tree for a future
   resumption; nothing user-facing in the fast lanes changes.
+### Fixed - box32/wine-32 startup crash part 2: box64 dladdr patch
+- Second crash site (after the scrub): wine's loader dlopens ntdll.so, calls
+  dladdr() on init_paths, then realpath(info.dli_fname) — box32's dladdr
+  wrapper stored the NATIVE library path string via to_ptrv(), truncating it
+  (>4GB), so the emulated realpath dereferenced garbage -> SIGSEGV. Same
+  bug present upstream (box64 HEAD). Fix: copy dli_fname/dli_sname through
+  box64's own to_cstring() helper (32-bit-arena strdup + hash cache, the
+  getpwent/freetype pattern). Patch: patches/box64-dladdr32-tocstring.patch
+  (applies to box64 v0.4.5; also on the box64 checkout branch
+  sprout-dladdr32-fix). Verified: wine32 now reaches DLL resolution,
+  behaving identically to wine64 on this device.
+- NOTE: a remaining "could not load kernel32.dll, status c0000135" affects
+  BOTH wine32 and wine64 with BOTH box64 builds — pre-existing wine setup
+  issue (stub prefixes), NOT a sprout/box32 incompatibility.
 ### Fixed - box32/wine-32 SIGSEGV: emulator environ scrub (SPROUT_PRELOAD_SCRUB)
 - box64's 32-bit persona parses LD_PRELOAD from its own environ and tries to
   preload the native arm64 chain (libsprout-core + sanitized libc) into the
