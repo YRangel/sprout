@@ -7,6 +7,11 @@ landed and gate-tested; L3 (demotion) ships as a documented stub. 0.6.1:
 the guest hostfs-mount replay path is fixed end-to-end and journal mounts
 are durable (see CHANGELOG 0.6.1 for the six root causes).
 
+**Dormant (beta) since 2026-09-20:** the bridge stack is implemented and
+gate-tested but development is paused; the fast lanes are the supported
+default. Everything (code, agent, ring protocol, kernel branch) stays
+in-tree for a future resumption.
+
 ## Context
 
 sprout's mission: drop-in proot replacement — full Linux userspace on Android

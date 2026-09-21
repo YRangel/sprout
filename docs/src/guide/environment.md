@@ -85,6 +85,11 @@ yourself (user values win over plan defaults for HOME/TERM/USER/LOGNAME,
 
 ## UML sidecar environment
 
+> **Beta — development paused (2026-09-20).** The UML sidecar is functional
+> (ADRs 0023/0024/0025 + 2026-09 benchmark receipts) but is not the supported
+> default; the LD_PRELOAD/ptrace fast lanes are. The stack stays in-tree for
+> a future resumption.
+
 The `sprout uml` subcommand (ADR-0023) reads these variables:
 
 | Variable | Meaning |

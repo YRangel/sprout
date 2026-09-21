@@ -262,6 +262,12 @@ slowdown.
 
 ---
 
+## UML sidecar (beta — development paused since 2026-09-20)
+
+The sections below cover the experimental UML stack. It is functional but
+not the supported default; use it only if you are deliberately testing the
+beta. Everything stays in-tree for a future resumption.
+
 ## UML sidecar: `error -12` boot panic ("No working init found")
 
 **Symptom:** `sprout uml up` (or a manual `linux.uml` boot) prints

@@ -1,6 +1,9 @@
 # ADR-0023: UML sidecar (real guest kernel next to the fast lane)
 
-- **Status:** accepted (Phase 0+1 implemented)
+- **Status:** accepted (Phase 0+1 implemented) — **dormant (beta) since
+  2026-09-20**: development of the UML stack is paused; the fast lanes
+  (LD_PRELOAD / ptrace) are the supported default. Code, docs and the
+  `sprout-arm64` kernel branch remain in-tree for a future resumption.
 - **Date:** 2026-09-07
 - **Deciders:** sprout
 - **Supersedes:** nothing. Complements ADR-0007 (sanitized ld.so), ADR-0017

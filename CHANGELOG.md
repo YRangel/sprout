@@ -3,6 +3,14 @@
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 ## [Unreleased]
 
+### Status - UML stack moved to beta (development paused)
+- The UML sidecar and its bridge stack (ADRs 0023/0024/0025: ring exec,
+  journal replay, shadow binds, virtio-fs, passt networking, PTY broker,
+  data-plane mount broker) are **functional and receipt-verified** but
+  development is paused as of 2026-09-20. The LD_PRELOAD/ptrace fast
+  lanes are the supported default. All UML code, the guest agent, docs,
+  and the `sprout-arm64` kernel branch stay in-tree for a future
+  resumption; nothing user-facing in the fast lanes changes.
 ### Fixed - uname branding no longer breaks Debian maintainer scripts
 - The default kernel-release spoof now leads with the numeric host
   release (`<rel>-sprout-android` instead of `Sprout-Android-<rel>`):

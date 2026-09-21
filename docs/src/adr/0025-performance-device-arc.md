@@ -7,7 +7,11 @@ D2-D7 shipped): ring-header token capability + SO_PEERCRED gates;
 dead-man switch + sync timer; tombstone compaction + strict mode;
 per-exec guest cache flush; virtio-fs (virtiofsd) + passt networking
 auto-wired at `up`; live bind/unbind convergence. Receipts:
-docs/src/benchmarks.md (2026-09-12 section). Original text follows.
+docs/src/benchmarks.md (2026-09-12 section).
+
+**Dormant (beta) since 2026-09-20** alongside the rest of the UML stack
+(ADR-0023/0024): shipped and receipt-verified, but development is paused;
+fast lanes remain the supported default. Original text follows.
 
 Accepted 2026-09-11. Implementation tracking: tasks sprout#13-#21. Research
 basis: `docs/src/research/2026-09-architecture-limitations.md` (committed
