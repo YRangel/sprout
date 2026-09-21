@@ -244,30 +244,73 @@ impl Rootfs {
     /// /bin/busybox` against the HOST's /bin — dead under proot-distro
     /// Alpine, where every applet is exactly that link.
     pub fn guest_real(&self, guest_abs: &Path) -> Option<PathBuf> {
-        let mut cur = guest_abs.to_path_buf();
-        for _ in 0..8 {
-            let host = self.to_host(&cur);
+        /* Component-wise walk: resolve EVERY symlink in the chain against
+         * the rootfs, not just the final component. An absolute symlink
+         * mid-path (wine's dosdevices/z: -> /) is followed by the KERNEL
+         * against the host root — the full-path metadata call then fails
+         * and the old final-only chase never engaged (wine kernel32
+         * c0000135, 2026-09-21). Textual '..' pop: symlink-mid-path '..'
+         * differs from kernel semantics but is the proot-distro
+         * convention. Missing components at any hop => None (not-found),
+         * matching the old contract. */
+        fn normals(p: &Path) -> Vec<std::ffi::OsString> {
+            use std::path::Component;
+            p.components()
+                .filter_map(|c| match c {
+                    Component::Normal(s) => Some(s.to_os_string()),
+                    _ => None,
+                })
+                .collect()
+        }
+        let mut stack: Vec<std::ffi::OsString> = Vec::new();
+        let mut pending = normals(guest_abs);
+        pending.reverse();
+        let mut hops = 0;
+        while let Some(comp) = pending.pop() {
+            if comp == "." {
+                continue;
+            }
+            if comp == ".." {
+                stack.pop();
+                continue;
+            }
+            stack.push(comp);
+            let mut guest_cur = PathBuf::from("/");
+            for c in &stack {
+                guest_cur.push(c);
+            }
+            let host = self.to_host(&guest_cur);
             let md = std::fs::symlink_metadata(&host).ok()?;
             if !md.file_type().is_symlink() {
-                return Some(host);
+                continue;
+            }
+            hops += 1;
+            if hops > 16 {
+                return None;
             }
             let mut t = std::fs::read_link(&host).ok()?;
             /* proot-distro link2symlink spells targets HOST-absolute
              * ($B/.l2s/...); strip the rootfs prefix back to guest form
-             * so the next hop re-maps it correctly instead of
-             * double-prefixing into a miss. */
+             * so the hop re-maps correctly instead of double-prefixing. */
             if t.is_absolute() {
                 if let Ok(stripped) = t.strip_prefix(&self.root) {
                     t = Path::new("/").join(stripped);
                 }
             }
-            cur = if t.is_absolute() {
-                t
+            if t.is_absolute() {
+                stack.clear();
             } else {
-                cur.parent().unwrap_or(Path::new("/")).join(t)
-            };
+                stack.pop(); /* the link itself; target is relative to its parent */
+            }
+            let mut tv = normals(&t);
+            tv.reverse();
+            pending.extend(tv);
         }
-        None
+        let mut guest_cur = PathBuf::from("/");
+        for c in &stack {
+            guest_cur.push(c);
+        }
+        Some(self.to_host(&guest_cur))
     }
 
     /// Locate a bare command name against the standard guest PATH dirs.

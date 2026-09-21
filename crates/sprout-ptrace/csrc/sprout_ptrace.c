@@ -335,11 +335,67 @@ static const char *g_rootfs;      /* SPROUT_ROOTFS (guest root, host absolute) *
 
 /* Host-file ELF inspection (open + phdrs). Returns 1 static, 0 dynamic,
  * 2 shebang-script (interp copied into buf), -1 not recognized. */
+/* Intermediate absolute symlinks escape to the HOST root when the kernel
+ * follows them (wine dosdevices/z: -> /): the full-path lstat then misses
+ * before the final-component chase below can engage. Walk components in
+ * userspace and splice targets against the rootfs. Failure-only: invoked
+ * when the exec-target lstat misses. Mirrors the preload lane's
+ * sp_resolve_intermediate_links (2026-09-21, wine kernel32 c0000135). */
+static void sp_resolve_intermediate_symlinks(char host[SP_PATH_MAX]) {
+    size_t rlen = strlen(g_rootfs);
+    struct stat st;
+    char link[SP_PATH_MAX], merged[SP_PATH_MAX];
+    for (int hops = 0; hops < 16; hops++) {
+        char *p = host + rlen;
+        int spliced = 0;
+        while (1) {
+            char *slash = strchr(p + 1, '/');
+            if (slash) *slash = '\0';
+            int rc = lstat(host, &st);
+            ssize_t n = -1;
+            if (rc == 0 && S_ISLNK(st.st_mode))
+                n = readlink(host, link, sizeof(link) - 1);
+            if (slash) *slash = '/';
+            if (rc != 0) return;          /* genuine miss */
+            if (n > 0) {
+                if ((size_t)n >= sizeof(link)) return;
+                link[n] = '\0';
+                const char *rest = slash ? slash : "";
+                if (link[0] == '/') {
+                    if (strncmp(g_rootfs, link, rlen) == 0 &&
+                        (link[rlen] == '\0' || link[rlen] == '/')) {
+                        if (snprintf(merged, sizeof merged, "%s%s", link, rest) >= (int)sizeof merged) return;
+                    } else {
+                        char tmp[SP_PATH_MAX];
+                        if (!sp_translate(&g_cfg, link, tmp)) return;
+                        if (snprintf(merged, sizeof merged, "%s%s", tmp, rest) >= (int)sizeof merged) return;
+                    }
+                } else {
+                    size_t dirlen = slash ? (size_t)(slash - host)
+                                          : (size_t)(strrchr(host, '/') - host);
+                    if (snprintf(merged, sizeof merged, "%.*s/%s%s",
+                                 (int)dirlen, host, link, rest) >= (int)sizeof merged) return;
+                }
+                memcpy(host, merged, strlen(merged) + 1);
+                spliced = 1;
+                break;
+            }
+            if (!slash) return;           /* full walk, no symlink */
+            p = slash;
+        }
+        if (!spliced) return;
+    }
+}
+
 /* Busybox alpine layout: /bin/ls -> /bin/busybox absolute symlink would
  * resolve on the HOST (missing). Chase absolute symlink targets back
  * through the guest translation; relatives pass through. 8 hops. */
 static void sp_resolve_absolute_symlink(char host[SP_PATH_MAX]) {
     char target[SP_PATH_MAX], dir[SP_PATH_MAX], tmp[SP_PATH_MAX];
+    struct stat st0;
+    if (g_rootfs && strncmp(host, g_rootfs, strlen(g_rootfs)) == 0 &&
+        lstat(host, &st0) != 0)
+        sp_resolve_intermediate_symlinks(host);
     for (int hop = 0; hop < 8; hop++) {
         struct stat st;
         if (lstat(host, &st) != 0 || !S_ISLNK(st.st_mode)) return;
