@@ -4448,12 +4448,175 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
     }
     nev[ec] = NULL;
 
+    /* box32 heap fix (2026-09-21): nothing to do HERE — the i386 wrap
+     * recurses into sp_execve_chain with the emulator as the target, and
+     * the SP_ELF_DYNAMIC arm there execs the patched-interp derivative
+     * directly (kernel-exact layout: fixed base + LOW heap). */
+
     int rc = sp_execve_chain(emu, nv, nev, depth + 1);
     /* only reached on exec FAILURE through the recursion (prints already) */
     free(nev);
     free(nv);
     (void)rc;
     return 1;
+}
+
+/* ---- fixed-base emulator direct exec (box32 heap fix, 2026-09-21) ------
+ * box64 links at a fixed low base (0x34800000) and box32's correctness
+ * depends on the brk heap sitting right behind the image: the sanitized
+ * ldso chain makes the LDSO the kernel's main exec, so the process brk
+ * follows the ldso's HIGH ASLR image, glibc's main arena lands >4GB, and
+ * stock box32 truncates every internal string (dladdr/realpath SIGSEGV).
+ * proot dodges this with its own custom loader; we dodge it with a
+ * patched-interp DERIVATIVE of the emulator (PT_INTERP -> ldso-sanitized,
+ * RPATH -> chain library path, cached next to the sanitized libs). The
+ * kernel then loads the emulator itself (fixed base + brk right behind it
+ * -> LOW heap) while the sanitized loader still neutralizes the blocked
+ * syscalls and the interposer rides LD_PRELOAD as usual. Chain fallback
+ * when patchelf is unavailable. */
+static int sp_emu_fixed_base(const char *base) {
+    return strcmp(base, "box64") == 0 || strcmp(base, "box32") == 0;
+}
+
+static unsigned long long sp_fnv1a(const char *s) {
+    unsigned long long h = 1469598103934665603ULL;
+    while (*s) { h ^= (unsigned char)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* Cache path of the direct-exec derivative for `host`, creating it on
+ * first use. patchelf's segment-add overlaps fixed-base executables' first
+ * LOAD (proved fatal 2026-09-21: SEGV_ACCERR on ld.so reloc writes), so we
+ * do the one thing the kernel actually needs ourselves: PT_INTERP is read
+ * straight from the FILE at p_offset (fs/binfmt_elf.c never consults
+ * p_vaddr for the interp path), so the new interpreter string goes at EOF
+ * and only the 5 phdr fields need rewriting. No external tools, no layout
+ * surgery. NULL when unavailable — the caller falls back to the ldso
+ * chain. */
+static const char *sp_emu_direct_derivative(const char *host) {
+    static char out[SP_PATH_MAX];
+    const char *loader = sp_loader_path();
+    if (!loader) return NULL;
+    char dir[SP_PATH_MAX];
+    snprintf(dir, sizeof dir, "%s", loader);
+    char *sl = strrchr(dir, '/');
+    if (!sl || sl == dir) return NULL;
+    *sl = '\0';
+    struct stat st;
+    if (stat(host, &st) != 0) return NULL;
+    size_t ilen = strlen(loader) + 1;
+    if (ilen > 240) return NULL;
+    const char *base = strrchr(host, '/');
+    base = base ? base + 1 : host;
+    int bn = 0;
+    while (base[bn] && base[bn] != '.' && bn < 24) bn++;   /* stem only */
+    snprintf(out, sizeof out, "%s/emu-direct-%.*s-%llx-%llx-%llx-%llx", dir,
+             bn, base,
+             (unsigned long long)st.st_ino,
+             (unsigned long long)st.st_mtime,
+             (unsigned long long)st.st_size,
+             sp_fnv1a(loader));
+    if (access(out, X_OK) == 0) return out;
+    char tmp[SP_PATH_MAX];
+    snprintf(tmp, sizeof tmp, "%s.tmp%d", out, (int)getpid());
+    int in = (int)syscall(SP_SYS_openat, AT_FDCWD, host, O_RDONLY, 0);
+    if (in < 0) return NULL;
+    int of = (int)syscall(SP_SYS_openat, AT_FDCWD, tmp, O_RDWR | O_CREAT | O_TRUNC, 0755);
+    if (of < 0) { syscall(SYS_close, in); return NULL; }
+    char cb[65536];
+    int cfail = 0;
+    for (;;) {
+        ssize_t r = (ssize_t)syscall(SYS_read, in, cb, sizeof cb);
+        if (r < 0) { cfail = 1; break; }
+        if (r == 0) break;
+        ssize_t w = 0;
+        while (w < r) {
+            ssize_t n = (ssize_t)syscall(SYS_write, of, cb + w, (size_t)(r - w));
+            if (n <= 0) { cfail = 1; break; }
+            w += n;
+        }
+        if (cfail) break;
+    }
+    /* append the interpreter string at EOF */
+    off_t eof = (off_t)lseek(of, 0, SEEK_END);
+    if (eof < 0 || (ssize_t)ilen != (ssize_t)syscall(SYS_write, of, loader, ilen))
+        cfail = 1;
+    syscall(SYS_close, in);
+    if (cfail) { syscall(SYS_close, of); unlink(tmp); return NULL; }
+    /* patch PT_INTERP's phdr in the copy AND extend the last PT_LOAD to
+     * cover the appended string: glibc's ld.so dereferences PT_INTERP's
+     * p_vaddr (proved 2026-09-21: SEGV_MAPERR at the raw EOF offset), so
+     * the string must sit inside a mapped segment. Extending the last
+     * LOAD's filesz/memsz only maps trailing (debug) sections lazily —
+     * zero RSS cost until touched.
+     * ELF64 phdr: u32 type, u32 flags, then six u64 at +8..+56. */
+    {
+        unsigned char eh[64];
+        if (pread(of, eh, 64, 0) != 64 || memcmp(eh, "\x7f" "ELF", 4) || eh[4] != 2)
+            { syscall(SYS_close, of); unlink(tmp); return NULL; }
+        unsigned long long phoff = 0;
+        for (int i = 0; i < 8; i++) phoff |= (unsigned long long)eh[32 + i] << (8 * i);
+        unsigned short phentsize = (unsigned short)(eh[54] | (eh[55] << 8));
+        unsigned short phnum = (unsigned short)(eh[56] | (eh[57] << 8));
+        int done = 0;
+        unsigned long long interp_at = 0;
+        unsigned long long last_load_at = 0, last_load_off = 0, last_load_va = 0;
+        for (int i = 0; i < phnum; i++) {
+            unsigned char ph[56];
+            off_t at = (off_t)phoff + (off_t)i * phentsize;
+            if (pread(of, ph, 56, at) != 56) break;
+            unsigned int ptype = (unsigned int)(ph[0] | (ph[1] << 8) | (ph[2] << 16) | ((unsigned)ph[3] << 24));
+            unsigned long long f[6];
+            for (int k = 0; k < 6; k++) {
+                f[k] = 0;
+                for (int b = 0; b < 8; b++) f[k] |= (unsigned long long)ph[8 + k * 8 + b] << (8 * b);
+            }
+            if (ptype == 1 && f[0] >= last_load_off) {   /* PT_LOAD, highest offset */
+                last_load_at = (unsigned long long)at;
+                last_load_off = f[0];
+                last_load_va = f[1];
+            }
+            if (ptype != 3 /* PT_INTERP */) continue;
+            interp_at = (unsigned long long)at;
+        }
+        if (interp_at && last_load_at) {
+            unsigned char ph[56];
+            unsigned long long str_va = last_load_va + ((unsigned long long)eof - last_load_off);
+            unsigned long long need = (unsigned long long)eof + ilen - last_load_off;
+            if (pread(of, ph, 56, (off_t)interp_at) == 56) {
+                unsigned long long vals[5];
+                vals[0] = (unsigned long long)eof;   /* p_offset */
+                vals[1] = str_va;                    /* p_vaddr */
+                vals[2] = str_va;                    /* p_paddr */
+                vals[3] = ilen;                      /* p_filesz */
+                vals[4] = ilen;                      /* p_memsz */
+                for (int k = 0; k < 5; k++)
+                    for (int b = 0; b < 8; b++) ph[8 + k * 8 + b] = (unsigned char)(vals[k] >> (8 * b));
+                if (pwrite(of, ph, 56, (off_t)interp_at) == 56) done = 1;
+            }
+            if (done == 1 && pread(of, ph, 56, (off_t)last_load_at) == 56) {
+                /* extend p_memsz ONLY: growing p_filesz would backfill the
+                 * segment's zero-BSS with the trailing debug sections'
+                 * bytes (proved 2026-09-21: garbage globals -> wild-ptr
+                 * SIGSEGV). The string's vaddr lands in zero-BSS — ld.so
+                 * only needs it mapped, the kernel reads the interp path
+                 * from the FILE offset. */
+                for (int b = 0; b < 8; b++) {
+                    ph[40 + b] = (unsigned char)(need >> (8 * b));   /* p_memsz */
+                }
+                if (pwrite(of, ph, 56, (off_t)last_load_at) != 56) done = 0;
+            } else done = 0;
+        }
+        syscall(SYS_close, of);
+        if (done != 1) {
+            if (g_cfg.debug) fprintf(stderr, "[sprout] emu-direct: phdr patch failed done=%d interp_at=%llu load_at=%llu\n", done, interp_at, last_load_at);
+            unlink(tmp); return NULL;
+        }
+    }
+    if (rename(tmp, out) != 0) { unlink(tmp); return NULL; }
+    if (g_cfg.debug)
+        fprintf(stderr, "[sprout] emu-direct: built '%s'\n", out);
+    return out;
 }
 
 static int sp_execve_chain(const char *path, char *const argv[], char *const envp[], int depth) {
@@ -4591,6 +4754,63 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
     sp_trace_exec(path, argv, cls);
     switch (cls) {
     case SP_ELF_DYNAMIC: {
+        /* fixed-base emulators (box64/box32): exec the patched-interp
+         * derivative directly so the KERNEL loads the emulator (fixed
+         * base, brk right behind the image -> LOW heap). Riding the ldso
+         * chain makes the ldso the main exec and pushes the brk heap
+         * >4GB — stock box32 then truncates every internal string. */
+        {
+            const char *bn = strrchr(host, '/');
+            bn = bn ? bn + 1 : host;
+            int is_der = (strncmp(bn, "emu-direct-", 11) == 0);
+            if (is_der || sp_emu_fixed_base(bn)) {
+                const char *lp = sp_chain_libpath(envp);
+                if (!lp) lp = sp_library_path_v();
+                const char *der = is_der ? host
+                                         : sp_emu_direct_derivative(host);
+                if (der) {
+                    int ac = 0;
+                    while (argv[ac]) ac++;
+                    char **dv = malloc(((size_t)ac + 1) * sizeof(char *));
+                    /* private env: chain env + LD_LIBRARY_PATH=<lp> so the
+                     * kernel-loaded emulator finds its guest libs (no
+                     * --library-path cmdline crutch without the loader
+                     * chain; box64 spawns no bionic children to leak to) */
+                    int ec = 0;
+                    while (envp[ec]) ec++;
+                    char **de = malloc(((size_t)ec + 2) * sizeof(char *));
+                    if (dv && de) {
+                        dv[0] = (char *)der;   /* box64 relaunches argv[0] */
+                        for (int k = 1; k < ac; k++) dv[k] = argv[k];
+                        dv[ac] = NULL;
+                        int w = 0, have_llp = 0;
+                        for (int k = 0; k < ec; k++) {
+                            if (!strncmp(envp[k], "LD_LIBRARY_PATH=", 16)) {
+                                char *row = malloc(16 + strlen(lp) + 1);
+                                if (row) sprintf(row, "LD_LIBRARY_PATH=%s", lp);
+                                de[w++] = row ? row : envp[k];
+                                have_llp = 1;
+                            } else {
+                                de[w++] = envp[k];
+                            }
+                        }
+                        if (!have_llp && lp) {
+                            char *row = malloc(16 + strlen(lp) + 1);
+                            if (row) { sprintf(row, "LD_LIBRARY_PATH=%s", lp); de[w++] = row; }
+                        }
+                        de[w] = NULL;
+                        int drc = sp_real_execve(der, dv, de);
+                        int de_ = errno;
+                        free(de); free(dv);
+                        if (drc == 0) return 0;  /* unreachable */
+                        if (de_ != ENOENT && de_ != EACCES) { errno = de_; return -1; }
+                        /* derivative vanished mid-flight: chain fallback */
+                    } else {
+                        free(de); free(dv);
+                    }
+                }
+            }
+        }
         char *vstack[SP_CHAIN_MAX_ARGS + 8];
         int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL,
                                      sp_chain_libpath(envp));

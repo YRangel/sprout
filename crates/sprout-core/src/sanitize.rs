@@ -38,8 +38,16 @@ const PATCH_MOV_X0_XZR: [u8; 4] = [0xe0, 0x03, 0x1f, 0xaa];
 /// (helium crash persists under both) — policy remains fake-success.
 #[allow(dead_code)]
 const PATCH_MOVN_X0_37: [u8; 4] = [0xa0, 0x04, 0x80, 0x92];
-fn patch_for(_sysno: u32) -> [u8; 4] {
-    PATCH_MOV_X0_XZR
+fn patch_for(sysno: u32) -> [u8; 4] {
+    /* 439 faccessat2: Android's base filter KILLS it (SIGSYS, no ENOSYS)
+     * while sprout's notify filter only traps its own list. Honest -ENOSYS
+     * is the ONLY safe emulation: glibc's faccessat wrapper then takes its
+     * documented fallback to faccessat(48), which the user-notify layer
+     * traps and serves translated+honest. Fake-success would lie about
+     * every accessibility probe. Found 2026-09-21: intra-libc callers
+     * (glibc's __access alias family) bypass the interposer's PLT wrappers
+     * — cc1 died at startup on exactly this. */
+    if sysno == 439 { PATCH_MOVN_X0_37 } else { PATCH_MOV_X0_XZR }
 }
 
 /// Syscall numbers Android's untrusted_app policy blocks (SIGSYS) that
@@ -58,7 +66,10 @@ fn patch_for(_sysno: u32) -> [u8; 4] {
 /// R_OK, AT_EMPTY_PATH)` and gracefully tolerates failure — Android ≥15
 /// blocks 48 outright (SIGSYS), so we emulate success instead.
 /// glibc artifacts: ONLY the two progatics glibc tolerates ENOSYS for.
-pub const EMULATED_SYSNOS_GLIBC: [u32; 2] = [99, 293];
+/// glibc artifacts: set_robust_list/rseq fake-success (callers ignore the
+/// return) + faccessat2 honest-ENOSYS (patch_for routes 439 to MOVN -38;
+/// glibc falls back to faccessat(48) which the notify layer serves).
+pub const EMULATED_SYSNOS_GLIBC: [u32; 3] = [99, 293, 439];
 /// musl artifacts: goto safety musl callers tolerate (faccessat poll) plus
 /// Android's blocked set*id family — emulating success here means "already
 /// at minimal privilege", the semantic a rootless sandbox provides.

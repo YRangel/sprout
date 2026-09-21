@@ -570,6 +570,14 @@ impl LaunchPlan {
     /// double-prefixed with the guest rootfs.
     fn push_passthrough(env: &mut Vec<(String, String)>, prefixes: &[&str]) {
         let mut merged: Vec<String> = vec!["/proc".into(), "/sys".into(), "/dev".into()];
+        /* Android system lib dirs are HOST paths, never guest paths:
+         * bionic binaries exec'd inside a translated tree (sprout-super
+         * pivot for box32 direct-exec, host box64) have their linker's
+         * /system/lib64 lookups answered by the real /system, not the
+         * rootfs. */
+        for p in ["/system", "/apex", "/vendor", "/odm", "/product", "/system_ext"] {
+            merged.push(p.into());
+        }
         if let Some((_, v)) = env.iter().find(|(k, _)| k == "SPROUT_PASSTHROUGH") {
             for part in v.split(';') {
                 let part = part.trim();

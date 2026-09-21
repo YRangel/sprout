@@ -308,6 +308,7 @@ typedef struct {
 static tracee_t g_tracees[SP_MAX_TRACEES];
 static sp_config_t g_cfg;
 static int g_shadow = 0;               /* SPROUT_SHADOW: root image starts shadowed */
+static int g_direct_exec = 0;          /* SPROUT_DIRECT_EXEC: dynamic execs go straight to the kernel (box32 heap) */
 
 /* Loader-chain context for rewriting static→dynamic execve (empty-/lib64
  * guest rootfs cannot satisfy PT_INTERP on the host). Provided by the CLI
@@ -1595,7 +1596,7 @@ static void apply_policy_entry(tracee_t *t, pid_t pid,
         char ibuf[SP_PATH_MAX];
         int cls = classify_host_file(host, ibuf, obuf);
         if (g_debug) SP_TRACE("[%d] exec target %s -> host %s cls=%d\n", pid, guest, host, cls);
-        if (cls == 0) {
+        if (cls == 0 && !g_direct_exec) {
             /* dynamic: full loader-chain rewrite */
             if (sp_rewrite_exec_to_loader(t, pid, &rex, host, guest, path_argi, 0))
                 ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iovex);
@@ -3169,6 +3170,16 @@ int main(int argc, char **argv) {
      * interposer covers the PLT set exactly like glibc's, so per-syscall
      * PTRACE_SYSCALL is pure waste in pipe-flood profiles (bench: musl
      * cmdsubst-pipe 0.76x -> target >=1x). SPROUT_MUSL_NOSHADOW reverts. */
+    /* Direct-exec mode (box32 heap fix, 2026-09-21): emulator trees
+     * (box64/box32) must be KERNEL-exec'd, not chained through the
+     * sanitized ldso. The chain makes the ldso the kernel's main exec, so
+     * the process brk follows the LDSO's high image; glibc's main arena
+     * then lands >4GB and every internal box32 string truncates in
+     * to_ptrv() (dladdr/realpath SIGSEGVs). Direct exec puts brk right
+     * after the emulator's fixed-base image (0x34800000), and the SIGSYS
+     * emulation table below covers the blocked-syscall startup probes the
+     * chain used to dodge. Set by the CLI/hook for i386 wraps. */
+    g_direct_exec = getenv("SPROUT_DIRECT_EXEC") != NULL;
     g_shadow = getenv("SPROUT_SHADOW") != NULL &&
                (g_libc_kind != SP_LIBC_MUSL || !getenv("SPROUT_MUSL_NOSHADOW"));
     /* Interposed grandchildren of this supervisor (preload chain) learn
@@ -3446,6 +3457,13 @@ int main(int argc, char **argv) {
         int sig = WSTOPSIG(status);
         if (g_debug && sig != (SIGTRAP | 0x80) && sig != SIGTRAP)
             fprintf(stderr, "[ptrace] %d stopped sig=%d\n", w, sig);
+        if (sig == SIGSYS && g_debug) {
+            siginfo_t si;
+            memset(&si, 0, sizeof(si));
+            if (ptrace(PTRACE_GETSIGINFO, w, 0, &si) == 0)
+                fprintf(stderr, "[ptrace] %d SIGSYS siginfo: nr=%d call_addr=%p arch=%u\n",
+                        w, si.si_syscall, si.si_call_addr, (unsigned)si.si_arch);
+        }
         tracee_t *t = find_or_add(w);
         if (!t) goto cont;
 

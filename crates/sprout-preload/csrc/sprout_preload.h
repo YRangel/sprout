@@ -28,7 +28,7 @@ typedef struct {
     size_t guest_len;
 } sp_bind_t;
 
-#define SP_MAX_PASSTHROUGH 16
+#define SP_MAX_PASSTHROUGH 32
 
 typedef struct {
     /* Absolute host path of the guest root (no trailing slash, unless "/"). */

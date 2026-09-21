@@ -3,6 +3,54 @@
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 ## [Unreleased]
 
+### Fixed - box32 heap layout: direct-exec derivatives for fixed-base emulators (stock box64 wine32 SIGSEGV)
+- Root cause: the sanitized-ldso chain makes the LDSO the kernel's main
+  exec, so the process brk follows the ldso's HIGH ASLR image; glibc's
+  main arena then lands >4GB and stock box32 truncates every internal
+  string (dladdr/realpath SIGSEGV, 4/4 deterministic under sprout, 4/4
+  clean under proot whose custom loader gives box64 a kernel-exact
+  layout). box64 links at a fixed low base (0x34800000) and expects the
+  kernel to load it.
+- Fix: the exec hook now splices a patched-interp DERIVATIVE of the
+  emulator into ~/.cache/sprout (emu-direct-<stem>-<ino>-<mtime>-<size>
+  -<ldsohash>) and execve()s it directly for box64/box32 targets. The
+  kernel loads the emulator itself (fixed base, brk right behind the
+  image -> LOW heap) while the sanitized ldso still rides along as
+  PT_INTERP and the interposer via LD_PRELOAD. box64's box32-persona
+  self-relaunch re-enters the same path (argv[0] is the derivative).
+- No patchelf: the rewrite appends the interpreter string at EOF and
+  patches PT_INTERP + extends the last LOAD's p_memsz (kernel reads the
+  interp path from the FILE offset; ld.so needs p_vaddr merely mapped;
+  extending p_filesz instead would backfill .bss with debug bytes —
+  both failure modes hit and fixed during validation).
+- Verified with STOCK box64 v0.4.5 (no box64 patches): wine --version
+  rc=0, wineboot --init rc=0, wine notepad full session rc=0 (start.exe,
+  wineserver, services.exe all exec'd through the derivative), wineserver
+  [heap] at 0x45c03000 (<4GB, was 0x55..), zero truncation crashes.
+  x86_64 lane unchanged (64-bit pointers cannot truncate).
+### Fixed - faccessat2(439) SIGSYS inside glibc (cc1 startup death)
+- glibc's faccessat wrapper tries faccessat2 first; Android's base
+  seccomp filter KILLS 439 (no ENOSYS) and intra-libc callers (the
+  __access alias family) bypass the interposer's PLT wrappers — cc1 died
+  at startup, breaking every in-guest compile.
+- The sanitize pass now also patches faccessat2 svc sites to return
+  -ENOSYS (movn x0, #37, routed per-sysno in patch_for): glibc takes its
+  documented fallback to faccessat(48), which the user-notify layer
+  traps and serves translated+honest. Verified: full gcc pipeline
+  (driver -> cc1 -> as -> collect2) compiles and runs.
+### Fixed - SPROUT_PASSTHROUGH table overflow evicted $PREFIX/$HOME
+- The merged passthrough list (defaults + SPROUT_LOADER/LIBRARY_PATH
+  parts + preload dirs + $PREFIX + $HOME) grew past SP_MAX_PASSTHROUGH
+  (16) once the Android system dirs were added; the tail entries
+  ($PREFIX/$HOME, which cover the interposer and the sanitize cache)
+  silently dropped, the loader's LD_PRELOAD opens got translated into
+  the rootfs, and the whole guest tree lost the interposer (dash's PATH
+  walk even reached the HOST /bin -> bionic ls with a glibc LD_PRELOAD).
+  Cap raised to 32.
+- Android system lib dirs (/system /apex /vendor /odm /product
+  /system_ext) are now passthrough defaults: bionic binaries exec'd
+  inside a translated tree have their linker lookups answered by the
+  real /system, not the rootfs.
 ### Status - UML stack moved to beta (development paused)
 - The UML sidecar and its bridge stack (ADRs 0023/0024/0025: ring exec,
   journal replay, shadow binds, virtio-fs, passt networking, PTY broker,
