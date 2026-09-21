@@ -805,8 +805,11 @@ fn run() -> Result<u8, Error> {
      * env is inherited through the whole exec chain, so descendants see
      * them without further flag plumbing. */
     // Kernel-release spoofing: explicit -k wins; otherwise brand the guest's
-    // view as sprout's own ("Sprout-Android-<host uname -r>"), so tools like
-    // fastfetch/neofetch print us instead of the raw HyperOS build string.
+    // view as sprout's own ("<host uname -r>-sprout-android"), so tools like
+    // fastfetch/neofetch print us. The release MUST lead with the host's
+    // numeric version: glibc's preinst (and other maintainer scripts) parse
+    // `uname -r` as ^([0-9]+\.[0-9]+) and ABORT on an unparsable prefix
+    // ("Sprout-Android-..." used to break apt --fix-broken / libc upgrades).
     // Empty SPROUT_KERNEL_RELEASE in the env = opt-out (host string passes).
     let rel = cli
         .kernel_release
@@ -824,7 +827,7 @@ fn run() -> Result<u8, Error> {
             } else {
                 "unknown".into()
             };
-            format!("Sprout-Android-{host_rel}")
+            format!("{host_rel}-sprout-android")
         }
     };
     plan.env.push(("SPROUT_KERNEL_RELEASE".into(), rel));
