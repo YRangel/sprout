@@ -137,6 +137,30 @@ sloppy — see session notes). Run F130 against any fix attempt.
 
 ## Not audited in depth (next pass candidates)
 
+### Sweep 2026-10-03 (DNS / statx / sockaddr / ashmem) — VERDICT: all four pass
+
+- **DNS wire parser** (`sp_dns_extract`): qname/label walk is guarded by
+  `off < nread` at every byte read, RDLEN checked against nread before the
+  rdata cast-into-struct (a4/a6 writes only fire on exact `rdlen == 4/16`
+  and `*na < 8`), and the top-level `qid != MY_QID` / `an <= 0` rejection
+  exists. The ancount is attacker-controlled, but the per-record loop
+  `off + 12 <= nread` bounds exit; a truncated RR can never advance `off`
+  past `nread` because each label read is checked. SEC-CLEAN.
+- **statx emulation** (`sp_statx_emulate`): mask explictly written as
+  `BASIC_STATS & ~BTIME` (consumers honor the mask), every populated field
+  maps to the same-priority legacy `stat` member, memset of the output
+  `statx` clears the gap fields the kernel would leave unspecified.
+  SEC-CLEAN.
+- **sockaddr rewriting** (`sp_addr_fwd_unix`): rewrite bounded by the
+  caller's second arg `len` for reads (strnlen bounded), writes into a
+  local `sockaddr_un` and bails if the translated guest path can't fit
+  sun_path (108) — kernel gets EINVAL-delayed, never a guest overflow.
+  SEC-CLEAN. (`sp_pmap_remember` fd 0-steal noted: not a security issue,
+  the map is per-process stat data.)
+- **ashmem tracking ring** (`sv_ashmem_fds[16]` / `fixup`): classic ring
+  with `% 16` wrap — bounded by construction. `fstat` size-fixup only on
+  tracked fds; lseek roundtrip preserves the caller's offset (verified
+  `cur >= 0` guard before SEEK_SET restore). SEC-CLEAN.
 - `sp_dns_*` hand-rolled wire parser (l.1472–1639) — bounds look consistent
   on skim but deserves a fuzz or property test.
 - `sp_statx_emulate` struct field mapping (l.2522) — verify alignment vs
