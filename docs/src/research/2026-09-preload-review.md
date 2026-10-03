@@ -111,6 +111,30 @@ fd's host spelling via `syscall(SYS_readlinkat, "/proc/self/fd/%d")`
 registry. useradd/stat-parity probes over fds now see the same answer as
 path stats.
 
+### F6 — NEW (found while testing F1): >127-arg execle chain SIGSEGV even post-F1
+
+Reproducer: `crates/sprout-preload/csrc/tests/test_execle_env.c`, built
+with `-DEXECLE_FILL_F130` (compile in any glibc guest, run via
+`sprout -r ~/roots/debian --user=0:0 -- /root/sptest/te_F130`).
+
+- F30 (30 filler args): PASS — child prints `marker_alive`, rc 0.
+- F130 / F300 (>127 args, i.e. the wrapper-truncated argv): rc 139,
+  SIGSEGV in the SECOND-level exec — the interposed `execle` builds the
+  capped argv correctly (F1 fix verified: scan-to-NULL reaches real envp),
+  then `sp_execve_chain` execs `ldso-sanitized` with ~131 argv entries and
+  the new image's init crashes after the auxit/auxfix probe opens
+  `/proc/self/auxv`, `/proc/self/maps`, `sp-auxfix.log` (ptrace log: child
+  stopped sig=11 right after those reads).
+- Direct launcher execs with 300 real args (`sprout -- /bin/sh -c ...f299`)
+  work fine — so plain big-argv ldso startup is OK; the crash is specific
+  to the chain-into-loader path when argv crosses ~127+.
+
+Suspects: AT_EXECFN stack-string rewrite in the auxfix block (l.~600-660),
+which memcpy's SPROUT_EXE into the auxv slot assuming loader-path length;
+or a stack-scan heuristic that walks argv on the new image's stack. NOT yet
+root-caused; no plausible fix landed (in-flight edit abandoned for being
+sloppy — see session notes). Run F130 against any fix attempt.
+
 ## Not audited in depth (next pass candidates)
 
 - `sp_dns_*` hand-rolled wire parser (l.1472–1639) — bounds look consistent
