@@ -104,7 +104,7 @@ static void add_bind(uint8_t *buf, size_t cap_entries, uint32_t idx,
 static int test_empty_shadow(void) {
     int f = 0;
     int fd = (int)syscall(SYS_memfd_create, "shadow-empty", 0);
-    uint8_t buf[65536];
+    uint8_t buf[4096 * 64];   /* build_shadow zeroes 4096*cap */
     uint64_t g;
     build_shadow(buf, 64, 0, NULL, NULL, &g);
     if (write(fd, buf, sizeof buf) != (ssize_t)sizeof buf) { perror("write"); return 1; }
@@ -124,7 +124,7 @@ static int test_empty_shadow(void) {
 static int test_bind_hit(void) {
     int f = 0;
     int fd = (int)syscall(SYS_memfd_create, "shadow-bind", 0);
-    uint8_t buf[65536];
+    uint8_t buf[4096 * 64];   /* build_shadow zeroes 4096*cap */
     build_shadow(buf, 64, 0, NULL, NULL, &(uint64_t){0});
     add_bind(buf, 64, 0, "/mnt/hello", "/backing/hello", SP_SH_S_VALID);
     add_bind(buf, 64, 1, "/mnt/hello/deep", "/backing/deeper", SP_SH_S_VALID);
@@ -155,7 +155,7 @@ static int test_bind_hit(void) {
 static int test_stale_shadow(void) {
     int f = 0;
     int fd = (int)syscall(SYS_memfd_create, "shadow-stale", 0);
-    uint8_t buf[65536];
+    uint8_t buf[4096 * 64];   /* build_shadow zeroes 4096*cap */
     build_shadow(buf, 64, 0, NULL, NULL, &(uint64_t){0});
     /* make heartbeat stale (>2s ago) */
     struct sp_shadow_hdr *h = (struct sp_shadow_hdr *)buf;
@@ -176,7 +176,7 @@ static int test_stale_shadow(void) {
 static int test_crc_corruption(void) {
     int f = 0;
     int fd = (int)syscall(SYS_memfd_create, "shadow-corrupt", 0);
-    uint8_t buf[65536];
+    uint8_t buf[4096 * 64];   /* build_shadow zeroes 4096*cap */
     build_shadow(buf, 64, 0, NULL, NULL, &(uint64_t){0});
 
     /* Poison 64 bytes past the header so CRC mismatches for the CRC-covered
@@ -203,7 +203,7 @@ static int test_crc_corruption(void) {
 static int test_seqlock_torn(void) {
     int f = 0;
     int fd = (int)syscall(SYS_memfd_create, "shadow-torn", 0);
-    uint8_t buf[65536];
+    uint8_t buf[4096 * 64];   /* build_shadow zeroes 4096*cap */
     uint64_t g;
     build_shadow(buf, 64, 0, NULL, NULL, &g);
     /* simulate a torn write: gen stays odd */
@@ -226,7 +226,7 @@ static int test_perf(void) {
     int f = 0;
     /* Build both empty and heavy (63 unused + 1 valid) — measure lookup cost. */
     int fd = (int)syscall(SYS_memfd_create, "shadow-perf", 0);
-    uint8_t buf[65536];
+    uint8_t buf[4096 * 64];   /* build_shadow zeroes 4096*cap */
     build_shadow(buf, 64, 0, NULL, NULL, &(uint64_t){0});
 
     /* Fill 62 junk entries so the default passes but the real one sits at 62. */
