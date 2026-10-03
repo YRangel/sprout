@@ -162,6 +162,48 @@ static int path_within(const char *prefix, size_t plen, const char *path) {
            (path[plen] == '\0' || path[plen] == '/');
 }
 
+/* Lexical canonicalization: collapse "//", drop "." components, and resolve
+ * ".." against preceding components, CLAMPED at a leading floor prefix
+ * (floor_len bytes are assumed already-clean, e.g. the rootfs). proot
+ * virtual-root semantics: ".." at the floor STAYS at the floor, so a guest
+ * (or a spliced symlink target) can never lexically walk above the rootfs.
+ * Pure string rewrite, no I/O; output is never longer than input. */
+static void sp_dotdot_canon(char *p, size_t floor_len) {
+    if (p[0] != '/') return;            /* in-tree callers pass absolutes */
+    char sc[SP_PATH_MAX];
+    size_t w = floor_len;
+    if (w >= sizeof sc) return;
+    memcpy(sc, p, w);                   /* floor prefix verbatim */
+    if (w == 0) { sc[0] = '/'; w = 1; }
+    const size_t fl = floor_len ? floor_len : 1;
+    const char *r = p + floor_len;
+    int trail_slash = 0;
+    while (*r) {
+        while (*r == '/') r++;
+        if (!*r) { trail_slash = 1; break; }
+        const char *e = r;
+        while (*e && *e != '/') e++;
+        size_t cl = (size_t)(e - r);
+        if (cl == 1 && r[0] == '.') {
+            /* drop "." */
+        } else if (cl == 2 && r[0] == '.' && r[1] == '.') {
+            if (w > fl) {
+                while (w > fl && sc[w - 1] != '/') w--;  /* drop component */
+                if (w > fl) w--;                          /* drop its slash  */
+            }
+            /* already at floor: clamp — ".." above the root stays */
+        } else {
+            sc[w++] = '/';
+            memcpy(sc + w, r, cl);
+            w += cl;
+        }
+        r = e;
+    }
+    if (trail_slash && w > 1) sc[w++] = '/';
+    sc[w] = '\0';
+    memcpy(p, sc, w + 1);
+}
+
 #include <sys/syscall.h>
 
 /* Resolve a translated path's symlink chain INSIDE the rootfs so that
@@ -219,6 +261,10 @@ static void sp_resolve_intermediate_links(const sp_config_t *cfg, char out[SP_PA
                     strcat(merged + dirlen + 1, rest);
                 }
                 memcpy(out, merged, strlen(merged) + 1);
+                /* the splice may have smuggled ".." ABOVE the rootfs prefix
+                 * (target="../../x" from $B/a/b): clamp lexically so the
+                 * string can never resolve host-side above the rootfs. */
+                sp_dotdot_canon(out, cfg->rootfs_len);
                 spliced = 1;
                 break;
             }
@@ -235,7 +281,7 @@ static void sp_resolve_intermediate_links(const sp_config_t *cfg, char out[SP_PA
 static int sp_chase_final(const sp_config_t *cfg, char out[SP_PATH_MAX]) {
     struct stat kb;
     char link[SP_PATH_MAX];
-    for (int hops = 0; hops < 8; hops++) {
+    for (int hops = 0; hops < 16; hops++) {
         if (syscall(SYS_newfstatat, AT_FDCWD, out, &kb, AT_SYMLINK_NOFOLLOW) != 0)
             return 0;
         if (!S_ISLNK(kb.st_mode)) return 1;
@@ -248,15 +294,38 @@ static int sp_chase_final(const sp_config_t *cfg, char out[SP_PATH_MAX]) {
             size_t dirlen = (size_t)(slash - out) + 1;
             if (dirlen + (size_t)n + 1 > SP_PATH_MAX) return 1;
             memmove(out + dirlen, link, (size_t)n + 1);
+            sp_dotdot_canon(out, cfg->rootfs_len);
             continue;
         }
         if (path_within(cfg->rootfs, cfg->rootfs_len, link)) {
             memmove(out, link, (size_t)n + 1);
+            sp_dotdot_canon(out, cfg->rootfs_len);
             continue;
         }
         if (cfg->rootfs_len + (size_t)n + 1 > SP_PATH_MAX) return 1;
         memmove(out + cfg->rootfs_len, link, (size_t)n + 1);
         memcpy(out, cfg->rootfs, cfg->rootfs_len);
+        sp_dotdot_canon(out, cfg->rootfs_len);
+    }
+    /* Hop budget exhausted with the chain still unresolved (link loop or a
+     * genuinely deep chain). The kernel would resolve the REMAINING tail
+     * itself — with guest-spelled absolute targets matching HOST paths.
+     * Clamp once more: if the final component is still a symlink whose
+     * absolute target is not rootfs-spelled, re-prefix it one last time so
+     * the kernel's own follow starts inside the rootfs, and let the
+     * kernel's 40-hop limit produce the honest ELOOP for real loops. */
+    if (syscall(SYS_newfstatat, AT_FDCWD, out, &kb, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISLNK(kb.st_mode)) {
+        ssize_t n = syscall(SYS_readlinkat, AT_FDCWD, out, link, sizeof(link) - 1);
+        if (n > 0 && (size_t)n < sizeof(link)) {
+            link[n] = '\0';
+            if (link[0] == '/' && !path_within(cfg->rootfs, cfg->rootfs_len, link) &&
+                cfg->rootfs_len + (size_t)n + 1 <= SP_PATH_MAX) {
+                memmove(out + cfg->rootfs_len, link, (size_t)n + 1);
+                memcpy(out, cfg->rootfs, cfg->rootfs_len);
+                sp_dotdot_canon(out, cfg->rootfs_len);
+            }
+        }
     }
     return 1;
 }
@@ -319,6 +388,8 @@ int sp_translate_f(const sp_config_t *cfg, const char *path, char out[SP_PATH_MA
         if (b->host_len + rest + 1 > SP_PATH_MAX) return 0;
         memcpy(out, b->host, b->host_len);
         memcpy(out + b->host_len, path + b->guest_len, rest + 1);
+        /* suffix ".." may climb past the bind's host anchor; clamp there */
+        sp_dotdot_canon(out, b->host_len);
         if (follow_final) sp_resolve_links(cfg, out);
         return 1;
     }
@@ -334,6 +405,10 @@ int sp_translate_f(const sp_config_t *cfg, const char *path, char out[SP_PATH_MA
     if (cfg->rootfs_len + n + 1 > SP_PATH_MAX) return 0;
     memcpy(out, cfg->rootfs, cfg->rootfs_len);
     memcpy(out + cfg->rootfs_len, path, n + 1);
+    /* Guest-supplied ".." must resolve VIRTUALLY against the guest root,
+     * never lexically above it (proot semantics): clamp here so the kernel
+     * cannot walk out of the rootfs through the raw string. */
+    sp_dotdot_canon(out, cfg->rootfs_len);
     if (follow_final) sp_resolve_links(cfg, out);
     return 1;
 }
@@ -3429,7 +3504,26 @@ int lstat(const char *path, struct stat *st) {
  * glibc ABI: musl does not provide struct stat64 nor these symbols, so
  * guard the whole block. */
 
-/* fstat64: no path to translate, only the ownership spoof contract. */
+/* nlink-parity for FD-based stats (F5): the hardlink registry is keyed on
+ * GUEST paths, but fstat sees only an fd. Recover the guest spelling via
+ * /proc/self/fd readlink (RAW syscalls — our readlink wrapper would chase
+ * it into translate recursion) + sp_reverse, then apply the same
+ * link2symlink nlink==1→2 bump the path wrappers do. No-op when the fd is
+ * not a registered hardlink; one short syscall per call, so it stays in
+ * the cold ship-fast path (fstat on l2s-emulated files is rare in batch). */
+static void sp_fstat_hreg_fixup(int fd, void *st_buf) {
+    struct stat *st = (struct stat *)st_buf;
+    if (st->st_nlink != 1) return;
+    char procp[48], hbuf[SP_PATH_MAX], gbuf[SP_PATH_MAX];
+    int pl = snprintf(procp, sizeof procp, "/proc/self/fd/%d", fd);
+    if (pl <= 0 || (size_t)pl >= sizeof procp) return;
+    ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD, procp, hbuf, sizeof(hbuf) - 1);
+    if (n <= 0 || (size_t)n >= sizeof(hbuf)) return;
+    hbuf[n] = '\0';
+    if (sp_reverse(&g_cfg, hbuf, gbuf, sizeof(gbuf)) == 0) return;
+    if (sp_hreg_hit(gbuf)) st->st_nlink = 2;
+}
+/* fstat64: no path to translate — ownership spoof + fd-derived registry fixup. */
 int fstat64(int fd, struct stat64 *st) {
     static int (*SP_REAL(fstat64))(int, struct stat64 *) = NULL;
     SP_RESOLVE(fstat64);
@@ -3437,6 +3531,7 @@ int fstat64(int fd, struct stat64 *st) {
     if (rc == 0) {
         sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid);
         sv_ashmem_fstat_fixup(fd, (off_t *)&st->st_size);
+        sp_fstat_hreg_fixup(fd, st);
     }
     return rc;
 }
@@ -3451,6 +3546,7 @@ int fstat(int fd, struct stat *st) {
     if (rc == 0) {
         sp_spoof_uid_gid(&st->st_uid, &st->st_gid);
         sv_ashmem_fstat_fixup(fd, &st->st_size);
+        sp_fstat_hreg_fixup(fd, st);
     }
     return rc;
 }
@@ -4949,7 +5045,11 @@ int execle(const char *path, const char *arg, ...) {
     va_list ap; va_start(ap, arg);
     char *a[128];
     int i = 0;
-    if (arg) { a[i++] = (char *)arg; char *s; while ((s = va_arg(ap, char *)) && i < 127) a[i++] = s; }
+    if (arg) { a[i++] = (char *)arg; char *s; while ((s = va_arg(ap, char *))) { if (i < 127) a[i++] = s; } }
+    /* keep consuming the variadic list to its NULL sentinel EVEN after the
+     * storage cap is hit: execle's envp is the NEXT va_arg after that NULL,
+     * so stopping the scan early would read a leftover argv pointer as envp
+     * and hand the child a garbage environment (>127-arg execle only). */
     char **envp = va_arg(ap, char **);
     va_end(ap);
     a[i] = NULL;
@@ -5061,6 +5161,22 @@ int system(const char *command) {
  * like system(); pclose pair-tracks pid by fd and waits manually.
  * (pid-map slots are static: chains under vfork-shared frames forbid
  * heap in spawn paths — ADR-0014.) */
+/* vfork MUST NOT leak into the exec chain: a guest vfork() child that
+ * calls execve() lands in sp_execve_chain INSIDE the parent's frozen
+ * address space, where our frame-slab malloc + classify fopen would run
+ * against shared glibc state. ADR-0014's no-heap-in-vfork contract is
+ * enforced by ELIMINATING vfork outright: fork() is a semantic superset
+ * (the child may touch memory freely; the parent's pages are COW), and
+ * every well-formed caller treats the result identically. This restores
+ * the comments' promise below for spawn chains reached via clone-VM
+ * paths too: they can only come through fork() now. */
+pid_t vfork(void) {
+    static pid_t (*SP_REAL(fork))(void) = NULL;
+    SP_RESOLVE(fork);
+    pid_t r = SP_REAL(fork) ? SP_REAL(fork)() : -1;
+    return r;
+}
+
 #define SP_POPEN_MAX 24
 static struct { int fd; pid_t pid; } sp_popen_map[SP_POPEN_MAX];
 static int sp_popen_initd = 0;

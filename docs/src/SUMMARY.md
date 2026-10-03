@@ -24,6 +24,8 @@
 # Research
 
 - [2026-09: architecture limitations & remediation](./research/2026-09-architecture-limitations.md)
+- [2026-09: preload interposer deep review](./research/2026-09-preload-review.md)
+- [2026-09: preload interposer deep review](./research/2026-09-preload-review.md)
 
 # Decisions (ADRs)
 

@@ -3,6 +3,28 @@
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 ## [Unreleased]
 
+### Fixed - preload deep-review round (findings F1-F5)
+- **F1** `execle()` mis-parsed `envp` for >127-arg calls: the variadic scan
+  stopped *consuming* at the storage cap, so the trailing `envp` read picked
+  up a leftover argv pointer. Scan now always runs to the NULL sentinel;
+  only the store is gated by the cap.
+- **F2** `..` is clamped to the virtual root at every translation point via
+  new `sp_dotdot_canon` (lexical, floor-aware): translate_f rootfs branch,
+  bind branch, intermediate relative splice, and all `sp_chase_final` arms.
+  A guest can no longer lexically walk above the rootfs (proot semantics).
+- **F3** chain hop-limit exhaustion: chase budget 8→16, and on exhaustion a
+  still-symlinked tail with an absolute target is re-prefixed once more so
+  the kernel's follow starts inside the rootfs; true loops hit kernel ELOOP.
+- **F4** `vfork()` is now interposed as `fork()` — a strict semantic
+  superset for well-formed callers — closing the ADR-0014 no-heap-in-vfork
+  gap where a guest vfork+execve landed a malloc/frame slab inside the
+  parent's CLONE_VFORK-frozen address space.
+- **F5** `fstat`/`fstat64` apply the link2symlink nlink==1→2 parity via
+  `/proc/self/fd` readlink + `sp_reverse` into the hardlink registry
+  (previously path-only; `open`+`fstat` on an emulated hardlink read
+  nlink==1).
+- Regression cases for the `..` clamp added to `csrc/tests/test_translate.c`.
+
 ### Fixed - box32 heap layout: direct-exec derivatives for fixed-base emulators (stock box64 wine32 SIGSEGV)
 - Root cause: the sanitized-ldso chain makes the LDSO the kernel's main
   exec, so the process brk follows the ldso's HIGH ASLR image; glibc's

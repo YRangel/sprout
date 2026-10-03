@@ -106,6 +106,17 @@ int main(void) {
      * rootfs string is NOT considered already-translated */
     EXPECT_T(&cfg, "/data/local/rootfs2/x", "/data/local/rootfs/data/local/rootfs2/x");
 
+    /* dotdot clamp (F2): ".." components must resolve virtually, never
+     * above the rootfs floor (proot semantics) */
+    EXPECT_T(&cfg, "/a/b/../c", "/data/local/rootfs/a/c");
+    EXPECT_T(&cfg, "/a/./b/", "/data/local/rootfs/a/b/");
+    EXPECT_T(&cfg, "/../../etc/passwd", "/data/local/rootfs/etc/passwd");
+    EXPECT_T(&cfg, "/x/../../../", "/data/local/rootfs/");
+    /* bind-side clamp: ".." cannot climb above the bind's host anchor */
+    EXPECT_T(&cfg, "/home/u1/../escape", "/data/local/home-u1/escape");
+    EXPECT_T(&cfg, "/home/u1/../../../../x", "/data/local/home-u1/x");
+    EXPECT_T(&cfg, "/mnt/sdcard/../host-out", "/sdcard/host-out");
+
     /* reverse path (readlink results) */
     EXPECT_REV(&cfg, "/data/local/rootfs/usr/bin/node", "/usr/bin/node");
     EXPECT_REV(&cfg, "/data/local/home-u1/x", "/home/u1/x");
