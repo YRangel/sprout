@@ -3,6 +3,23 @@
 All notable changes to sprout, grouped by release version. The four-eyes rule: any change that modifies `crates/sprout-preload/csrc/sprout_preload.c` or `crates/sprout-ptrace/csrc/sprout_ptrace.c` gates on the full battery suite before an artifact swap.
 ## [Unreleased]
 
+### Added
+- `csrc/tests/test_execle_env.c` — runtime execle regression probe:
+  envp-survival for 30/130/300 filler args (reproduces F1 class and gates
+  any future F6 fix).
+
+### Fixed - test suite
+- `test_shadow.c`: build_shadow memsets 4096*cap (256 KiB for cap=64) into
+  caller buffers sized 65536 — deterministic 4x stack overflow, now sized
+  `4096 * 64`. (test_shadow segfaulted in the debian guest on every run.)
+
+### Known issue (filed, unfixed)
+- **F6** — `execle` with >127 argv entries still SIGSEGVs in the
+  second-level chain-into-loader even with the F1 fix: crash lands after
+  the new image's auxfix phase reads `/proc/self/auxv` / `maps`. Suspect:
+  AT_EXECFN stack-string rewrite or the argv-walking stack scan in the
+  auxfix block (l.~600-660). Reproducer: `test_execle_env.c -DEXECLE_FILL_F130`.
+
 ### Fixed - preload deep-review round (findings F1-F5)
 - **F1** `execle()` mis-parsed `envp` for >127-arg calls: the variadic scan
   stopped *consuming* at the storage cap, so the trailing `envp` read picked
