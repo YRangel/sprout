@@ -1086,8 +1086,8 @@ static const char *sp_translate_xf(const char *path, char buf[SP_PATH_MAX], int 
             cw[cn] = '\0';
             size_t rl = g_cfg.rootfs_len;
             if (rl && strncmp(cw, g_cfg.rootfs, rl) == 0) {
-                int w = snprintf(joined, sizeof(joined), "%s/%s", cw + rl, path);
-                if (w > 0 && (size_t)w < sizeof(joined)) path = joined;
+                int w = snprintf(joined, SP_PATH_MAX, "%s/%s", cw + rl, path);
+                if (w > 0 && (size_t)w < SP_PATH_MAX) path = joined;
             }
         }
     }
@@ -3926,7 +3926,7 @@ static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
  * Merge guest-supplied entries BEFORE our system fallback. Static buffer
  * is deliberate: chains run under vfork-shared frames (ADR-0014), malloc
  * is forbidden here. */
-static const char *sp_chain_libpath(char *envp[]) {
+static const char *sp_chain_libpath(const char *const envp[]) {
     const char *sys = getenv("SPROUT_LIBRARY_PATH");
     const char *cust = NULL;
     for (int i = 0; envp && envp[i]; i++)
