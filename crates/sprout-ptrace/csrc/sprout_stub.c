@@ -607,7 +607,18 @@ static int install_notify_filter(void)
         200, 203, 206, 211,
     };
     const int ntr = (int)(sizeof(traps) / sizeof(traps[0]));
-    sp_bpf_insn_t prog[4 + 24 + 2];
+    /* F17: chdir-family raw svc (emulator lanes like FEX emulate guest
+     * syscalls with inline svc — invisible to every libc wrapper). These
+     * CHANGE PROCESS STATE, so the notify lane cannot answer them with a
+     * value: they go SECCOMP_RET_TRACE and the supervisor rewrites the
+     * path arg at a PTRACE_EVENT_SECCOMP stop (translate_reg_path). */
+    static const int traced[] = { 49 /*chdir*/, 51 /*chroot*/,
+                                  43 /*statfs*/, 45 /*truncate*/ };
+    const int ntrace = (int)(sizeof(traced) / sizeof(traced[0]));
+#ifndef SECCOMP_RET_TRACE
+#define SECCOMP_RET_TRACE 0x7ff00000u
+#endif
+    sp_bpf_insn_t prog[4 + 4 + 32 + 3];
     int p = 0;
     const u32 BPF_LD = 0x00, BPF_W = 0x00, BPF_ABS = 0x20;
     const u32 BPF_JMP = 0x05, BPF_JEQ = 0x10, BPF_K = 0x00, BPF_RET = 0x06;
@@ -616,10 +627,15 @@ static int install_notify_filter(void)
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_JMP | BPF_JEQ | BPF_K), 1, 0, AUDIT_ARCH_AARCH64_OWN };
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_KILL };
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_LD | BPF_W | BPF_ABS), 0, 0, 0 };
+    /* layout: [.. nr][ntrace checks][ntr checks][ALLOW][TRACE][NOTIF] */
+    for (int i = 0; i < ntrace; i++)
+        prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_JMP | BPF_JEQ | BPF_K),
+                                     (u8)(ntr + 2 - i), 0, (u32)traced[i] };
     for (int i = 0; i < ntr; i++)
         prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_JMP | BPF_JEQ | BPF_K),
-                                     (u8)(ntr + 2 - (i + 1) + 0), 0, (u32)traps[i] };
+                                     (u8)(ntr + 1 - i), 0, (u32)traps[i] };
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_ALLOW };
+    prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_TRACE };
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_USER_NOTIF };
 
     /* jump-target math like the supervisor: on nr-match jump over

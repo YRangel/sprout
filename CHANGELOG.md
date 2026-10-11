@@ -502,3 +502,28 @@ cargo test 26/26 (workspace), the C-side `test_translate` suite (covers the ance
   +login anonymous +quit` exits 0 (steamcmd.sh's own env override; its
   uname-based picker would otherwise seek linuxarm64/ on aarch64 hosts).
 - test_translate, test_shadow, smoke, proot-compat all green.
+
+### FEX lane check (partial — lane opens, chdir-class open)
+- **F16 self-exe lstat is a symlink**: /proc/self/exe reported S_IFREG
+  through the F8 translation; std::filesystem::read_symlink then died with
+  EINVAL (FEXServer boot). The no-follow stat family now repaints self-exe
+  results as symlinks. FEXServer starts.
+- **F17 groundwork**: SPROUT_EXE stamping now also recognizes configured
+  binfmt emulators (SPROUT_BINFMT_I386=/…/FEX execs steal no guest stamp);
+  the lane gate keys on the ELFCLASS32 guest stamp (chain processes hide
+  the emulator name behind the sanitized ldso); the F12 gap reservation
+  leaves a sbrk slack window (FEX's own DisableSBRKAllocations pins the
+  page above sbrk — the two guard designs collided); syscall(2) now
+  translates the standalone-path family (chdir/chroot/truncate/statfs).
+- **F17 raw-svc RET_TRACE lane (OPT-IN, SPROUT_EMU_TRACE=1)**: FEX's guest
+  syscalls arrive as inline svc — invisible to every libc wrapper. A
+  seccomp RET_TRACE filter + supervisor PTRACE_EVENT_SECCOMP handler
+  (translate_reg_path + SETREGSET) implements the design's own chdir plan.
+  EXPERIMENTAL: with the filter armed the working box64 chdir path
+  regressed (resume-mode change at the stop) — default OFF until fixed.
+- FEX status: FEXServer boots (F16), i386 guests execute, rootfs opens
+  work (notify-served), guest chdir-class needs the RET_TRACE lane fix.
+
+### Verified
+- box64 steamcmd `+login anonymous +quit` exits 0 (no regression).
+- test_translate, test_shadow, smoke, proot-compat all green.

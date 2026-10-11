@@ -356,6 +356,7 @@ static const char *sp_fakeproc_host_path(const char *guest); /* defined near ope
  * (real bug found 2026-08-17: 'rm -f /tmp/hl1' deleted the payload). */
 #ifdef SPROUT_INTERPOSE
 static const char *sp_self_exe_guest_path(const char *path);
+static void sp_self_exe_linkify(const char *path, void *stv, int is64);
 static FILE *sp_frepair(FILE *f);   /* F11 stdio repair (defined at tail) */
 static int g_emu32_low = 0;         /* F12b: emulator+ELF32 lane (see ctor) */
 static void *sp_arena_alloc(size_t need, size_t align);   /* F12c (tail) */
@@ -680,7 +681,12 @@ __attribute__((constructor)) static void sprout_init(void) {
                     }
                     p = c ? c + 1 : p + tl;
                 }
-                if (gmatch) {
+                /* F17: the token match is a FALLBACK — the authoritative
+                 * emulator-lane signal is SPROUT_EXE naming an ELFCLASS32
+                 * guest (a native process cannot be one). Through the
+                 * chain the raw self is the sanitized ldso, so a name
+                 * match alone misses SPROUT_BINFMT_I386=/.../FEX execs. */
+                if (gmatch || getenv("SPROUT_EXE")) {
                     const char *sg = getenv("SPROUT_EXE");
                     if (sg && *sg) {
                         int efd = open(sg, O_RDONLY);
@@ -701,12 +707,50 @@ __attribute__((constructor)) static void sprout_init(void) {
                              * under the fixed-base derivative image) and
                              * caps arenas so no high arena is ever born. */
                             g_emu32_low = getenv("SPROUT_NOARENA") ? 0 : 1;
-#ifdef M_MMAP_MAX
-                            mallopt(M_MMAP_MAX, 0);
-#endif
-#ifdef M_ARENA_MAX
-                            mallopt(M_ARENA_MAX, 1);
-#endif
+                            /* NOTE: no mallopt(M_MMAP_MAX,0) here — FEX
+                             * drives its guest heap through sbrk and glibc
+                             * on the same break starves it ("Couldn't
+                             * allocate page after SBRK"). The arena below
+                             * already covers the lane's allocations. */
+                            /* F17: the emulator's guest runs raw svc
+                             * syscalls (FEX's emulation layer) — invisible
+                             * to every libc wrapper. Arm SECCOMP_RET_TRACE
+                             * for the process-state path family; the
+                             * supervisor rewrites the path arg at the
+                             * PTRACE_EVENT_SECCOMP stop (translate_reg_path
+                             * — chdir cannot be answered with a value, it
+                             * must execute in the tracee). Plain allow-all
+                             * otherwise. */
+                            if (getenv("SPROUT_EMU_TRACE")) {
+                                /* EXPERIMENTAL (F17, opt-in): the RET_TRACE
+                                 * lane regressed the working box64 chdir
+                                 * path (resume-mode change at the stop) —
+                                 * off by default until that is fixed. */
+                                struct sp_sfilter { unsigned short code; unsigned char jt, jf; unsigned int k; };
+                                struct sp_sfprog { unsigned short len; struct sp_sfilter *filt; };
+                                static struct sp_sfilter fp[] = {
+                                    { 0x20, 0, 0, 4 },                        /* ld arch */
+                                    { 0x15, 1, 0, 0xC00000B7u },              /* jeq aarch64 */
+                                    { 0x06, 0, 0, 0x00000000u },              /* ret KILL */
+                                    { 0x20, 0, 0, 0 },                        /* ld nr */
+                                    { 0x15, 0, 1, 49u }, { 0x06, 0, 0, 0x7ff00000u },  /* chdir -> TRACE */
+                                    { 0x15, 0, 1, 51u }, { 0x06, 0, 0, 0x7ff00000u },  /* chroot */
+                                    { 0x15, 0, 1, 43u }, { 0x06, 0, 0, 0x7ff00000u },  /* statfs */
+                                    { 0x15, 0, 1, 45u }, { 0x06, 0, 0, 0x7ff00000u },  /* truncate */
+                                    { 0x06, 0, 0, 0x7fff0000u },              /* ret ALLOW */
+                                };
+                                struct sp_sfprog fpl = { (unsigned short)(sizeof fp / sizeof fp[0]), fp };
+                                long fprc = sp_raw_svc4(277 /*SYS_seccomp*/, 1 /*SET_MODE_FILTER*/, 0, (long)&fpl, 0);
+                                if (getenv("SPROUT_DEBUG")) {
+                                    int df = open("/tmp/sp-emu32.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+                                    if (df >= 0) {
+                                        char lb[64];
+                                        int ll = snprintf(lb, sizeof lb, "seccomp-filter rc=%ld\n", fprc);
+                                        if (ll > 0) write(df, lb, (size_t)ll);
+                                        close(df);
+                                    }
+                                }
+                            }
                             /* Reserve every FREE region above 4GB. NEVER a
                              * blanket MAP_FIXED: the live libc sits high
                              * (~0x79...) and MAP_FIXED would unmap it — the
@@ -721,29 +765,59 @@ __attribute__((constructor)) static void sprout_init(void) {
                             const unsigned long hi4 = 1UL << 39;
                             FILE *gmf = fopen("/proc/self/maps", "r");
                             int gres = 0;
+                            /* FEX's DisableSBRKAllocations() pins the page
+                             * right above sbrk(0) (its own answer to this
+                             * very class) — a PIE-loaded heap can sit above
+                             * 4GB and the walker must not eat that page or
+                             * FEX aborts. Leave a slack window above the
+                             * current break. */
+                            unsigned long slo = 0, shi = 0;
+                            {
+                                void *bk = sbrk(0);
+                                if (bk && bk != (void *)-1) {
+                                    slo = ((unsigned long)bk + 0xfffUL) & ~0xfffUL;
+                                    shi = slo + (16UL << 20);
+                                }
+                            }
                             if (gmf) {
                                 char gl[256];
                                 unsigned long prev = lo4;
                                 while (fgets(gl, sizeof gl, gmf)) {
                                     unsigned long a = 0, b = 0;
-                                    if (sscanf(gl, "%lx-%lx", &a, &b) != 2) continue;
+                                    if (sscanf(gl, "%lx-%llx", &a, &b) != 2 && sscanf(gl, "%lx-%lx", &a, &b) != 2) continue;
                                     if (b <= lo4) continue;
                                     if (a >= hi4) break;
                                     if (a > prev) {
                                         unsigned long ga = prev;
                                         unsigned long gbnd = (a < hi4) ? a : hi4;
-                                        if (mmap((void *)ga, gbnd - ga, PROT_NONE,
+                                        /* subtract the sbrk slack window */
+                                        unsigned long segs[2][2] = {
+                                            { ga, (gbnd < slo) ? gbnd : slo },
+                                            { (ga > shi) ? ga : shi, gbnd }
+                                        };
+                                        for (int si = 0; si < 2; si++) {
+                                            if (segs[si][1] <= segs[si][0]) continue;
+                                            if (mmap((void *)segs[si][0], segs[si][1] - segs[si][0], PROT_NONE,
+                                                     MAP_PRIVATE | MAP_ANONYMOUS |
+                                                     MAP_FIXED | MAP_NORESERVE,
+                                                     -1, 0) != MAP_FAILED) gres++;
+                                        }
+                                    }
+                                    if (b > prev) prev = b;
+                                }
+                                if (prev < hi4) {
+                                    unsigned long segs[2][2] = {
+                                        { prev, (hi4 < slo) ? hi4 : slo },
+                                        { (prev > shi) ? prev : shi, hi4 }
+                                    };
+                                    for (int si = 0; si < 2; si++) {
+                                        if (segs[si][1] <= segs[si][0]) continue;
+                                        if (mmap((void *)segs[si][0], segs[si][1] - segs[si][0], PROT_NONE,
                                                  MAP_PRIVATE | MAP_ANONYMOUS |
                                                  MAP_FIXED | MAP_NORESERVE,
                                                  -1, 0) != MAP_FAILED) gres++;
                                     }
-                                    if (b > prev) prev = b;
                                 }
-                                if (prev < hi4 &&
-                                    mmap((void *)prev, hi4 - prev, PROT_NONE,
-                                         MAP_PRIVATE | MAP_ANONYMOUS |
-                                         MAP_FIXED | MAP_NORESERVE,
-                                         -1, 0) != MAP_FAILED) gres++;
                                 fclose(gmf);
                             }
                             if (getenv("SPROUT_DEBUG")) {
@@ -2675,6 +2749,7 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("fstatat", path, p);
     int rc = SP_REAL(fstatat)(dirfd, p, st, flags);
+    if (rc == 0 && (flags & AT_SYMLINK_NOFOLLOW)) sp_self_exe_linkify(path, st, 0);
     if (rc == 0) { sp_spoof_uid_gid(&st->st_uid, &st->st_gid); if (sp_hreg_hit(path) && st->st_nlink == 1) st->st_nlink = 2; }
     return rc;
 }
@@ -2688,6 +2763,7 @@ int newfstatat(int dirfd, const char *path, struct stat *st, int flags) {
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("newfstatat", path, p);
     int rc = SP_REAL(newfstatat)(dirfd, p, st, flags);
+    if (rc == 0 && (flags & AT_SYMLINK_NOFOLLOW)) sp_self_exe_linkify(path, st, 0);
     if (rc == 0) { sp_spoof_uid_gid(&st->st_uid, &st->st_gid); if (sp_hreg_hit(path) && st->st_nlink == 1) st->st_nlink = 2; }
     return rc;
 }
@@ -2902,6 +2978,37 @@ static int sp_self_exe_answer(const char *path, char *buf, size_t bufsiz) {
     if (l > bufsiz) l = bufsiz;
     memcpy(buf, e, l);
     return (int)l;
+}
+
+static int sp_self_exe_match(const char *path) {
+    if (!path) return 0;
+    if (!strcmp(path, "/proc/self/exe")) return 1;
+    char m[96];
+    snprintf(m, sizeof m, "/proc/%ld/exe", (long)getpid());
+    return !strcmp(path, m);
+}
+
+/* F16: procfs truth for the no-follow stat family. /proc/self/exe IS a
+ * symlink; F8 translates the path to the real image so lstat reports
+ * S_IFREG — read_symlink users (std::filesystem, FEXServer) then die with
+ * EINVAL. Repaint self-exe results as symlinks sized to the answer. */
+static void sp_self_exe_linkify(const char *path, void *stv, int is64) {
+    if (!sp_self_exe_match(path)) return;
+    const char *e = getenv("SPROUT_EXE");
+    if (!e || !*e) return;
+#if defined(__GLIBC__)
+    if (is64) {
+        struct stat64 *st = (struct stat64 *)stv;
+        st->st_mode = (st->st_mode & ~(mode_t)S_IFMT) | S_IFLNK | 0777;
+        st->st_size = (off64_t)strlen(e);
+        return;
+    }
+#else
+    (void)is64;
+#endif
+    struct stat *st = (struct stat *)stv;
+    st->st_mode = (st->st_mode & ~(mode_t)S_IFMT) | S_IFLNK | 0777;
+    st->st_size = (off_t)strlen(e);
 }
 
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
@@ -3374,6 +3481,34 @@ long syscall(long nr, ...) {
             sp_real_syscall2 = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
         return sp_real_syscall2((long)SYS_newfstatat, (long)a1, (long)p, (long)a3, (long)st);
     }
+    /* F17: standalone-path syscalls arriving through syscall(2). Emulators
+     * (FEX) emulate guest syscalls by calling syscall() directly — those
+     * bypass every libc wrapper, and without translation the raw guest
+     * spelling resolves against the HOST namespace (chdir("/root/steamcmd")
+     * -> ENOENT: steamcmd's "Couldn't chdir into the install path"). */
+#if defined(SYS_chdir)
+    case SYS_chdir:
+#endif
+#if defined(SYS_chroot)
+    case SYS_chroot:
+#endif
+#if defined(SYS_truncate)
+    case SYS_truncate:
+#endif
+#if defined(SYS_statfs)
+    case SYS_statfs:
+#endif
+    {
+        const char *path = (const char *)(unsigned long)a1;
+        if (!path || path[0] != '/') break;
+        char x[SP_PATH_MAX];
+        const char *p = sp_translate_x(path, x);
+        SP_TRACE("syscall.path", path, p);
+        static long (*sp_real_syscall3)(long, ...) = NULL;
+        if (!sp_real_syscall3)
+            sp_real_syscall3 = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
+        return sp_real_syscall3(nr, (long)p, a2, a3, a4, a5, a6);
+    }
 #endif
     default:
         break;
@@ -3748,6 +3883,7 @@ int lstat(const char *path, struct stat *st) {
     const char *p = sp_translate_l(path, x);
     SP_TRACE("lstat", path, p);
     int rc = SP_REAL(lstat)(p, st);
+    if (rc == 0) sp_self_exe_linkify(path, st, 0);
     if (rc == 0) { sp_spoof_uid_gid(&st->st_uid, &st->st_gid); if (sp_hreg_hit(path) && st->st_nlink == 1) st->st_nlink = 2; }
     return rc;
 }
@@ -3810,6 +3946,7 @@ int fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
     const char *p = (flags & AT_SYMLINK_NOFOLLOW) ? sp_translate_l(path, x) : sp_translate_x(path, x);
     SP_TRACE("fstatat64", path, p);
     int rc = SP_REAL(fstatat64)(dirfd, p, st, flags);
+    if (rc == 0 && (flags & AT_SYMLINK_NOFOLLOW)) sp_self_exe_linkify(path, st, 1);
     if (rc == 0) { sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid); if (sp_hreg_hit(path) && ((struct stat *)st)->st_nlink == 1) ((struct stat *)st)->st_nlink = 2; }
     return rc;
 }
@@ -3832,6 +3969,7 @@ int lstat64(const char *path, struct stat64 *st) {
     const char *p = sp_translate_l(path, x);
     SP_TRACE("lstat64", path, p);
     int rc = SP_REAL(lstat64)(p, st);
+    if (rc == 0) sp_self_exe_linkify(path, st, 1);
     if (rc == 0) { sp_spoof_uid_gid(&((struct stat *)st)->st_uid, &((struct stat *)st)->st_gid); if (sp_hreg_hit(path) && ((struct stat *)st)->st_nlink == 1) ((struct stat *)st)->st_nlink = 2; }
     return rc;
 }
@@ -5023,6 +5161,15 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
                 bn2 = bn2 ? bn2 + 1 : gabs;
                 int is_emu_target = (strncmp(bn2, "emu-direct-", 11) == 0);
                 if (!is_emu_target) is_emu_target = sp_emu_fixed_base(bn2);
+                if (!is_emu_target) {
+                    /* F17: a configured binfmt emulator is exec'd directly
+                     * (SPROUT_BINFMT_I386=/.../FEX) — no emu-direct name to
+                     * key on. The configured path itself must not steal. */
+                    const char *bi = getenv("SPROUT_BINFMT_I386");
+                    const char *bx = getenv("SPROUT_BINFMT_X86_64");
+                    if (bi && *bi && !strcmp(gabs, bi)) is_emu_target = 1;
+                    if (bx && *bx && !strcmp(gabs, bx)) is_emu_target = 1;
+                }
                 if (!is_emu_target || !getenv("SPROUT_EXE"))
                     sp_stamp_exe((char **)envp, gabs);
             }

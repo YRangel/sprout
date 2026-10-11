@@ -3940,6 +3940,39 @@ int main(int argc, char **argv) {
                         SP_TRACE("[%d] exec event: image is %s shadow=%d\n", w,
                                  sp_kind_name(kind), t->shadow);
                 }
+            } else if (ev == (unsigned int)PTRACE_EVENT_SECCOMP) {
+                /* F17: chdir-family raw svc (see the stub filter). Rewrite
+                 * the path arg at the ptrace stop and continue — these
+                 * change process state, so the notify lane cannot answer
+                 * them with a value. Already-translated spellings (the
+                 * interposed wrappers' own svc) re-translate to themselves. */
+                struct user_pt_regs rx;
+                struct iovec ior = { &rx, sizeof rx };
+                if (g_debug) SP_TRACE("[%d] EVENT_SECCOMP stop\n", w);
+                if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &ior) == 0) {
+                    long nr = (long)rx.regs[8];
+                    if (g_debug) SP_TRACE("[%d] EVENT_SECCOMP nr=%ld\n", w, nr);
+                    for (size_t i = 0; i < sizeof SP_PATH_RULES / sizeof SP_PATH_RULES[0]; i++) {
+                        const sp_path_rule *rule = &SP_PATH_RULES[i];
+                        if (rule->sysno != nr) continue;
+                        if (rule->path_argi >= 0) {
+                            /* Never double-translate: the interposed
+                             * wrappers' own svc arrives here already
+                             * host-spelled (the F8 lesson, supervisor-side). */
+                            char pg[SP_PATH_MAX];
+                            int skip = 0;
+                            if (g_rootfs &&
+                                peek_str(w, rx.regs[rule->path_argi], pg, sizeof pg) > 0 &&
+                                !strncmp(pg, g_rootfs, strlen(g_rootfs)))
+                                skip = 1;
+                            if (!skip &&
+                                translate_reg_path(t, w, &rx, rule->path_argi,
+                                                   rule->follow, rule->name))
+                                ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &ior);
+                        }
+                        break;
+                    }
+                }
             } else if (ev == (unsigned int)PTRACE_EVENT_FORK ||
                        ev == (unsigned int)PTRACE_EVENT_VFORK ||
                        ev == (unsigned int)PTRACE_EVENT_CLONE) {
