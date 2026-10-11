@@ -118,6 +118,15 @@ static const sp_emul_rule SP_EMULATE_BASE[] = {
     { 425, -38 },  /* io_uring_setup    -> -ENOSYS */
     { 426, -38 },  /* io_uring_enter    -> -ENOSYS */
     { 427, -38 },  /* io_uring_register -> -ENOSYS */
+    /* NUMA/perf probing (2026-10-10, DepotDownloader/.NET CoreCLR): the GC
+     * queries NUMA topology at startup — get_mempolicy(236) is SIGSYS-
+     * killed for untrusted uids. Whole family answers -ENOSYS so numa
+     * probes take their single-node fallback. */
+    { 233, -38 },  /* set_mempolicy   */
+    { 234, -38 },  /* migrate_pages   */
+    { 235, -38 },  /* move_pages      */
+    { 236, -38 },  /* get_mempolicy   */
+    { 237, -38 },  /* perf_event_open */
     /* SysV IPC: Android netsys kills the whole family for untrusted apps
      * (msg*186-189, sem*190/193, shm*194-197). Real IPC can't be faked,
      * and no proot-distro guest ever had it — surface -ENOSYS so X/MIT-SHM
@@ -1871,6 +1880,11 @@ static int sp_notify_install(void) {
      * conditions; the self-pipe event loop makes those stops cheap. */
     static const int traps[] = {
         56 /*openat*/, 437 /*openat2*/,
+        /* F9: Android's app seccomp KILLS raw set_robust_list/rseq with
+         * SIGSYS (ADR-0006 class). The sanitized glibc/ldso skip their own
+         * sites, but unsanitized guest libs (dotnet CoreCLR & friends) call
+         * them raw — trap and answer below instead of letting them die. */
+        99 /*set_robust_list*/, 293 /*rseq*/,
         48 /*faccessat*/,
         34 /*mkdirat*/, 35 /*unlinkat*/, 33 /*mknodat*/,
         53 /*fchmodat*/, 54 /*fchownat*/, 55 /*fchown*/, 88 /*utimensat*/,
@@ -2533,6 +2547,10 @@ static void sp_notify_serve_one(pid_t pid, unsigned long long nr,
     char guest[SP_PATH_MAX], host[SP_PATH_MAX];
     resp->flags = 0;
     switch (nr) {
+    case 99:  /* set_robust_list — advisory; 0 = "registered" */
+        resp->error = 0; resp->val = 0; resp->flags = 0; return;
+    case 293: /* rseq — ENOSYS = "kernel too old"; callers proceed without */
+        resp->error = -ENOSYS; resp->val = 0; resp->flags = 0; return;
     case 221: { /* execve(path,argv,envp) — lazy-attach rewrite (ADR-0016 T3) */
         if (sp_notify_read_str(pid, args[0], guest, sizeof(guest)) <= 0) { sp_notify_continue(resp); return; }
         if (guest[0] != '/') { sp_notify_continue(resp); return; } /* relative: tracee cwd is host-real */
@@ -3496,6 +3514,41 @@ int main(int argc, char **argv) {
                     ptrace(PTRACE_SETSIGINFO, w, 0, &si);
                 ptrace(PTRACE_CONT, w, 0, (void *)(long)sig);
                 continue;
+            }
+            /* F10: SIGSYS = the seccomp-kill class (ADR-0006). The shadow
+             * free-run must NOT re-inject it — the ptrace stop is exactly
+             * the swallow point the SP_EMULATE design calls for: skip the
+             * svc insn and hand back the fabricated x0 (set_robust_list=0,
+             * rseq/-ENOSYS, io_uring/SysV/mqueue ...). Unsanitized guest
+             * libs (dotnet CoreCLR & friends) call these raw and died here. */
+            if (sig == SIGSYS) {
+                struct user_pt_regs r;
+                struct iovec iov = { &r, sizeof(r) };
+                if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &iov) == 0) {
+                    long emul_ret = 0; int emulated = 0;
+                    for (size_t i = 0; i < sizeof(SP_EMULATE_BASE)/sizeof(*SP_EMULATE_BASE); i++) {
+                        if ((long)r.regs[8] == SP_EMULATE_BASE[i].sys) {
+                            emulated = 1; emul_ret = SP_EMULATE_BASE[i].ret; break;
+                        }
+                    }
+                    if (emulated) {
+                        long nrl = (long)r.regs[8];
+                        siginfo_t si2;
+                        memset(&si2, 0, sizeof si2);
+                        /* land EXACTLY after the svc: on aarch64 SIGSYS the
+                         * saved pc may be at the insn or already past it —
+                         * call_addr+4 is the only unambiguous landing. */
+                        if (ptrace(PTRACE_GETSIGINFO, w, 0, &si2) == 0 && si2.si_call_addr)
+                            r.pc = (unsigned long long)(long long)si2.si_call_addr + 4;
+                        r.regs[0] = (unsigned long long)emul_ret;
+                        ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &iov);
+                        if (g_debug)
+                            fprintf(stderr, "[ptrace] %d SIGSYS emulated nr=%ld -> %ld\n",
+                                    w, nrl, emul_ret);
+                        ptrace(PTRACE_CONT, w, 0, 0);
+                        continue;
+                    }
+                }
             }
             /* still CONT for everything else — shadow contract is
              * free-run; supervisor only watches exec events. */

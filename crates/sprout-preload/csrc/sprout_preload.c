@@ -351,8 +351,28 @@ static const char *sp_fakeproc_host_path(const char *guest); /* defined near ope
  * unlinkat/lstat/rename/lutimes must translate the LINK itself — chasing
  * here would unlinkat() the payload of /etc/hostname-style .l2s stubs
  * (real bug found 2026-08-17: 'rm -f /tmp/hl1' deleted the payload). */
+#ifdef SPROUT_INTERPOSE
+static const char *sp_self_exe_guest_path(const char *path);
+#else
+/* test/unit builds (test_translate & the supervisor link) don't need the
+ * self-identity stamp — the fakeproc section that defines it is interpose-
+ * only. Keep translation behavior identical to pre-F8 there. */
+static const char *sp_self_exe_guest_path(const char *path) { (void)path; return NULL; }
+#endif
 int sp_translate_f(const sp_config_t *cfg, const char *path, char out[SP_PATH_MAX], int follow_final) {
     if (!path || path[0] != '/') return 0; /* relative paths resolve against cwd, untouched */
+
+    /* Self-identity (F8): /proc/self/exe resolves at KERNEL level to the
+     * chain's main exec = the sanitized ldso. Path consumers that stat()/
+     * mmap() it (dotnet single-file bundle reader bounds an 86MB payload
+     * with the ldso's 201KB size -> "Arithmetic overflow while reading
+     * bundle"; WoW64 wine derives its lib dir from it) must see the GUEST
+     * exe instead. Map before any translation; open() did this alone.
+     * Cheap prefilter keeps the hot path free of strcmp storms. */
+    if (path[1] == 'p' && path[2] == 'r' && path[3] == 'o' && path[4] == 'c') {
+        const char *g = sp_self_exe_guest_path(path);
+        if (g) path = g;
+    }
 
     /* Idempotence: a path that is already host-side must not be re-prefixed.
      * Covers both the full rootfs form AND its every leading prefix —
@@ -3124,6 +3144,38 @@ long syscall(long nr, ...) {
          * so route through it instead of dlsym(RTLD_NEXT). */
         return openat((int)a1, (const char *)(unsigned long)a2,
                       (int)how.flags, (int)how.mode);
+    }
+#endif
+#ifdef SYS_statx
+    case SYS_statx: {
+        /* Raw-syscall statx (dotnet System.Native & friends call
+         * syscall(2) directly, bypassing libc wrappers): without this the
+         * GUEST path reaches the kernel untranslated -> ENOENT, and callers
+         * like the .NET single-file bundle reader then compute bounds from
+         * a garbage statx struct ("Arithmetic overflow while reading
+         * bundle"). Route through our libc statx() wrapper (translation +
+         * uid spoof + ENOSYS->newfstatat emulation all live there), with
+         * the /proc/self/exe self-identity mapping first. */
+        const char *path = (const char *)(unsigned long)a2;
+        const char *g = sp_self_exe_guest_path(path);
+        if (g) path = g;
+        struct statx *sx = (struct statx *)(unsigned long)a5;
+        return (long)statx((int)a1, path, (int)a3, (unsigned int)a4, sx);
+    }
+#endif
+#ifdef SYS_newfstatat
+    case SYS_newfstatat: {
+        const char *path = (const char *)(unsigned long)a2;
+        const char *g = sp_self_exe_guest_path(path);
+        if (g) path = g;
+        if (!path || (a1 != -100 && path[0] != '/')) break; /* fd-relative */
+        char x[SP_PATH_MAX];
+        const char *p = sp_translate_l(path, x);
+        struct stat *st = (struct stat *)(unsigned long)a4;
+        static long (*sp_real_syscall2)(long, ...) = NULL;
+        if (!sp_real_syscall2)
+            sp_real_syscall2 = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
+        return sp_real_syscall2((long)SYS_newfstatat, (long)a1, (long)p, (long)a3, (long)st);
     }
 #endif
     default:

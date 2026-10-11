@@ -401,3 +401,33 @@ cargo test 26/26 (workspace), the C-side `test_translate` suite (covers the ance
 - **0.5.0** — first tagged release with the resolute guest (26.04, glibc 2.43) as the live acceptance target, v0.4.x wargame-era features stabilized (AF_UNIX-X + shm protocol, sysvipc-mainline, FAKEROOT stat-chain, helium-RPCS3-dwarfs family).
 - **0.4.10** — first release with the full v0.4 worklog closed (php-fpm, openat2 propagate, fake-proc chain for `ps`/`time`, statics lane).
 - **0.4.x** — pivot era: gcc → libc-sanitized + preload interposer as the working fast-lane.
+
+## [Unreleased] — DepotDownloader round (dotnet single-file lane)
+
+### Fixed
+- **F8 (self-identity at translate core)** — `/proc/self/exe` (and the
+  pid-spelled twin) now maps to SPROUT_EXE inside `sp_translate_f` for ALL
+  path consumers, not just `open()`. Previously a path-stat of
+  `/proc/self/exe` resolved at kernel level to the chain's ldso
+  (201KB vs the real 86MB payload): the .NET single-file bundle reader
+  computed bounds from that -> "Arithmetic overflow while reading bundle".
+  Also fixes WoW64 wine's lib-dir derivation class.
+- **F10 (SIGSYS emulation for shadow tracees)** — the ptrace shadow
+  free-run re-injected SIGSYS (seccomp-kill class) and skipped the
+  SP_EMULATE_BASE table that already listed set_robust_list/rseq. Now the
+  SIGSYS signal-stop is swallowed at the ptrace stop: x0 = fabricated
+  result, pc = si_call_addr+4. Unsanitized guest libs (dotnet CoreCLR)
+  that call blocked syscalls raw no longer die.
+- **NUMA/perf emulation family** — set_mempolicy/migrate_pages/move_pages/
+  get_mempolicy/perf_event_open (233-237) answer -ENOSYS; CoreCLR's GC
+  NUMA probe (get_mempolicy=236) was the SIGSYS killer for .NET guests.
+- **raw syscall(2) statx/newfstatat translation** — the libc `syscall()`
+  interposer now routes SYS_statx through the libc wrapper (translation +
+  spoof + ENOSYS emulation) and translates SYS_newfstatat paths. .NET's
+  System.Native calls statx via raw syscall(2) with guest paths.
+
+### Verified
+- `DepotDownloader` (SteamRE, .NET 8 self-contained linux-arm64) runs
+  under sprout: bundle parse, CoreCLR init, Steam3 connect, anonymous
+  login, AppInfo + depot keys OK. Battery (test_translate, test_shadow,
+  smoke, proot-compat) green.
