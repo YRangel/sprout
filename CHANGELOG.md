@@ -464,3 +464,27 @@ cargo test 26/26 (workspace), the C-side `test_translate` suite (covers the ance
 
 ### Verified
 - test_translate, test_shadow, smoke, proot-compat all green.
+
+### F12 lane completion (the truncated-pointer class, closed)
+- **F12b mmap low-retry + mallopt**: glibc's MMAP allocator and reopened
+  high holes could still serve >4GB blocks; the lane now pins the host heap
+  to brk and retries high non-MIXED mmaps into low hints.
+- **F12c low arena (malloc family)**: for emulator+ELFCLASS32 processes the
+  allocator is replaced outright (low pools, spinlocked, boot-bump safe) so
+  every host allocation the guest can reach is <4GB and truncation is
+  harmless at every depth. Non-lane processes pass through untouched
+  (aligned allocators route to the real implementations — interior-pointer
+  handouts would corrupt the host heap).
+- **Guard self-detection via raw svc**: the emulator check must not route
+  through the interposed syscall() from the constructor (verified A/B:
+  ctor-time interposed-syscall poisoning; dlsym-only is clean; root cause
+  filed as a box32/interposer interaction).
+- **box64 side (local commit)**: InternalMmap forces low placement for
+  non-MAP_FIXED requests (MAP_32BIT is x86-only); my32_gethostbyname now
+  builds the hostent fully in the 32-bit arena (was: returned a native
+  .data static + raw to_ptrv of resolver addr blobs).
+
+### Verified
+- **steamcmd now runs inside sprout: `./steamcmd.sh +quit` exits 0**
+  (was SIGSEGV rc=139 for the entire session). test_translate, test_shadow,
+  smoke, proot-compat all green.

@@ -3519,6 +3519,77 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "[ptrace] %d SEGV fault pc=%llx x0=%llx addr=%p\n",
                                 w, (unsigned long long)dr.pc,
                                 (unsigned long long)dr.regs[0], si.si_addr);
+                        /* F12-diag: name the truncation source — which live
+                         * mapping would the guest reach through a TRUNCATED
+                         * 32-bit pointer? Match the fault address's low32
+                         * against every mapping's low32 window. */
+                        if (si.si_addr) {
+                            char mpath[64];
+                            snprintf(mpath, sizeof mpath, "/proc/%d/maps", (int)w);
+                            FILE *mf = fopen(mpath, "r");
+                            if (mf) {
+                                char ml[512];
+                                unsigned want = (unsigned)(uintptr_t)si.si_addr;
+                                int hits = 0;
+                                while (fgets(ml, sizeof ml, mf) && hits < 3) {
+                                    unsigned long long a = 0, b = 0;
+                                    if (sscanf(ml, "%llx-%llx", &a, &b) != 2) continue;
+                                    unsigned la = (unsigned)a, lb2 = (unsigned)b;
+                                    if (lb2 == la) continue;
+                                    if (want - la < lb2 - la) {
+                                        unsigned long long off = want - la;
+                                        fprintf(stderr, "[ptrace] %d SEGV trunc-src %llx-%llx off=0x%llx line=%.120s",
+                                                w, a, b, off, ml);
+                                        /* peek the map's first word: ELF? chunk? zeros? */
+                                        errno = 0;
+                                        long w0 = ptrace(PTRACE_PEEKDATA, w, (void *)(uintptr_t)a, 0);
+                                        long w1 = ptrace(PTRACE_PEEKDATA, w, (void *)(uintptr_t)(a + 8), 0);
+                                        fprintf(stderr, "[ptrace] %d SEGV trunc-src-head %016lx %016lx x1=%llx x2=%llx\n",
+                                                w, (unsigned long)w0, (unsigned long)w1,
+                                                (unsigned long long)dr.regs[1],
+                                                (unsigned long long)dr.regs[2]);
+                                        /* string scan: name the map by content */
+                                        {
+                                            char acc[96];
+                                            int ai = 0, found = 0;
+                                            for (unsigned long long o = 0; o < 0x20000 && found < 5; o += 8) {
+                                                long wv = ptrace(PTRACE_PEEKDATA, w,
+                                                    (void *)(uintptr_t)(a + o), 0);
+                                                for (int b = 0; b < 8; b++) {
+                                                    char c = (char)((unsigned long)wv >> (b * 8));
+                                                    if (c >= 32 && c < 127 && ai < (int)sizeof acc - 1) acc[ai++] = c;
+                                                    else {
+                                                        if (ai >= 10) {
+                                                            acc[ai] = 0;
+                                                            fprintf(stderr, "[ptrace] %d SEGV trunc-str +0x%llx \"%s\"\n",
+                                                                w, o, acc);
+                                                            found++;
+                                                        }
+                                                        ai = 0;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        /* chunk-header probe: 0x0ff0..0x1040 */
+                                        for (int k = 0; k < 12; k++) {
+                                            long hv = ptrace(PTRACE_PEEKDATA, w,
+                                                (void *)(uintptr_t)(a + 0x0ff0 + (long)k * 8), 0);
+                                            fprintf(stderr, "[ptrace] %d SEGV trunc-hdr +0x%x %016lx\n",
+                                                w, 0x0ff0 + k * 8, (unsigned long)hv);
+                                        }
+                                        /* dump the struct around the fault offset */
+                                        for (int k = -2; k <= 5; k++) {
+                                            long vv = ptrace(PTRACE_PEEKDATA, w,
+                                                (void *)(uintptr_t)(a + off + (long)k * 8), 0);
+                                            fprintf(stderr, "[ptrace] %d SEGV trunc-struct %+d %016lx\n",
+                                                w, k, (unsigned long)vv);
+                                        }
+                                        hits++;
+                                    }
+                                }
+                                fclose(mf);
+                            }
+                        }
                 }
                 ptrace(PTRACE_CONT, w, 0, (void *)(long)sig);
                 continue;

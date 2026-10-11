@@ -33,6 +33,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <malloc.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -355,6 +357,20 @@ static const char *sp_fakeproc_host_path(const char *guest); /* defined near ope
 #ifdef SPROUT_INTERPOSE
 static const char *sp_self_exe_guest_path(const char *path);
 static FILE *sp_frepair(FILE *f);   /* F11 stdio repair (defined at tail) */
+static int g_emu32_low = 0;         /* F12b: emulator+ELF32 lane (see ctor) */
+/* Raw svc — never route ctor-time kernel calls through our own interposed
+ * syscall(): calling it from the constructor poisons the process (verified
+ * A/B against a dlsym-only call; root cause filed, this sidesteps it). */
+static long sp_raw_svc4(long nr, long a, long b, long c, long d)
+{
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3) : "memory", "cc");
+    return x0;
+}
 #else
 /* test/unit builds (test_translate & the supervisor link) don't need the
  * self-identity stamp — the fakeproc section that defines it is interpose-
@@ -629,8 +645,12 @@ __attribute__((constructor)) static void sprout_init(void) {
              * (the GUEST image) — emulator detection needs the real exec
              * name (the emu-direct derivative, box64, FEX). Same trick as
              * F5: never let our own interposition feed this check. */
-            ssize_t gn = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
-                                          "/proc/self/exe", gexe, sizeof gexe - 1);
+            /* sp_syscall2, NOT syscall(): our own interposed syscall()
+             * translates nr 78 as newfstatat (x86 numbering) and would
+             * treat gexe as a path — self-collision. */
+            ssize_t gn = (ssize_t)sp_raw_svc4(SYS_readlinkat, AT_FDCWD,
+                                              (long)"/proc/self/exe",
+                                              (long)gexe, (long)(sizeof gexe - 1));
             if (gn > 0) {
                 gexe[gn] = 0;
                 const char *gb = strrchr(gexe, '/');
@@ -673,6 +693,19 @@ __attribute__((constructor)) static void sprout_init(void) {
                             close(efd);
                         }
                         if (is32) {
+                            /* F12b: pin the HOST heap low too — glibc's own
+                             * MMAP allocator bypasses the PLT (internal
+                             * __mmap), so interposing mmap is not enough.
+                             * mallopt routes every chunk through brk (low,
+                             * under the fixed-base derivative image) and
+                             * caps arenas so no high arena is ever born. */
+                            g_emu32_low = getenv("SPROUT_NOARENA") ? 0 : 1;
+#ifdef M_MMAP_MAX
+                            mallopt(M_MMAP_MAX, 0);
+#endif
+#ifdef M_ARENA_MAX
+                            mallopt(M_ARENA_MAX, 1);
+#endif
                             /* Reserve every FREE region above 4GB. NEVER a
                              * blanket MAP_FIXED: the live libc sits high
                              * (~0x79...) and MAP_FIXED would unmap it — the
@@ -6136,6 +6169,252 @@ int fprintf(FILE *stream, const char *fmt, ...) {
     int r = vfprintf(stream, fmt, ap);   /* our own wrapper repairs */
     va_end(ap);
     return r;
+}
+
+/* F12b: low-placement retry for the emulator+ELF32-guest lane. The i386
+ * guest holds 32-bit pointers; every host mapping above 4GB is garbage in
+ * its hands. The ctor gap reservation seals the space that is FREE at ctor
+ * time, but a later munmap reopens a high hole and topdown mmap lands in
+ * it — this retry closes that path. MAP_FIXED requests pass through
+ * untouched (explicit layout: box32 guest memory, JIT, sanitizers). */
+static void *(*SP_REAL(mmap))(void *, size_t, int, int, int, off_t);
+static int (*SP_REAL(munmap))(void *, size_t);
+
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+    SP_RESOLVE(mmap);
+    void *r = SP_REAL(mmap)(addr, length, prot, flags, fd, offset);
+    if (!g_emu32_low || r == MAP_FAILED) return r;
+    if ((uintptr_t)r < 0x100000000UL) return r;
+    if (flags & (MAP_FIXED
+#ifdef MAP_FIXED_NOREPLACE
+                 | MAP_FIXED_NOREPLACE
+#endif
+                 )) return r;
+    SP_RESOLVE(munmap);
+    SP_REAL(munmap)(r, length);
+    static const unsigned long hints[] = {
+        0x10000000UL, 0x20000000UL, 0x40000000UL, 0x60000000UL,
+        0x80000000UL, 0xA0000000UL, 0xC0000000UL, 0xE0000000UL
+    };
+    for (size_t i = 0; i < sizeof hints / sizeof hints[0]; i++) {
+        void *h = SP_REAL(mmap)((void *)hints[i], length, prot, flags, fd, offset);
+        if (h != MAP_FAILED && (uintptr_t)h < 0x100000000UL) return h;
+        if (h != MAP_FAILED) SP_REAL(munmap)(h, length);
+    }
+    return SP_REAL(mmap)(addr, length, prot, flags, fd, offset);
+}
+void *mmap64(void *addr, size_t length, int prot, int flags, int fd, long offset)
+{
+    return mmap(addr, length, prot, flags, fd, (off_t)offset);
+}
+
+/* F12c: low arena for the emulator+ELF32-guest lane. Host allocations
+ * reach the i386 guest truncated; scudo/bionic allocates at syscall level
+ * (bypassing the mmap retry) and its spans live above 4GB since boot. For
+ * the lane, replace the allocator outright: every block comes from low
+ * pools, so truncation is harmless at EVERY depth (buffers and the refs
+ * inside them). Non-lane processes pass through untouched. */
+#define SP_ARENA_MAGIC 0x53504131u
+#define SP_ALIGNED_TAG 0x53504132u
+#define SP_BOOT_MAGIC  0x53504133u
+
+typedef struct sp_blk {
+    unsigned magic;
+    unsigned cls;           /* free-list class, or 0 = large */
+    unsigned size;          /* payload bytes */
+    unsigned pad;
+    struct sp_blk *next;    /* free list */
+} sp_blk;
+
+static sp_blk *g_free[20];                  /* class free lists */
+/* arena lock: box64's guest is multithreaded; an unlocked freelist
+ * corrupts under concurrent malloc/free (this cost one abort hunt). */
+static volatile int g_arena_lk = 0;
+static void sp_arena_lock(void)
+{
+    while (__atomic_test_and_set(&g_arena_lk, __ATOMIC_ACQUIRE))
+        sched_yield();
+}
+static void sp_arena_unlock(void) { __atomic_clear(&g_arena_lk, __ATOMIC_RELEASE); }
+static char *g_bump; static size_t g_bump_left;
+static void *(*SP_REAL(malloc))(size_t);
+static void *(*SP_REAL(calloc))(size_t, size_t);
+static void *(*SP_REAL(realloc))(void *, size_t);
+static void (*SP_REAL(free))(void *);
+
+/* pre-resolution bump (dlsym's own calloc lives here) */
+static char g_boot[1 << 16]; static size_t g_boot_off;
+
+static int sp_in_pool(void *q)
+{
+    uintptr_t v = (uintptr_t)q;
+    return v >= 0x10000000UL && v < 0x100000000UL;
+}
+
+static void *sp_arena_alloc(size_t need, size_t align)
+{
+    sp_arena_lock();
+    if (align < 16) align = 16;
+    size_t sz = (need + 15u) & ~(size_t)15u;
+    unsigned cls = 0;
+    if (sz <= (1u << 20)) {
+        size_t c = 32;
+        cls = 4;
+        while (c < sz) { c <<= 1; cls++; }
+        sz = c;
+    }
+    sp_blk *b = NULL;
+    if (cls && g_free[cls]) {
+        b = g_free[cls]; g_free[cls] = b->next;
+    } else {
+        if (!g_bump || g_bump_left < sz + sizeof(sp_blk) + align) {
+            size_t pool = sz + sizeof(sp_blk) + align + (1u << 22);
+            pool &= ~((size_t)0xfff);
+            SP_RESOLVE(mmap);
+            void *p = SP_REAL(mmap)((void *)0x20000000UL, pool, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) { sp_arena_unlock(); return NULL; }
+            if (!sp_in_pool(p)) {
+                /* even the pool hint missed: keep it (still better than
+                 * nothing) but do not poison free dispatch */
+                SP_REAL(munmap)(p, pool);
+                sp_arena_unlock();
+                return NULL;
+            }
+            g_bump = (char *)p; g_bump_left = pool;
+        }
+        uintptr_t base = ((uintptr_t)g_bump + sizeof(sp_blk) + (align - 1)) & ~(uintptr_t)(align - 1);
+        b = (sp_blk *)(base - sizeof(sp_blk));
+        size_t used = (size_t)((char *)(base + sz) - g_bump);
+        g_bump += used; g_bump_left -= used;
+    }
+    b->magic = SP_ARENA_MAGIC;
+    b->cls = cls;
+    b->size = (unsigned)sz;
+    b->next = NULL;
+    sp_arena_unlock();
+    return (char *)b + sizeof(sp_blk);
+}
+
+void *malloc(size_t n)
+{
+    if (!g_emu32_low) {
+        if (!SP_REAL(malloc)) SP_RESOLVE(malloc);
+        if (SP_REAL(malloc)) return SP_REAL(malloc)(n);
+        size_t need = ((n + 15u) & ~(size_t)15u) + sizeof(sp_blk);
+        if (g_boot_off + need > sizeof g_boot) return NULL;
+        sp_blk *b = (sp_blk *)(g_boot + g_boot_off);
+        g_boot_off += need;
+        b->magic = SP_BOOT_MAGIC;
+        b->cls = 0; b->size = (unsigned)n; b->next = NULL;
+        return (char *)b + sizeof(sp_blk);
+    }
+    void *r = sp_arena_alloc(n, 16);
+    return r ? r : (SP_REAL(malloc) ? SP_REAL(malloc)(n) : NULL);
+}
+
+void *calloc(size_t a, size_t b)
+{
+    size_t n = a * b;
+    void *r;
+    if (b && n / b != a) return NULL;
+    if (!g_emu32_low) {
+        if (!SP_REAL(calloc)) SP_RESOLVE(calloc);
+        if (SP_REAL(calloc)) return SP_REAL(calloc)(a, b);
+        r = malloc(n);
+        if (r) memset(r, 0, n);
+        return r;
+    }
+    r = sp_arena_alloc(n ? n : 1, 16);
+    if (!r) return NULL;
+    memset(r, 0, n);
+    return r;
+}
+
+void free(void *q)
+{
+    if (!q) return;
+    sp_blk *b = (sp_blk *)((char *)q - sizeof(sp_blk));
+    if ((char *)q > g_boot && (char *)q < g_boot + sizeof g_boot) {
+        /* boot-bump block (resolution window): leak, never hand to the
+         * real free — it is not heap memory. */
+        return;
+    }
+    if (sp_in_pool((char *)b) && b->magic == SP_BOOT_MAGIC) return;
+    if (g_emu32_low && sp_in_pool((char *)b) && b->magic == SP_ARENA_MAGIC) {
+        unsigned cls = b->cls;
+        sp_arena_lock();
+        if (cls && cls < 20) {
+            b->next = g_free[cls]; g_free[cls] = b;
+            sp_arena_unlock();
+        } else {
+            sp_arena_unlock();
+            SP_RESOLVE(munmap);
+            SP_REAL(munmap)(b, b->size + sizeof(sp_blk));
+        }
+        return;
+    }
+    if (!SP_REAL(free)) SP_RESOLVE(free);
+    if (SP_REAL(free)) SP_REAL(free)(q);
+}
+
+void *realloc(void *q, size_t n)
+{
+    if (!q) return malloc(n);
+    if (!n) { free(q); return NULL; }
+    sp_blk *b = (sp_blk *)((char *)q - sizeof(sp_blk));
+    if (!(g_emu32_low && sp_in_pool((char *)b) && b->magic == SP_ARENA_MAGIC)) {
+        if (!SP_REAL(realloc)) SP_RESOLVE(realloc);
+        return SP_REAL(realloc) ? SP_REAL(realloc)(q, n) : NULL;
+    }
+    if (n <= b->size) return q;
+    void *r = malloc(n);
+    if (r) memcpy(r, q, b->size);
+    free(q);
+    return r;
+}
+
+static int (*SP_REAL(posix_memalign))(void **, size_t, size_t);
+static void *(*SP_REAL(memalign))(size_t, size_t);
+static void *(*SP_REAL(aligned_alloc))(size_t, size_t);
+
+int posix_memalign(void **out, size_t align, size_t n)
+{
+    if (!out) return EINVAL;
+    if (align < sizeof(void *) || (align & (align - 1))) return EINVAL;
+    if (!g_emu32_low) {
+        /* NEVER hand out interior pointers here: free() could not tell
+         * them from real blocks and the host heap would corrupt (this
+         * cost a cmake/libuv debugging round). */
+        if (!SP_REAL(posix_memalign)) SP_RESOLVE(posix_memalign);
+        return SP_REAL(posix_memalign)
+                   ? SP_REAL(posix_memalign)(out, align, n) : ENOMEM;
+    }
+    void *r = sp_arena_alloc(n, align > 16 ? align : 16);
+    if (!r) return ENOMEM;
+    *out = r;
+    return 0;
+}
+
+void *memalign(size_t align, size_t n)
+{
+    if (!align) align = 16;
+    if (!g_emu32_low) {
+        if (!SP_REAL(memalign)) SP_RESOLVE(memalign);
+        return SP_REAL(memalign) ? SP_REAL(memalign)(align, n) : NULL;
+    }
+    return sp_arena_alloc(n, align > 16 ? align : 16);
+}
+
+void *aligned_alloc(size_t align, size_t n)
+{
+    if (!align) align = 16;
+    if (!g_emu32_low) {
+        if (!SP_REAL(aligned_alloc)) SP_RESOLVE(aligned_alloc);
+        return SP_REAL(aligned_alloc) ? SP_REAL(aligned_alloc)(align, n) : NULL;
+    }
+    return sp_arena_alloc(n, align > 16 ? align : 16);
 }
 
 #endif /* SPROUT_INTERPOSE */
