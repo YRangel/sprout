@@ -627,22 +627,21 @@ static int install_notify_filter(void)
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_JMP | BPF_JEQ | BPF_K), 1, 0, AUDIT_ARCH_AARCH64_OWN };
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_KILL };
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_LD | BPF_W | BPF_ABS), 0, 0, 0 };
-    /* layout: [.. nr][ntrace checks][ntr checks][ALLOW][TRACE][NOTIF] */
+    /* layout: [.. nr][ntrace checks][ntr checks][ALLOW][TRACE][NOTIF].
+     * jt = target - pos - 1: traced -> TRACE at 4+ntrace+ntr+1 needs
+     * jt = ntrace+ntr-i; traps -> NOTIF at 4+ntrace+ntr+2 needs
+     * jt = ntr+1-i. (A stale fixup loop here rewrote positions 4..11
+     * onto a single mid-table JEQ — traced AND the first four notify
+     * traps silently fell through to ALLOW.) */
     for (int i = 0; i < ntrace; i++)
         prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_JMP | BPF_JEQ | BPF_K),
-                                     (u8)(ntr + 2 - i), 0, (u32)traced[i] };
+                                     (u8)(ntrace + ntr - i), 0, (u32)traced[i] };
     for (int i = 0; i < ntr; i++)
         prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_JMP | BPF_JEQ | BPF_K),
                                      (u8)(ntr + 1 - i), 0, (u32)traps[i] };
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_ALLOW };
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_TRACE };
     prog[p++] = (sp_bpf_insn_t){ (u16)(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_USER_NOTIF };
-
-    /* jump-target math like the supervisor: on nr-match jump over
-     * (remaining-JEQs + 1) to the USER_NOTIF ret */
-    int base = 4;
-    for (int i = base; i < base + ntr; i++)
-        prog[i].jt = (u8)((base + ntr + 1) - (i + 1));
 
     /* kernel validates arg3..5==0 for NNP: x4 must be zeroed */
     if (sc6(SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0) < 0)

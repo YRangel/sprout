@@ -527,3 +527,30 @@ cargo test 26/26 (workspace), the C-side `test_translate` suite (covers the ance
 ### Verified
 - box64 steamcmd `+login anonymous +quit` exits 0 (no regression).
 - test_translate, test_shadow, smoke, proot-compat all green.
+
+### F17 raw-svc RET_TRACE lane COMPLETE — steamcmd works under FEX AND box64
+Three real bugs behind the F17 regressions, all fixed:
+- **Missing PTRACE_O_TRACESECCOMP** in the supervisor's SETOPTIONS: without
+  it the kernel silently turns SECCOMP_RET_TRACE syscalls into ENOSYS (the
+  syscall never executes) — that, not a resume-mode issue, is what broke
+  box64's chdir and killed the FEX probe. The option is now set.
+- **Stub BPF jump offsets were corrupt**: a stale fixup loop rewrote
+  positions 4..11 onto one mid-table JEQ, so the chdir-family traced[]
+  entries AND the first four notify traps (openat/statx/newfstatat/execve)
+  fell through to ALLOW instead of RET_TRACE/USER_NOTIF. Correct jt math
+  now inlined (traced -> TRACE, traps -> NOTIF); fixup deleted.
+- **Double-translate guard keyed on the wrong rootfs**: now uses
+  g_cfg.rootfs (the exact spelling translate_reg_path keys on) and logs
+  the peeked path + decision under SPROUT_DEBUG.
+- **FEX class split**: FEX owns its guest/pointer reality (its
+  DisableSBRKAllocations keeps host allocations HIGH on purpose) — the
+  low-arena/gap-reservation/F15 lane is box64-class only. The RET_TRACE
+  lane is emulator-agnostic: ON by default for the FEX class
+  (SPROUT_EMU_TRACE=0 kill-switch), opt-in for box64.
+
+### Verified
+- FEX + sprout: `STEAM_PLATFORM=linux32 ./steamcmd.sh +login anonymous
+  +quit` exits 0 (Waiting for client config... OK / user info... OK).
+- box64 steamcmd +login anonymous +quit exits 0 (no regression, default
+  and with SPROUT_EMU_TRACE=1).
+- test_translate, test_shadow, smoke, proot-compat all green.

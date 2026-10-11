@@ -282,6 +282,13 @@ static const long SP_EMULATE_MUSL_EXTRA[] = {
 #ifndef PTRACE_GET_SYSCALL_INFO
 #define PTRACE_GET_SYSCALL_INFO 0x420e
 #endif
+#ifndef PTRACE_O_TRACESECCOMP
+/* bionic may predate the define; required for SECCOMP_RET_TRACE events
+ * (F17): without the option the kernel silently turns RET_TRACE syscalls
+ * into ENOSYS — the syscall never executes (this exact gap cost the
+ * box64 chdir path once). */
+#define PTRACE_O_TRACESECCOMP 0x00000080
+#endif
 #define PTRACE_SYSCALL_INFO_ENTRY 1
 #define PTRACE_SYSCALL_INFO_EXIT  2
 
@@ -3369,7 +3376,8 @@ int main(int argc, char **argv) {
         return 128 + WTERMSIG(st0);
     if (ptrace(PTRACE_SETOPTIONS, child, 0,
                PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
-               PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL) < 0) {
+               PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACESECCOMP |
+               PTRACE_O_EXITKILL) < 0) {
         if (errno == ESRCH) {
             /* lost the race after all: reap whatever status is left */
             int st1 = 0;
@@ -3958,13 +3966,21 @@ int main(int argc, char **argv) {
                         if (rule->path_argi >= 0) {
                             /* Never double-translate: the interposed
                              * wrappers' own svc arrives here already
-                             * host-spelled (the F8 lesson, supervisor-side). */
+                             * host-spelled (the F8 lesson, supervisor-side).
+                             * Primary source is g_cfg.rootfs — the exact
+                             * spelling translate_reg_path itself keys on. */
+                            const char *rf = (g_cfg.rootfs && g_cfg.rootfs[0])
+                                                 ? g_cfg.rootfs : g_rootfs;
                             char pg[SP_PATH_MAX];
                             int skip = 0;
-                            if (g_rootfs &&
+                            pg[0] = 0;
+                            if (rf &&
                                 peek_str(w, rx.regs[rule->path_argi], pg, sizeof pg) > 0 &&
-                                !strncmp(pg, g_rootfs, strlen(g_rootfs)))
+                                !strncmp(pg, rf, strlen(rf)))
                                 skip = 1;
+                            if (g_debug)
+                                SP_TRACE("[%d] EVENT_SECCOMP %s skip=%d path=%s\n", w,
+                                         rule->name, skip, pg);
                             if (!skip &&
                                 translate_reg_path(t, w, &rx, rule->path_argi,
                                                    rule->follow, rule->name))

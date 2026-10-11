@@ -700,13 +700,37 @@ __attribute__((constructor)) static void sprout_init(void) {
                             close(efd);
                         }
                         if (is32) {
+                            /* F17 class split: FEX owns its own guest
+                             * reality — its DisableSBRKAllocations keeps
+                             * host allocations HIGH on purpose, so forcing
+                             * them low (arena/gap/F15) inverts its
+                             * invariant and kills it. Only the raw-svc
+                             * translation lane is ours there. Class comes
+                             * from the same env the classifier execs. */
+                            int emu_fex = 0;
+                            {
+                                const char *bi = getenv("SPROUT_BINFMT_I386");
+                                if (bi && *bi) {
+                                    const char *bb = strrchr(bi, '/');
+                                    bb = bb ? bb + 1 : bi;
+                                    if (strstr(bb, "FEX")) emu_fex = 1;
+                                }
+                            }
+                            /* FEX class: RET_TRACE lane ON by default
+                             * (SPROUT_EMU_TRACE=0 kill-switch). box64 class:
+                             * opt-in only (its chdir rides the wrappers). */
+                            int arm_trace = emu_fex;
+                            {
+                                const char *et = getenv("SPROUT_EMU_TRACE");
+                                if (et) arm_trace = (*et && strcmp(et, "0") != 0);
+                            }
                             /* F12b: pin the HOST heap low too — glibc's own
                              * MMAP allocator bypasses the PLT (internal
                              * __mmap), so interposing mmap is not enough.
                              * mallopt routes every chunk through brk (low,
                              * under the fixed-base derivative image) and
                              * caps arenas so no high arena is ever born. */
-                            g_emu32_low = getenv("SPROUT_NOARENA") ? 0 : 1;
+                            g_emu32_low = (!emu_fex && !getenv("SPROUT_NOARENA")) ? 1 : 0;
                             /* NOTE: no mallopt(M_MMAP_MAX,0) here — FEX
                              * drives its guest heap through sbrk and glibc
                              * on the same break starves it ("Couldn't
@@ -721,11 +745,12 @@ __attribute__((constructor)) static void sprout_init(void) {
                              * — chdir cannot be answered with a value, it
                              * must execute in the tracee). Plain allow-all
                              * otherwise. */
-                            if (getenv("SPROUT_EMU_TRACE")) {
-                                /* EXPERIMENTAL (F17, opt-in): the RET_TRACE
-                                 * lane regressed the working box64 chdir
-                                 * path (resume-mode change at the stop) —
-                                 * off by default until that is fixed. */
+                            if (arm_trace) {
+                                /* F17 raw-svc lane: guest chdir-class from
+                                 * emulator layers (FEX inline svc) is
+                                 * invisible to every libc wrapper — the
+                                 * supervisor rewrites the path arg at the
+                                 * PTRACE_EVENT_SECCOMP stop. */
                                 struct sp_sfilter { unsigned short code; unsigned char jt, jf; unsigned int k; };
                                 struct sp_sfprog { unsigned short len; struct sp_sfilter *filt; };
                                 static struct sp_sfilter fp[] = {
@@ -751,7 +776,9 @@ __attribute__((constructor)) static void sprout_init(void) {
                                     }
                                 }
                             }
-                            /* Reserve every FREE region above 4GB. NEVER a
+                            if (!emu_fex) {
+                            /* Reserve every FREE region above 4GB (box64
+                             * class only — see the class split above). NEVER a
                              * blanket MAP_FIXED: the live libc sits high
                              * (~0x79...) and MAP_FIXED would unmap it — the
                              * ctor then dies on the next libc call (this
@@ -829,6 +856,7 @@ __attribute__((constructor)) static void sprout_init(void) {
                                     close(df);
                                 }
                             }
+                            } /* !emu_fex */
                         }
                     }
                 }
