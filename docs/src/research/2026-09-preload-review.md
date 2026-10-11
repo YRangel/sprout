@@ -111,29 +111,26 @@ fd's host spelling via `syscall(SYS_readlinkat, "/proc/self/fd/%d")`
 registry. useradd/stat-parity probes over fds now see the same answer as
 path stats.
 
-### F6 — NEW (found while testing F1): >127-arg execle chain SIGSEGV even post-F1
+### F6 — FIXED: >127-arg execle chain SIGSEGV — OOB read past [stack] top
+
+Root cause: the auxfix stack-scan (finding the relocated live auxv by
+signature over `[stack]`) bounded its walk `a + 64 <= shi` but the
+candidate check reads `q[0..63]` (64×16 = 1024 bytes past `a`). Whenever
+no signature match broke the loop early, the walk reached `a` within 64
+bytes of the mapping top and read up to ~960 bytes past `shi` → SIGSEGV.
+Layout-dependent: F30 found the signature before the danger zone, F130/
+F300 did not. Fix: walk bound `a + 64*16 <= shi`. A/B: pre-fix rc=139,
+post-fix rc=0 for all three probe sizes (test_execle_env.c).
 
 Reproducer: `crates/sprout-preload/csrc/tests/test_execle_env.c`, built
 with `-DEXECLE_FILL_F130` (compile in any glibc guest, run via
 `sprout -r ~/roots/debian --user=0:0 -- /root/sptest/te_F130`).
 
-- F30 (30 filler args): PASS — child prints `marker_alive`, rc 0.
-- F130 / F300 (>127 args, i.e. the wrapper-truncated argv): rc 139,
-  SIGSEGV in the SECOND-level exec — the interposed `execle` builds the
-  capped argv correctly (F1 fix verified: scan-to-NULL reaches real envp),
-  then `sp_execve_chain` execs `ldso-sanitized` with ~131 argv entries and
-  the new image's init crashes after the auxit/auxfix probe opens
-  `/proc/self/auxv`, `/proc/self/maps`, `sp-auxfix.log` (ptrace log: child
-  stopped sig=11 right after those reads).
-- Direct launcher execs with 300 real args (`sprout -- /bin/sh -c ...f299`)
-  work fine — so plain big-argv ldso startup is OK; the crash is specific
-  to the chain-into-loader path when argv crosses ~127+.
-
-Suspects: AT_EXECFN stack-string rewrite in the auxfix block (l.~600-660),
-which memcpy's SPROUT_EXE into the auxv slot assuming loader-path length;
-or a stack-scan heuristic that walks argv on the new image's stack. NOT yet
-root-caused; no plausible fix landed (in-flight edit abandoned for being
-sloppy — see session notes). Run F130 against any fix attempt.
+Observed matrix (pre-fix): F30 rc=0; F130/F300 rc=139 (second-level exec
+init); direct 300-arg launcher execs unaffected (different stack layout
+lets the early `q[0].t > 100` bail skip the danger zone). Post-fix: all
+three rc=0; battery (test_translate, test_shadow, smoke, proot-compat)
+all green on the rebuilt libsprout-core.so.
 
 ## Not audited in depth (next pass candidates)
 

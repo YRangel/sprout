@@ -736,7 +736,11 @@ __attribute__((constructor)) static void sprout_init(void) {
                                         unsigned long long slo = 0, shi = 0;
                                         if (sscanf(l, "%llx-%llx", &slo, &shi) != 2 || shi <= slo) break;
                                         struct _AuxEnt { unsigned long long t, v; } *q;
-                                        for (unsigned long long a = slo; a + 64 <= shi; a += 8) {
+                                        /* Bound must cover the FULL scan window below: q[0..63] reads
+                                         * up to 64*16 = 1024 bytes past `a`; a 64-byte guard let the walk
+                                         * read past [stack]'s top into unmapped memory (F6 SIGSEGV, e.g.
+                                         * execle >127 args pushes candidate slots near shi). */
+                                        for (unsigned long long a = slo; a + 64 * 16 <= shi; a += 8) {
                                             q = (struct _AuxEnt *)a;
                                             if (q[0].t > 100 || q[1].t > 100) continue;
                                             int uid_n = 0, phdr_n = 0, ends = 0;
@@ -3926,7 +3930,7 @@ static int sp_guest_path_search(const char *name, char out[SP_PATH_MAX]) {
  * Merge guest-supplied entries BEFORE our system fallback. Static buffer
  * is deliberate: chains run under vfork-shared frames (ADR-0014), malloc
  * is forbidden here. */
-static const char *sp_chain_libpath(const char *const envp[]) {
+static const char *sp_chain_libpath(char **envp) {
     const char *sys = getenv("SPROUT_LIBRARY_PATH");
     const char *cust = NULL;
     for (int i = 0; envp && envp[i]; i++)
@@ -4860,7 +4864,7 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
             bn = bn ? bn + 1 : host;
             int is_der = (strncmp(bn, "emu-direct-", 11) == 0);
             if (is_der || sp_emu_fixed_base(bn)) {
-                const char *lp = sp_chain_libpath(envp);
+                const char *lp = sp_chain_libpath((char **)envp);
                 if (!lp) lp = sp_library_path_v();
                 const char *der = is_der ? host
                                          : sp_emu_direct_derivative(host);
@@ -4909,7 +4913,7 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
         }
         char *vstack[SP_CHAIN_MAX_ARGS + 8];
         int b = sp_build_loader_argv(vstack, SP_CHAIN_MAX_ARGS + 8, host, argv, 0, NULL,
-                                     sp_chain_libpath(envp));
+                                     sp_chain_libpath((char **)envp));
         if (b == -2) return sp_chain_fail(path, depth, EIO, "argv-build:no-loader");
         if (b != 0) return sp_chain_fail(path, depth, E2BIG, "argv-build:cap");
         {

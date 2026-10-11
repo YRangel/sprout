@@ -13,12 +13,21 @@ All notable changes to sprout, grouped by release version. The four-eyes rule: a
   caller buffers sized 65536 — deterministic 4x stack overflow, now sized
   `4096 * 64`. (test_shadow segfaulted in the debian guest on every run.)
 
+### Fixed
+- **F6 (was known-issue)** — `execle` with >127 argv entries SIGSEGV'd in
+  the second-level chain: the auxfix stack-scan of `sprout_preload.c`
+  bounded its walk `a + 64 <= shi` but read `q[0..63]` = up to 1024 bytes
+  past `a`, walking past `[stack]`'s top into unmapped memory whenever the
+  real auxv signature wasn't found before the walk reached the top (layout
+  dependent → F30 survived, F130/F300 died). Bound is now `a + 64*16`.
+  A/B verified: pre-fix rc=139, post-fix rc=0 for F30/F130/F300.
+- **F7 (build break)** — `sp_chain_libpath`'s constification in `937574e`
+  left `envp[i] = lp_entry` writing through `const char *const *` (hard
+  compile error on strict GCC) plus two caller type mismatches. HEAD did
+  not compile; shipped .so pre-dated the commits. Signature is `char **`
+  with explicit casts at the two execve-chain call sites.
+
 ### Known issue (filed, unfixed)
-- **F6** — `execle` with >127 argv entries still SIGSEGVs in the
-  second-level chain-into-loader even with the F1 fix: crash lands after
-  the new image's auxfix phase reads `/proc/self/auxv` / `maps`. Suspect:
-  AT_EXECFN stack-string rewrite or the argv-walking stack scan in the
-  auxfix block (l.~600-660). Reproducer: `test_execle_env.c -DEXECLE_FILL_F130`.
 
 ### Fixed - preload deep-review round (findings F1-F5)
 - **F1** `execle()` mis-parsed `envp` for >127-arg calls: the variadic scan
