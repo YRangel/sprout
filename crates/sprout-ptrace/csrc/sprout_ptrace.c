@@ -3512,6 +3512,14 @@ int main(int argc, char **argv) {
                 memset(&si, 0, sizeof si);
                 if (ptrace(PTRACE_GETSIGINFO, w, 0, &si) == 0)
                     ptrace(PTRACE_SETSIGINFO, w, 0, &si);
+                if (g_debug && sig == SIGSEGV) {
+                    struct user_pt_regs dr;
+                    struct iovec dio = { &dr, sizeof dr };
+                    if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &dio) == 0)
+                        fprintf(stderr, "[ptrace] %d SEGV fault pc=%llx x0=%llx addr=%p\n",
+                                w, (unsigned long long)dr.pc,
+                                (unsigned long long)dr.regs[0], si.si_addr);
+                }
                 ptrace(PTRACE_CONT, w, 0, (void *)(long)sig);
                 continue;
             }
