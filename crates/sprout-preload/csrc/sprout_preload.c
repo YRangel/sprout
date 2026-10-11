@@ -358,6 +358,7 @@ static const char *sp_fakeproc_host_path(const char *guest); /* defined near ope
 static const char *sp_self_exe_guest_path(const char *path);
 static FILE *sp_frepair(FILE *f);   /* F11 stdio repair (defined at tail) */
 static int g_emu32_low = 0;         /* F12b: emulator+ELF32 lane (see ctor) */
+static void *sp_arena_alloc(size_t need, size_t align);   /* F12c (tail) */
 /* Raw svc — never route ctor-time kernel calls through our own interposed
  * syscall(): calling it from the constructor poisons the process (verified
  * A/B against a dlsym-only call; root cause filed, this sidesteps it). */
@@ -1986,7 +1987,39 @@ struct hostent *gethostbyname(const char *name) {
     addrs[na4 < 8 ? na4 : 8] = NULL;
     he.h_name = (char *)name; he.h_aliases = aliases;
     he.h_addrtype = AF_INET; he.h_length = 4; he.h_addr_list = addrs;
-    return &he;
+    if (!g_emu32_low) return &he;
+    /* F14: the statics above live in our .data (high, pre-guard). box32's
+     * my32_gethostbyname thunk reads this struct in HOST layout and
+     * converts it guest-side — but it passes the address blobs through
+     * to_ptrv(), which truncates anything >4GB into garbage the guest
+     * then walks (steamcmd abort in the resolver chain). So: keep the
+     * HOST layout (the thunk reads it!), place every nested object in
+     * the LOW arena — truncation then lands on full values. */
+    struct hostent *d = (struct hostent *)sp_arena_alloc(sizeof(struct hostent), 16);
+    if (!d) return &he;
+    size_t nl = strlen(name ? name : "") + 1;
+    char *nm = (char *)sp_arena_alloc(nl, 16);
+    if (!nm) return &he;
+    memcpy(nm, name ? name : "", nl);
+    d->h_name = nm;
+    d->h_addrtype = AF_INET;
+    d->h_length = 4;
+    char **al = (char **)sp_arena_alloc(sizeof(char *), 16);
+    if (!al) return &he;
+    al[0] = NULL;
+    d->h_aliases = al;
+    int m = na4 < 8 ? na4 : 8;
+    char **hl = (char **)sp_arena_alloc(sizeof(char *) * (size_t)(m + 1), 16);
+    if (!hl) return &he;
+    for (int i = 0; i < m; i++) {
+        char *c = (char *)sp_arena_alloc(4, 16);
+        if (!c) return &he;
+        memcpy(c, &buf4[i], 4);
+        hl[i] = c;
+    }
+    hl[m] = NULL;
+    d->h_addr_list = hl;
+    return d;
 }
 
 /* tempfile family: glibc's mkstemp uses internal __open calls — wraps the
@@ -3068,6 +3101,13 @@ int uname(struct utsname *b) {
     if (init_ == 1) {
         strncpy(b->release, rel, sizeof(b->release) - 1);
         b->release[sizeof(b->release) - 1] = '\0';
+    }
+    /* F15: emulator-lane reality — a 32-bit guest runs under an aarch64
+     * emulator but must SEE the machine it was built for. steamcmd.sh's
+     * arch picker reads uname -m and looks for linuxarm64/ otherwise. */
+    if (g_emu32_low) {
+        strncpy(b->machine, "i686", sizeof(b->machine) - 1);
+        b->machine[sizeof(b->machine) - 1] = '\0';
     }
     return rc;
 }
@@ -6208,6 +6248,7 @@ void *mmap64(void *addr, size_t length, int prot, int flags, int fd, long offset
 {
     return mmap(addr, length, prot, flags, fd, (off_t)offset);
 }
+
 
 /* F12c: low arena for the emulator+ELF32-guest lane. Host allocations
  * reach the i386 guest truncated; scudo/bionic allocates at syscall level

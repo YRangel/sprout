@@ -488,3 +488,17 @@ cargo test 26/26 (workspace), the C-side `test_translate` suite (covers the ance
 - **steamcmd now runs inside sprout: `./steamcmd.sh +quit` exits 0**
   (was SIGSEGV rc=139 for the entire session). test_translate, test_shadow,
   smoke, proot-compat all green.
+
+### F14/F15 — the class closed with STOCK box64 (box64 is read-only)
+- **F14 gethostbyname**: box32's my32_gethostbyname thunk passes the
+  address blobs through to_ptrv() — any >4GB blob became garbage the
+  guest walked (abort in the resolver chain). Our DNS shim now serves the
+  hostent in HOST layout (the thunk reads it that way) with every nested
+  object in the LOW arena, so truncation lands on full values. Stock
+  box64, no patches.
+- **F15 uname machine**: an emulated ELFCLASS32 process now sees i686 in
+  utsname.machine (guest reality for arch-picking scripts).
+- steamcmd: full session runs — `STEAM_PLATFORM=linux32 ./steamcmd.sh
+  +login anonymous +quit` exits 0 (steamcmd.sh's own env override; its
+  uname-based picker would otherwise seek linuxarm64/ on aarch64 hosts).
+- test_translate, test_shadow, smoke, proot-compat all green.
