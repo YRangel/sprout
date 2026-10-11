@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -353,6 +354,7 @@ static const char *sp_fakeproc_host_path(const char *guest); /* defined near ope
  * (real bug found 2026-08-17: 'rm -f /tmp/hl1' deleted the payload). */
 #ifdef SPROUT_INTERPOSE
 static const char *sp_self_exe_guest_path(const char *path);
+static FILE *sp_frepair(FILE *f);   /* F11 stdio repair (defined at tail) */
 #else
 /* test/unit builds (test_translate & the supervisor link) don't need the
  * self-identity stamp — the fakeproc section that defines it is interpose-
@@ -602,7 +604,129 @@ __attribute__((constructor)) static void sprout_init(void) {
             }
         }
     }
-    sp_config_load(&g_cfg);
+    sp_config_load(&g_cfg);   /* moved up: F12 needs translation live */
+    /* F12: emulator 32-bit-guest arena guard (the FEX/box64/box32 common
+     * factor): those emulators bridge i386 guests to the HOST libc through
+     * truncated pointers (to_ptrv / FEX thunks alike) — every host
+     * allocation that lands ABOVE 4GB becomes garbage in guest hands
+     * (steamcmd SEGV pc=dynarec addr=<low32-of-high-mmap>; stdio's
+     * _IO_2_1_* trio was only the first victim). FEX's in-allocator answer
+     * is "keep guest-visible host allocations low"; we can enforce that for
+     * ALL emulators at once: when the guest is ELFCLASS32, reserve every
+     * byte above 4GB PROT_NONE so later malloc/mmap/dlopen can only land
+     * low and truncation becomes harmless. Same comm-token semantics as
+     * SPROUT_PRELOAD_SCRUB ("box64" matches "box64-latest"/emu-direct-*).
+     * SPROUT_EMU32_GUARD="" disables; else overrides the token list. */
+    {
+        const char *gl = getenv("SPROUT_EMU32_GUARD");
+        int go = 1;
+        const char *glist = "box64,box32,FEX";
+        if (gl && !*gl) go = 0;
+        else if (gl) glist = gl;
+        if (go) {
+            char gexe[256];
+            /* RAW readlinkat: the interposed readlink answers SPROUT_EXE
+             * (the GUEST image) — emulator detection needs the real exec
+             * name (the emu-direct derivative, box64, FEX). Same trick as
+             * F5: never let our own interposition feed this check. */
+            ssize_t gn = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
+                                          "/proc/self/exe", gexe, sizeof gexe - 1);
+            if (gn > 0) {
+                gexe[gn] = 0;
+                const char *gb = strrchr(gexe, '/');
+                gb = gb ? gb + 1 : gexe;
+                if (getenv("SPROUT_DEBUG")) {
+                    int df = open("/tmp/sp-emu32.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+                    if (df >= 0) {
+                        char lb[160];
+                        int ll = snprintf(lb, sizeof lb, "guard enter bn=%s sproue=%s\n",
+                                          gb, getenv("SPROUT_EXE") ? getenv("SPROUT_EXE") : "(none)");
+                        if (ll > 0) write(df, lb, (size_t)ll);
+                        close(df);
+                    }
+                }
+                int gmatch = 0;
+                for (const char *p = glist; *p && !gmatch; ) {
+                    const char *c = strchr(p, ',');
+                    size_t tl = c ? (size_t)(c - p) : strlen(p);
+                    if (tl && tl < 32) {
+                        char tb[32];
+                        memcpy(tb, p, tl);
+                        tb[tl] = 0;
+                        /* substring: the emu-direct derivative is named
+                         * emu-direct-box64-<hash> — prefix match misses it */
+                        if (strstr(gb, tb)) gmatch = 1;
+                    }
+                    p = c ? c + 1 : p + tl;
+                }
+                if (gmatch) {
+                    const char *sg = getenv("SPROUT_EXE");
+                    if (sg && *sg) {
+                        int efd = open(sg, O_RDONLY);
+                        unsigned char eh[6];
+                        int is32 = 0;
+                        if (efd >= 0) {
+                            is32 = (read(efd, eh, sizeof eh) == (ssize_t)sizeof eh
+                                    && eh[0] == 0x7f && eh[1] == 'E'
+                                    && eh[2] == 'L' && eh[3] == 'F'
+                                    && eh[4] == 1 /*ELFCLASS32*/);
+                            close(efd);
+                        }
+                        if (is32) {
+                            /* Reserve every FREE region above 4GB. NEVER a
+                             * blanket MAP_FIXED: the live libc sits high
+                             * (~0x79...) and MAP_FIXED would unmap it — the
+                             * ctor then dies on the next libc call (this
+                             * exact bug cost three debugging rounds).
+                             * Gaps taken from /proc/self/maps; MAP_FIXED is
+                             * then safe (we only cover verified-free space),
+                             * and every later malloc/mmap/dlopen can only
+                             * land low -> host pointers are 32-bit-clean in
+                             * guest hands -> truncation harmless. */
+                            const unsigned long lo4 = 0x100000000UL;
+                            const unsigned long hi4 = 1UL << 39;
+                            FILE *gmf = fopen("/proc/self/maps", "r");
+                            int gres = 0;
+                            if (gmf) {
+                                char gl[256];
+                                unsigned long prev = lo4;
+                                while (fgets(gl, sizeof gl, gmf)) {
+                                    unsigned long a = 0, b = 0;
+                                    if (sscanf(gl, "%lx-%lx", &a, &b) != 2) continue;
+                                    if (b <= lo4) continue;
+                                    if (a >= hi4) break;
+                                    if (a > prev) {
+                                        unsigned long ga = prev;
+                                        unsigned long gbnd = (a < hi4) ? a : hi4;
+                                        if (mmap((void *)ga, gbnd - ga, PROT_NONE,
+                                                 MAP_PRIVATE | MAP_ANONYMOUS |
+                                                 MAP_FIXED | MAP_NORESERVE,
+                                                 -1, 0) != MAP_FAILED) gres++;
+                                    }
+                                    if (b > prev) prev = b;
+                                }
+                                if (prev < hi4 &&
+                                    mmap((void *)prev, hi4 - prev, PROT_NONE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS |
+                                         MAP_FIXED | MAP_NORESERVE,
+                                         -1, 0) != MAP_FAILED) gres++;
+                                fclose(gmf);
+                            }
+                            if (getenv("SPROUT_DEBUG")) {
+                                int df = open("/tmp/sp-emu32.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+                                if (df >= 0) {
+                                    char lb[48];
+                                    int ll = snprintf(lb, sizeof lb, "guard reserved gaps=%d\n", gres);
+                                    if (ll > 0) write(df, lb, (size_t)ll);
+                                    close(df);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     /* --user anchor (proot -i / proot-distro --user parity): the resolved
      * guest identity is forwarded by the launcher as SPROUT_FAKE_UID/GID;
      * absent = root anchor (0/0). Musl-safe digit loop (no sscanf/atoi). */
@@ -2794,7 +2918,7 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("freopen", path, p);
-    return SP_REAL(freopen)(p, mode, stream);
+    return SP_REAL(freopen)(p, mode, sp_frepair(stream));
 }
 
 FILE *freopen64(const char *path, const char *mode, FILE *stream) {
@@ -2803,7 +2927,7 @@ FILE *freopen64(const char *path, const char *mode, FILE *stream) {
     char x[SP_PATH_MAX];
     const char *p = sp_translate_x(path, x);
     SP_TRACE("freopen64", path, p);
-    return SP_REAL(freopen64)(p, mode, stream);
+    return SP_REAL(freopen64)(p, mode, sp_frepair(stream));
 }
 
 char *getcwd(char *buf, size_t size) {
@@ -4812,7 +4936,23 @@ static int sp_execve_chain(const char *path, char *const argv[], char *const env
                 size_t gn = strlen(gcan);
                 if (gn > 1) memcpy(gabs, gcan, gn + 1);
             }
-            sp_stamp_exe((char **)envp, gabs);
+            /* F13: emulator-class targets must NOT steal the stamp. The
+             * binfmt-adapter recursion (sp_execve_chain(emu, ...)) and the
+             * emu-direct derivative exec re-enter here with the EMULATOR as
+             * the path, but SPROUT_EXE must keep naming the foreign GUEST
+             * program — the outer exec already stamped it. Labeling the
+             * emulator broke: F8's /proc/self/exe mapping double-prefixed
+             * ~/.cache/sprout/emu-direct-* paths into the rootfs, the F12
+             * arena guard's ELFCLASS32 gate saw the emulator's own class,
+             * and every other consumer keyed on the guest image. */
+            {
+                const char *bn2 = strrchr(gabs, '/');
+                bn2 = bn2 ? bn2 + 1 : gabs;
+                int is_emu_target = (strncmp(bn2, "emu-direct-", 11) == 0);
+                if (!is_emu_target) is_emu_target = sp_emu_fixed_base(bn2);
+                if (!is_emu_target || !getenv("SPROUT_EXE"))
+                    sp_stamp_exe((char **)envp, gabs);
+            }
         }
         free(sl);
     }
@@ -5847,5 +5987,155 @@ void *dlopen(const char *file, int mode) {
 
 /* ADR-0020: sysv-shm emulation (termux libandroid-shmem protocol). */
 #include "sprout_shm.inc"
+
+#endif /* SPROUT_INTERPOSE */
+
+#ifdef SPROUT_INTERPOSE
+/* ---------------------------------------------------------------------
+ * F11: low32 FILE* repair for the emulator bridge (box32/box64).
+ *
+ * box32 wraps the NATIVE aarch64 libc for i386 guests and hands the guest
+ * 32-bit pointers (to_ptrv). The libc's stdin/stdout/stderr FILE structs
+ * live in libc's data segment which maps ABOVE 4GB under the chain, so the
+ * guest's stderr is a truncated pointer (observed: sym=0x767d791430 ->
+ * guest 0x7d791430) and every forwarded stdio call on it dereferences
+ * garbage (steamcmd's freopen(".../stderr.txt","w",stderr) SIGSEGV).
+ *
+ * Sprout-side repair: the interposer rides inside the emulator process and
+ * box32 resolves its wrapped symbols through the dlsym() PLT. Intercept
+ * the stdio names and hand out wrappers that substitute truncated->real on
+ * FILE* arguments. Returns pass through: box32 truncates them back to the
+ * same stable value the guest already holds. No upstream box64 patching.
+ * --------------------------------------------------------------------- */
+static void *sp_freal[3];
+static void *sp_ftrunc[3];
+static void sp_fmap_init(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    static const char *syms[3] = {
+        "_IO_2_1_stdin_", "_IO_2_1_stdout_", "_IO_2_1_stderr_"
+    };
+    for (int i = 0; i < 3; i++) {
+        sp_freal[i] = sp_sym(syms[i]);
+        if (sp_freal[i])
+            sp_ftrunc[i] = (void *)(unsigned long)(unsigned)(unsigned long)sp_freal[i];
+    }
+}
+static FILE *sp_frepair(FILE *f) {
+    if (!f) return f;
+    sp_fmap_init();
+    /* Match on low32: box32's to_ptrv/from_ptriv round-trip preserves only
+     * the low 32 bits of the handle (observed guest value 0x7d70ff1430 for
+     * a real stderr at 0x7f..70ff1430) — exact equality can never hit. */
+    unsigned fl = (unsigned)(unsigned long)(void *)f;
+    for (int i = 0; i < 3; i++)
+        if (sp_freal[i] && fl == (unsigned)(unsigned long)sp_freal[i])
+            return (FILE *)sp_freal[i];
+    return f;
+}
+
+#define SP_FRESOLVE(name)                                       \
+    static __typeof__(&name) sp_real_##name = NULL;             \
+    if (!sp_real_##name)                                        \
+        sp_real_##name = (__typeof__(&name))(void *)sp_sym(#name)
+
+/* freopen/freopen64 live above (path-translating); their stream arg is
+ * repaired via sp_frepair like the rest of the F11 set. */
+size_t fwrite(const void *p, size_t s, size_t n, FILE *stream) {
+    SP_FRESOLVE(fwrite);
+    return sp_real_fwrite(p, s, n, sp_frepair(stream));
+}
+size_t fread(void *p, size_t s, size_t n, FILE *stream) {
+    SP_FRESOLVE(fread);
+    return sp_real_fread(p, s, n, sp_frepair(stream));
+}
+int fflush(FILE *stream) {
+    SP_FRESOLVE(fflush);
+    return sp_real_fflush(sp_frepair(stream));
+}
+int fclose(FILE *stream) {
+    SP_FRESOLVE(fclose);
+    return sp_real_fclose(sp_frepair(stream));
+}
+int fputs(const char *s, FILE *stream) {
+    SP_FRESOLVE(fputs);
+    return sp_real_fputs(s, sp_frepair(stream));
+}
+char *fgets(char *s, int n, FILE *stream) {
+    SP_FRESOLVE(fgets);
+    return sp_real_fgets(s, n, sp_frepair(stream));
+}
+int fputc(int c, FILE *stream) {
+    SP_FRESOLVE(fputc);
+    return sp_real_fputc(c, sp_frepair(stream));
+}
+int fgetc(FILE *stream) {
+    SP_FRESOLVE(fgetc);
+    return sp_real_fgetc(sp_frepair(stream));
+}
+int putc(int c, FILE *stream) {
+    SP_FRESOLVE(putc);
+    return sp_real_putc(c, sp_frepair(stream));
+}
+int getc(FILE *stream) {
+    SP_FRESOLVE(getc);
+    return sp_real_getc(sp_frepair(stream));
+}
+int ferror(FILE *stream) {
+    SP_FRESOLVE(ferror);
+    return sp_real_ferror(sp_frepair(stream));
+}
+void clearerr(FILE *stream) {
+    SP_FRESOLVE(clearerr);
+    sp_real_clearerr(sp_frepair(stream));
+}
+int feof(FILE *stream) {
+    SP_FRESOLVE(feof);
+    return sp_real_feof(sp_frepair(stream));
+}
+int fileno(FILE *stream) {
+    SP_FRESOLVE(fileno);
+    return sp_real_fileno(sp_frepair(stream));
+}
+int fseek(FILE *stream, long off, int whence) {
+    SP_FRESOLVE(fseek);
+    return sp_real_fseek(sp_frepair(stream), off, whence);
+}
+int fseeko(FILE *stream, off_t off, int whence) {
+    SP_FRESOLVE(fseeko);
+    return sp_real_fseeko(sp_frepair(stream), off, whence);
+}
+long ftell(FILE *stream) {
+    SP_FRESOLVE(ftell);
+    return sp_real_ftell(sp_frepair(stream));
+}
+off_t ftello(FILE *stream) {
+    SP_FRESOLVE(ftello);
+    return sp_real_ftello(sp_frepair(stream));
+}
+int setvbuf(FILE *stream, char *buf, int mode, size_t size) {
+    SP_FRESOLVE(setvbuf);
+    return sp_real_setvbuf(sp_frepair(stream), buf, mode, size);
+}
+int ungetc(int c, FILE *stream) {
+    SP_FRESOLVE(ungetc);
+    return sp_real_ungetc(c, sp_frepair(stream));
+}
+void rewind(FILE *stream) {
+    SP_FRESOLVE(rewind);
+    sp_real_rewind(sp_frepair(stream));
+}
+int vfprintf(FILE *stream, const char *fmt, va_list ap) {
+    SP_FRESOLVE(vfprintf);
+    return sp_real_vfprintf(sp_frepair(stream), fmt, ap);
+}
+int fprintf(FILE *stream, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfprintf(stream, fmt, ap);   /* our own wrapper repairs */
+    va_end(ap);
+    return r;
+}
 
 #endif /* SPROUT_INTERPOSE */

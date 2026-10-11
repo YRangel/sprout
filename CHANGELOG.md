@@ -431,3 +431,36 @@ cargo test 26/26 (workspace), the C-side `test_translate` suite (covers the ance
   under sprout: bundle parse, CoreCLR init, Steam3 connect, anonymous
   login, AppInfo + depot keys OK. Battery (test_translate, test_shadow,
   smoke, proot-compat) green.
+
+## [Unreleased] — SteamCMD round (emulator bridge, the FEX/box64/box32 common factor)
+
+### Fixed
+- **F13 (SPROUT_EXE stolen by the emulator recursion)** — the binfmt-adapter
+  recursion and the emu-direct derivative exec re-stamped SPROUT_EXE with
+  the EMULATOR's image path instead of the foreign GUEST program. Every
+  consumer keyed on the guest image broke: F8's /proc/self/exe mapping
+  double-prefixed ~/.cache/sprout/emu-direct-* into the rootfs, and any
+  ELFCLASS gate saw the emulator's class. Emulator-class targets now keep
+  the outer stamp.
+- **F12 (emulator 32-bit-guest arena guard)** — the common factor between
+  FEX and box64/box32: they bridge i386 guests to the HOST libc through
+  truncated pointers; every host allocation above 4GB becomes garbage in
+  guest hands. For emulator processes running an ELFCLASS32 guest, the
+  interposer now reserves the FREE gaps above 4GB PROT_NONE (parsed from
+  /proc/self/maps — never a blanket MAP_FIXED, which would unmap the live
+  high libc and kill the ctor), forcing later malloc/mmap/dlopen low and
+  making truncation harmless. Verified: box64's dynarec region moved below
+  4GB (pc 0x100855108 -> 0xff574108).
+- **F11 (stdio FILE* repair wrappers)** — freopen/fwrite/fflush/... repair
+  box32's truncated stdin/stdout/stderr handles (low32 match against the
+  libc statics) on the re-issued native calls; path translation preserved.
+
+### Known issue (filed, unfixed)
+- steamcmd still SIGSEGVs (pc in dynarec, addr = low32 of a sliding high
+  mapping) — one more pre-guard high-libc-static pointer class beyond the
+  stdio trio reaches the guest (x0=0xf8017530 stable signature, addr low24
+  constant 0x442780). Next: identify the export and extend the F11 repair
+  table / find the box32 wrapper that forwards it.
+
+### Verified
+- test_translate, test_shadow, smoke, proot-compat all green.
