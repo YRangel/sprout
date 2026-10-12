@@ -587,3 +587,28 @@ Three real bugs behind the F17 regressions, all fixed:
   GPU-disabled restart option — CEF webhelper is the remaining work).
   steamcmd +login anonymous +quit still exits 0; test_translate,
   test_shadow, smoke, proot-compat green.
+
+### Steam webhelper: robust-futex lane + reservation yield (UI stack now boots)
+- **Robust-futex serving (the webhelper's startup fatal)**: Android blocks
+  set_robust_list (the sanitized libc fakes success) so the kernel never
+  registers a robust list — steamwebhelper FATALS verifying it ("futex
+  robust_list not initialized by pthreads"). Reverse-engineered its exact
+  check from the binary (llvm-objdump): `head != NULL && len == 24 &&
+  head->futex_offset == -0x20`. The interposer's syscall() case now serves
+  glibc's at-rest shape {list=FUTEX_LIST_END, futex_offset=-32,
+  list_op_pending=0}; the supervisor's EVENT_SECCOMP handler serves the
+  same for raw-svc routes (rewrites the syscall to sched_yield).
+  An always-on seccomp filter ({99,100} RET_TRACE) is armed for every
+  interposed process; the stub lane's traced[] got the same pair.
+- **F12 reservations yield to explicit layouts**: Chromium's
+  PartitionAlloc claims fixed high arenas with MAP_FIXED_NOREPLACE and my
+  >4GB gap reservations answered EEXIST ("mmap() failed: File exists").
+  The walker now records its spans and the mmap interposer releases the
+  overlap (with precise bookkeeping — never unmaps anything but our own
+  spans) before any MAP_FIXED/MAP_FIXED_NOREPLACE claim.
+- Verified: steamwebhelper passes both robust checks and boots its full
+  multiprocess stack (7 processes, browser children, crash reporting);
+  the client UI stack runs. Remaining: the client<->webhelper IPC
+  handshake ("LockMgrMutex failed to acquire SysMgrMutex" — the sysv-sem
+  lane) is the last piece before the login UI paints. steamcmd
+  +login anonymous +quit exits 0; battery green.

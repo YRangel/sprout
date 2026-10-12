@@ -542,6 +542,14 @@ static int g_auxv_fd = -2;
 #define SP_SNAP_MAX_ROWS 160
 #define SP_SNAP_ROW_CAP  (SP_PATH_MAX + 2)
 static char s_snap_blob[SP_SNAP_MAX_ROWS][SP_SNAP_ROW_CAP];
+/* F12 reservation bookkeeping: the >4GB gap walk records every span it
+ * takes. Explicit MAP_FIXED/MAP_FIXED_NOREPLACE mappings (Chromium's
+ * PartitionAlloc reserves fixed high arenas!) must be able to CLAIM
+ * their layout — the reservations yield: release overlap + bookkeeping,
+ * so we never unmap anything but our own spans. */
+static unsigned long g_res_a[64], g_res_b[64];
+static int g_res_n = 0;
+
 static char *s_snap_rows[SP_SNAP_MAX_ROWS];
 static int s_snap_nrows = 0;
 
@@ -574,6 +582,32 @@ static const char *sp_libc_kind(void)     { const char *e = getenv("SPROUT_LIBC"
 
 __attribute__((constructor)) static void sprout_init(void) {
     sp_snapshot_chain_env();
+    /* F17-base: robust-list seccomp lane, armed for EVERY interposed
+     * process. Android blocks set_robust_list (the sanitized libc fakes
+     * success) so the kernel never registers a robust list — and
+     * Chromium/CEF (steam's webhelper) FATALS verifying exactly that
+     * ("futex robust_list not initialized by pthreads"). The guest may
+     * ask via raw svc (box64 syscall emulation) or libc syscall(); route
+     * BOTH to the supervisor which serves an empty list (RET_TRACE +
+     * PTRACE_EVENT_SECCOMP handler). Two filters stack legally; the
+     * lane's chdir-class filter below stays independent. */
+    {
+        struct sp_sfilter2 { unsigned short code; unsigned char jt, jf; unsigned int k; };
+        struct sp_sfprog2 { unsigned short len; struct sp_sfilter2 *filt; };
+        static struct sp_sfilter2 fpb[] = {
+            { 0x20, 0, 0, 4 },                    /* ld arch */
+            { 0x15, 1, 0, 0xC00000B7u },          /* jeq aarch64 */
+            { 0x06, 0, 0, 0x00000000u },          /* ret KILL (foreign arch) */
+            { 0x20, 0, 0, 0 },                    /* ld nr */
+            { 0x15, 0, 1, 99u },  { 0x06, 0, 0, 0x7ff00000u }, /* set_robust_list -> TRACE */
+            { 0x15, 0, 1, 100u }, { 0x06, 0, 0, 0x7ff00000u }, /* get_robust_list -> TRACE */
+            { 0x06, 0, 0, 0x7fff0000u },          /* ret ALLOW */
+        };
+        struct sp_sfprog2 fpl2;
+        fpl2.len = (unsigned short)(sizeof fpb / sizeof fpb[0]);
+        fpl2.filt = fpb;
+        (void)sp_raw_svc4(277 /*SYS_seccomp*/, 1 /*SET_MODE_FILTER*/, 0, (long)&fpl2, 0);
+    }
     /* Emulator environ scrub (box32 my32_realpath SIGSEGV, 2026-09-21):
      * box64's 32-bit persona parses LD_PRELOAD from its OWN environ and
      * preloads each entry into the i386 guest; our native arm64 chain
@@ -827,7 +861,14 @@ __attribute__((constructor)) static void sprout_init(void) {
                                             if (mmap((void *)segs[si][0], segs[si][1] - segs[si][0], PROT_NONE,
                                                      MAP_PRIVATE | MAP_ANONYMOUS |
                                                      MAP_FIXED | MAP_NORESERVE,
-                                                     -1, 0) != MAP_FAILED) gres++;
+                                                     -1, 0) != MAP_FAILED) {
+                                                gres++;
+                                                if (g_res_n < 64) {
+                                                    g_res_a[g_res_n] = segs[si][0];
+                                                    g_res_b[g_res_n] = segs[si][1];
+                                                    g_res_n++;
+                                                }
+                                            }
                                         }
                                     }
                                     if (b > prev) prev = b;
@@ -842,7 +883,14 @@ __attribute__((constructor)) static void sprout_init(void) {
                                         if (mmap((void *)segs[si][0], segs[si][1] - segs[si][0], PROT_NONE,
                                                  MAP_PRIVATE | MAP_ANONYMOUS |
                                                  MAP_FIXED | MAP_NORESERVE,
-                                                 -1, 0) != MAP_FAILED) gres++;
+                                                 -1, 0) != MAP_FAILED) {
+                                            gres++;
+                                            if (g_res_n < 64) {
+                                                g_res_a[g_res_n] = segs[si][0];
+                                                g_res_b[g_res_n] = segs[si][1];
+                                                g_res_n++;
+                                            }
+                                        }
                                     }
                                 }
                                 fclose(gmf);
@@ -3428,12 +3476,35 @@ long syscall(long nr, ...) {
     switch (nr) {
 #ifdef SYS_set_robust_list
     case SYS_set_robust_list:
+        /* Advisory; Android blocks the real registration and the
+         * sanitized libc fakes success — mirror that here. */
+        return 0;
 #endif
 #ifdef SYS_get_robust_list
-    case SYS_get_robust_list:
-#endif
-        /* advisory; callers never recover from -EINTR-style errors here */
+    case SYS_get_robust_list: {
+        /* Chromium/CEF startup FATALS on "futex robust_list not
+         * initialized by pthreads": it verifies the KERNEL registration
+         * which the blocked set_robust_list never made. Serve a kernel-
+         * faithful EMPTY list from shadow state: struct robust_list_head
+         * { list_op_pending=0; list=FUTEX_LIST_END; futex_offset=0 }
+         * and *len_ptr = 24. */
+        static unsigned long sp_fake_rh[4];
+        /* glibc's at-rest robust_head (verified against steamwebhelper's
+         * check: head->futex_offset must be -0x20 on x86_64 glibc):
+         * struct robust_list_head { list, futex_offset, list_op_pending }. */
+        sp_fake_rh[0] = ~(unsigned long)0;   /* list = FUTEX_LIST_END */
+        sp_fake_rh[1] = (unsigned long)-32;  /* futex_offset */
+        sp_fake_rh[2] = 0;                   /* list_op_pending */
+        void ***headp = (void ***)a2;
+        size_t *lenp = (size_t *)a3;
+        (void)a1; /* pid: only self is ever queried */
+        if (headp && (unsigned long)headp < 0x800000000000UL)
+            *headp = (void **)sp_fake_rh;
+        if (lenp && (unsigned long)lenp < 0x800000000000UL)
+            *lenp = 24;
         return 0;
+    }
+#endif
 #ifdef SYS_mount
     case SYS_mount:
 #endif
@@ -6437,8 +6508,51 @@ int fprintf(FILE *stream, const char *fmt, ...) {
 static void *(*SP_REAL(mmap))(void *, size_t, int, int, int, off_t);
 static int (*SP_REAL(munmap))(void *, size_t);
 
+static void sp_release_res(unsigned long a, unsigned long b)
+{
+    if (!g_res_n) return;
+    SP_RESOLVE(munmap);
+    for (int i = 0; i < g_res_n; ) {
+        unsigned long lo = a > g_res_a[i] ? a : g_res_a[i];
+        unsigned long hi = b < g_res_b[i] ? b : g_res_b[i];
+        if (hi <= lo) { i++; continue; }
+        SP_REAL(munmap)((void *)lo, hi - lo);
+        unsigned long ea = g_res_a[i], eb = g_res_b[i];
+        unsigned long l1a = ea, l1b = lo, l2a = hi, l2b = eb;
+        int keep1 = l1b > l1a, keep2 = l2b > l2a;
+        if (keep1 && keep2) {
+            if (g_res_n < 64) {
+                g_res_a[i] = l1a; g_res_b[i] = l1b;
+                g_res_a[g_res_n] = l2a; g_res_b[g_res_n] = l2b;
+                g_res_n++;
+                i++;
+            } else if (l1b - l1a >= l2b - l2a) {
+                g_res_a[i] = l1a; g_res_b[i] = l1b; i++;
+            } else {
+                g_res_a[i] = l2a; g_res_b[i] = l2b; i++;
+            }
+        } else if (keep1) { g_res_a[i] = l1a; g_res_b[i] = l1b; i++; }
+        else if (keep2) { g_res_a[i] = l2a; g_res_b[i] = l2b; i++; }
+        else {
+            g_res_n--;
+            g_res_a[i] = g_res_a[g_res_n]; g_res_b[i] = g_res_b[g_res_n];
+        }
+    }
+}
+
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
+    /* Explicit layout claims beat our reservations: release the overlap
+     * first (bookkeeping shrinks with it — we never unmap a span we do
+     * not own). MAP_FIXED would silently clobber ours anyway; without
+     * this, MAP_FIXED_NOREPLACE got EEXIST ("mmap() failed: File
+     * exists") and Chromium's allocator died. */
+    if (g_res_n && addr && addr != MAP_FAILED && (flags & (MAP_FIXED
+#ifdef MAP_FIXED_NOREPLACE
+                 | MAP_FIXED_NOREPLACE
+#endif
+                 )))
+        sp_release_res((unsigned long)addr, (unsigned long)addr + length);
     SP_RESOLVE(mmap);
     void *r = SP_REAL(mmap)(addr, length, prot, flags, fd, offset);
     if (!g_emu32_low || r == MAP_FAILED) return r;

@@ -3960,6 +3960,49 @@ int main(int argc, char **argv) {
                 if (ptrace(PTRACE_GETREGSET, w, (void *)NT_PRSTATUS, &ior) == 0) {
                     long nr = (long)rx.regs[8];
                     if (g_debug) SP_TRACE("[%d] EVENT_SECCOMP nr=%ld\n", w, nr);
+                    if (nr == 99 /*set_robust_list*/ ||
+                        nr == 100 /*get_robust_list*/) {
+                        /* Android blocks set_robust_list (guest libs fake
+                         * success) so the kernel never registers a robust
+                         * list — Chromium/CEF FATALS verifying it ("futex
+                         * robust_list not initialized by pthreads"). Serve
+                         * an EMPTY list from shadow state: a head word
+                         * containing FUTEX_LIST_END below SP, *head_ptr =
+                         * its address, *len_ptr = 8; then rewrite the
+                         * syscall to sched_yield (returns 0, no side
+                         * effects) so no exit stop is needed. */
+                        if (nr == 100 && rx.regs[1] && rx.regs[2] &&
+                            rx.regs[1] < 0x800000000000ULL &&
+                            rx.regs[2] < 0x800000000000ULL) {
+                            /* kernel-faithful struct robust_list_head:
+                             *   word0 list_op_pending = 0
+                             *   word1 list            = FUTEX_LIST_END
+                             *   word2 futex_offset    = 0
+                             * and *len_ptr = 24 (what the kernel
+                             * returns for sizeof the struct). */
+                            unsigned long long scr =
+                                (rx.sp & ~15ULL) - 48ULL;
+                            ptrace(PTRACE_POKEDATA, w,
+                                   (void *)(uintptr_t)scr,
+                                   (void *)(uintptr_t)~0ULL);
+                            ptrace(PTRACE_POKEDATA, w,
+                                   (void *)(uintptr_t)(scr + 8),
+                                   (void *)(uintptr_t)(unsigned long long)-32ULL);
+                            ptrace(PTRACE_POKEDATA, w,
+                                   (void *)(uintptr_t)(scr + 16), 0);
+                            ptrace(PTRACE_POKEDATA, w,
+                                   (void *)(uintptr_t)rx.regs[1],
+                                   (void *)(uintptr_t)scr);
+                            ptrace(PTRACE_POKEDATA, w,
+                                   (void *)(uintptr_t)rx.regs[2],
+                                   (void *)(uintptr_t)24ULL);
+                            if (g_debug)
+                                SP_TRACE("[%d] EVENT_SECCOMP robust served head=%llx len=24\n",
+                                         w, scr);
+                        }
+                        rx.regs[8] = 124; /* sched_yield -> 0 */
+                        ptrace(PTRACE_SETREGSET, w, (void *)NT_PRSTATUS, &ior);
+                    } else
                     for (size_t i = 0; i < sizeof SP_PATH_RULES / sizeof SP_PATH_RULES[0]; i++) {
                         const sp_path_rule *rule = &SP_PATH_RULES[i];
                         if (rule->sysno != nr) continue;

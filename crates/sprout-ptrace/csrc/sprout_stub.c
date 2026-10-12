@@ -613,7 +613,11 @@ static int install_notify_filter(void)
      * value: they go SECCOMP_RET_TRACE and the supervisor rewrites the
      * path arg at a PTRACE_EVENT_SECCOMP stop (translate_reg_path). */
     static const int traced[] = { 49 /*chdir*/, 51 /*chroot*/,
-                                  43 /*statfs*/, 45 /*truncate*/ };
+                                  43 /*statfs*/, 45 /*truncate*/,
+                                  99 /*set_robust_list: Android-blocked,
+                                        supervisor serves the swallow*/,
+                                  100 /*get_robust_list: supervisor
+                                         serves an empty robust list*/ };
     const int ntrace = (int)(sizeof(traced) / sizeof(traced[0]));
 #ifndef SECCOMP_RET_TRACE
 #define SECCOMP_RET_TRACE 0x7ff00000u
