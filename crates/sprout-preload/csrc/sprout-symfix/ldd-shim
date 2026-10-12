@@ -1,0 +1,59 @@
+#!/bin/sh
+# sprout guest shim: ldd for emulated guest ELFs (i386/x86_64 under the
+# box64 binfmt lane). The host-arch loader cannot --verify a guest ELF
+# ("not a dynamic executable") and box32 cannot relocate the guest
+# ld-linux.so.2 as a PROGRAM (RELR relocs), so resolve DT_NEEDED here
+# the way the guest loader would: LD_LIBRARY_PATH first, then the
+# multiarch lib dirs. Native/unknown ELFs fall through to real ldd.
+#
+# Output mirrors glibc ldd's "lib => /path (0x..)" shape so callers like
+# Steam's get_missing_libraries (grep "=>" | grep -v /) work unchanged:
+# resolved paths contain "/", unresolved ones print "not found".
+real=/usr/bin/ldd
+rc=0
+for f in "$@"; do
+    case "$f" in
+    -*) continue ;;
+    esac
+    if [ ! -e "$f" ]; then
+        echo "ldd: $f: No such file or directory" >&2
+        rc=1
+        continue
+    fi
+    # e_machine at ELF offset 18 (x86 is little-endian): 3=i386, 62=x86_64
+    m=$(od -An -tu2 -j18 -N2 "$f" 2>/dev/null | tr -dc 0-9)
+    case "$m" in
+    3)  dirs="/lib/i386-linux-gnu /usr/lib/i386-linux-gnu /lib /usr/lib" ;;
+    62) dirs="/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64 /lib /usr/lib" ;;
+    *)  "$real" "$f" || rc=1
+        continue ;;
+    esac
+    needs=$(readelf -d "$f" 2>/dev/null |
+            sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p')
+    if [ -z "$needs" ]; then
+        "$real" "$f" || rc=1
+        continue
+    fi
+    printf '%s:\n' "$f"
+    for lib in $needs; do
+        hit=
+        for d in $(printf '%s' "$LD_LIBRARY_PATH" | tr ':' ' ') $dirs; do
+            if [ -n "$d" ] && [ -f "$d/$lib" ]; then
+                # arch gate: the chain rewrites LD_LIBRARY_PATH to
+                # host-spelled aarch64 dirs — never resolve a guest lib
+                # to the wrong architecture.
+                am=$(od -An -tu2 -j18 -N2 "$d/$lib" 2>/dev/null | tr -dc 0-9)
+                if [ "$am" = "$m" ]; then
+                    hit=$d/$lib
+                    break
+                fi
+            fi
+        done
+        if [ -n "$hit" ]; then
+            printf '\t%s => %s (0x00000000)\n' "$lib" "$hit"
+        else
+            printf '\t%s => not found\n' "$lib"
+        fi
+    done
+done
+exit $rc

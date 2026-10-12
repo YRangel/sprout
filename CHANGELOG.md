@@ -554,3 +554,36 @@ Three real bugs behind the F17 regressions, all fixed:
 - box64 steamcmd +login anonymous +quit exits 0 (no regression, default
   and with SPROUT_EMU_TRACE=1).
 - test_translate, test_shadow, smoke, proot-compat all green.
+
+### Steam client: installed, running, UI paints (symfix + chain-reinjection)
+- **LD_PRELOAD chain re-injection fix**: bash's `VAR=val cmd` spawn blanks
+  our LIVE environ value before the exec hook runs (steam's
+  `LD_PRELOAD= ldd` check produced `LD_PRELOAD=:` → children ran with NO
+  translation → "No such file or directory" on files ls can see). The
+  merge now sources the chain from the ctor snapshot, as its comment
+  always promised.
+- **`csrc/sprout-symfix/`**: guest i386 DSO preloaded via BOX64_LD_PRELOAD
+  (same pattern as libsprout-sysvipc) filling box32's unwrapped-symbol
+  gaps — steam's Sep-2026 client needs 22 of them: resolver trio
+  (getservbyname_r/dn_expand/res_nquery), glibc 2.36+ additions
+  (copy_file_range/mallinfo2/pidfd-open/send-signal/epoll_pwait2/qsort_r/
+  lchmod/__openat64_2/arc4random family) and the FreeType COLRv1 +
+  fontconfig enumeration APIs. The glibc class gets working
+  implementations; FT paint APIs degrade safely (error = plain-glyph
+  fallback); FcFontSetMatch/List compose from the WRAPPED host-side twins
+  (FcFontSetSort head = best match; caller-owned FcFontSetCreate — a
+  static fake set crashed in FcFontSetDestroy).
+- **`ldd-shim`** (installed at /usr/local/bin/ldd in guests): ldd for
+  emulated guest ELFs — the host loader can't --verify them ("not a
+  dynamic executable") and box32 can't relocate guest ld-linux.so.2 as a
+  program (RELR). Resolves DT_NEEDED like the guest loader would
+  (LD_LIBRARY_PATH + multiarch dirs, arch-gated) so library checks like
+  Steam's get_missing_libraries work; also exposes genuinely-missing
+  i386 libs (installed libgtk2.0-0:i386, libxtst6:i386, libpipewire-
+  0.3-0:i386, libxcb-res0:i386, libsm6:i386, libice6:i386).
+- Verified: steam.sh's 32-bit library check passes, steamui.so and the
+  vgui module chain load under box32, the Steam client runs and PAINTS
+  its native UI (the steamwebhelper-not-responding dialog with the
+  GPU-disabled restart option — CEF webhelper is the remaining work).
+  steamcmd +login anonymous +quit still exits 0; test_translate,
+  test_shadow, smoke, proot-compat green.

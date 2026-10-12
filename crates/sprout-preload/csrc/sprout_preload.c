@@ -3021,6 +3021,7 @@ static int sp_self_exe_match(const char *path) {
  * S_IFREG — read_symlink users (std::filesystem, FEXServer) then die with
  * EINVAL. Repaint self-exe results as symlinks sized to the answer. */
 static void sp_self_exe_linkify(const char *path, void *stv, int is64) {
+    if (getenv("SPROUT_NOLINKIFY")) return; /* A/B kill-switch */
     if (!sp_self_exe_match(path)) return;
     const char *e = getenv("SPROUT_EXE");
     if (!e || !*e) return;
@@ -4509,11 +4510,34 @@ static char **sp_chain_env(char *const envp[]) {
                  * there), the guest's DSO appended after; skip re-merge
                  * when the interposer is already visible (deep chains). */
                 if (kl == 10 && 0 == strncmp(environ[i], "LD_PRELOAD", kl)) {
+                    /* OUR chain = the ctor SNAPSHOT, not eq+1: bash's
+                     * `VAR=val cmd` spawn blanks our LIVE environ value
+                     * BEFORE the exec hook runs (LD_PRELOAD= cmd makes
+                     * eq+1 ""), and the old merge then emitted a bare
+                     * ":" that loaded nothing — children ran without
+                     * translation (steam's `LD_PRELOAD= ldd` check:
+                     * "No such file or directory" on files ls can see).
+                     * The ctor comment promises the snapshot feeds this
+                     * merge; make it actually do so. */
+                    const char *ours = eq + 1;
+                    for (int si = 0; si < s_snap_nrows; si++) {
+                        const char *row = s_snap_rows[si];
+                        if (!strncmp(row, "LD_PRELOAD=", 11) && row[11]) {
+                            ours = row + 11;
+                            break;
+                        }
+                    }
+                    if (!ours || !*ours) continue;
                     for (int j = 0; j < n; j++) {
                         if (strncmp(e2[j], environ[i], kl) != 0 || e2[j][kl] != '=') continue;
                         if (strstr(e2[j], "libsprout-core")) continue;
                         static char mp[SP_PATH_MAX * 4 + 32];
-                        int mw = snprintf(mp, sizeof(mp), "LD_PRELOAD=%s:%s", eq + 1, e2[j] + kl + 1);
+                        const char *theirs = e2[j] + kl + 1;
+                        int mw;
+                        if (theirs && *theirs)
+                            mw = snprintf(mp, sizeof(mp), "LD_PRELOAD=%s:%s", ours, theirs);
+                        else
+                            mw = snprintf(mp, sizeof(mp), "LD_PRELOAD=%s", ours);
                         if (mw > 0 && (size_t)mw < sizeof(mp)) e2[j] = mp;
                     }
                 }
@@ -4925,12 +4949,30 @@ static int sp_binfmt_maybe_exec(const char *guest_path, const char *host_abs,
             }
         }
     }
-    if (!have_pre && e_machine == EM_386 && has_interp && !getenv("SPROUT_SYSVIPC_OFF")
-        && access("/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so", R_OK) == 0) {
-        nev[ec] = malloc(strlen("BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so") + 1);
-        if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
-        sprintf(nev[ec], "BOX64_LD_PRELOAD=/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so");
-        ec++;
+    if (!have_pre && e_machine == EM_386 && has_interp) {
+        /* Guest i386 DSOs loaded as REAL elfs by box64's BOX64_LD_PRELOAD:
+         * symfix fills box32's unwrapped-symbol gaps (steam client's
+         * resolver/FT-COLRv1/Fc enumeration imports), then the sysvipc
+         * shim. SPROUT_SYMFIX=0 disables symfix only. */
+        char pv[512];
+        pv[0] = 0;
+        if (!getenv("SPROUT_SYMFIX") || strcmp(getenv("SPROUT_SYMFIX"), "0") != 0) {
+            if (access("/usr/lib/sprout-symfix/i386/libsprout-symfix.so", R_OK) == 0) {
+                if (pv[0]) strcat(pv, ":");
+                strcat(pv, "/usr/lib/sprout-symfix/i386/libsprout-symfix.so");
+            }
+        }
+        if (!getenv("SPROUT_SYSVIPC_OFF")
+            && access("/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so", R_OK) == 0) {
+            if (pv[0]) strcat(pv, ":");
+            strcat(pv, "/usr/lib/sprout-sysvipc/i386/libsprout-sysvipc.so");
+        }
+        if (pv[0]) {
+            nev[ec] = malloc(strlen("BOX64_LD_PRELOAD=") + strlen(pv) + 1);
+            if (!nev[ec]) { free(nev); free(nv); errno = ENOMEM; return -1; }
+            sprintf(nev[ec], "BOX64_LD_PRELOAD=%s", pv);
+            ec++;
+        }
     }
     if (!have_lib) {
         if (emu_bionic) {
